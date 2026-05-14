@@ -6,6 +6,7 @@ from discord import app_commands
 from dotenv import load_dotenv
 from db import connect, init_db, reset_auction_state
 from card_generator import create_player_card
+from import_players import main as import_players_main
 
 load_dotenv()
 
