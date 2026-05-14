@@ -67,6 +67,7 @@ def player_embed(player, title="FC26 Player Card"):
 @bot.event
 async def on_ready():
     init_db()
+    import_players_main()
     reset_auction_state()
 
     guild = get_guild()
