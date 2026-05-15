@@ -413,7 +413,7 @@ async def card(interaction: discord.Interaction, player_id: str):
 @app_commands.describe(player_id="ID giocatore")
 async def asta(interaction: discord.Interaction, player_id: str):
     if AUCTION_CHANNEL_ID and str(interaction.channel_id) != str(AUCTION_CHANNEL_ID):
-        await interaction.response.send_message("❌ Puoi avviare le aste solo nel canale aste.", ephemeral=True)
+        await interaction.response.send_message("❌ Puoi avviare le aste solo nel canale asta.", ephemeral=True)
         return
 
     await interaction.response.defer()
@@ -443,10 +443,26 @@ async def asta(interaction: discord.Interaction, player_id: str):
 
     base = base_price_from_overall(player["overall"])
 
+    cur.execute("SELECT * FROM managers WHERE discord_id = ?", (str(interaction.user.id),))
+    starter_manager = cur.fetchone()
+
+    if not starter_manager:
+        conn.close()
+        await interaction.followup.send("Prima usa `/registrami` per partecipare alle aste.", ephemeral=True)
+        return
+
+    if int(starter_manager["budget"]) < base:
+        conn.close()
+        await interaction.followup.send(
+            f"Budget insufficiente per aprire l'asta. Servono almeno {base} crediti.",
+            ephemeral=True
+        )
+        return
+
     cur.execute("""
-        INSERT INTO auctions (player_id, status, highest_bid, channel_id)
-        VALUES (?, 'open', ?, ?)
-    """, (player_id, base, str(interaction.channel_id)))
+        INSERT INTO auctions (player_id, status, highest_bid, highest_bidder_id, channel_id)
+        VALUES (?, 'open', ?, ?, ?)
+    """, (player_id, base, str(interaction.user.id), str(interaction.channel_id)))
     auction_id = cur.lastrowid
     conn.commit()
 
