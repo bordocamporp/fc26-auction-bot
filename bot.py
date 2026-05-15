@@ -939,14 +939,28 @@ async def on_message(message: discord.Message):
         return
 
     if message.channel.id in BOT_ONLY_CHANNELS:
-        try:
-            await message.delete()
-        except discord.Forbidden:
-            pass
-        except discord.NotFound:
-            pass
-        except Exception:
-            pass
+
+        # Permette i comandi slash Discord
+        if not message.content.startswith("/"):
+
+            try:
+                await message.delete()
+
+                warning = await message.channel.send(
+                    f"{message.author.mention} ⚠️ Su questo canale puoi usare solo i comandi `/` del bot."
+                )
+
+                await asyncio.sleep(5)
+                await warning.delete()
+
+            except discord.Forbidden:
+                pass
+
+            except discord.NotFound:
+                pass
+
+            except Exception:
+                pass
 
     await bot.process_commands(message)
 
