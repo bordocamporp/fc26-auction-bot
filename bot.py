@@ -31,6 +31,18 @@ CALENDAR_CHANNEL_ID = "1504884471286075532"
 LEAGUE_PLAYER_ROLE_ID = "1398332847655358554"
 LEAGUE_ADMIN_ROLE_ID = "1398358193197027408"
 
+BOT_ONLY_CHANNELS = {
+    1504884471286075532,  # calendario
+    1504874612805337229,  # risultati
+    1504874671064223784,  # classifiche
+    1504874788349542431,  # statistiche
+    1504825224422756463,  # asta
+    1504847601361616996,  # scambi
+    1504833349414551703,  # ricerca-giocatori
+    1504846794142781480,  # spam-chat
+    1504847438727610519,  # rose
+}
+
 DEFAULT_BUDGET = 500
 MIN_RAISE = 10
 AUCTION_SECONDS = 45
@@ -919,6 +931,24 @@ class RegistraPreIscrittoView(discord.ui.View):
     def __init__(self, members):
         super().__init__(timeout=180)
         self.add_item(RegistraPreIscrittoSelect(members))
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    if message.channel.id in BOT_ONLY_CHANNELS:
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            pass
+        except discord.NotFound:
+            pass
+        except Exception:
+            pass
+
+    await bot.process_commands(message)
 
 
 @tree.command(name="registra", description="Staff: registra un player pre-iscritto")
