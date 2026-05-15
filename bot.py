@@ -1,5 +1,6 @@
 import os
 import asyncio
+import random
 import unicodedata
 import discord
 from discord.ext import commands
@@ -13,14 +14,26 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
 AUCTION_CHANNEL_ID = os.getenv("AUCTION_CHANNEL_ID")
+AUCTION_LOG_CHANNEL_ID = os.getenv("AUCTION_LOG_CHANNEL_ID", "1504830394908803142")
+ADMIN_ROLE_ID = os.getenv("ADMIN_ROLE_ID", "1398358193197027408")
 
 DEFAULT_BUDGET = 500
 MIN_RAISE = 10
-AUCTION_SECONDS = 30
+AUCTION_SECONDS = 45
+ANTI_SNIPE_THRESHOLD = 10
+ANTI_SNIPE_EXTENSION = 10
+
+MAX_GK = 2
+MAX_DEF = 6
+MAX_MID = 6
+MAX_ATT = 4
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
+
+auction_timers = {}
+auction_last_bids = {}
 
 
 def get_guild():
@@ -34,11 +47,24 @@ def normalize_text(value):
 
 
 def is_admin(interaction: discord.Interaction):
+    if ADMIN_ROLE_ID:
+        return any(str(role.id) == str(ADMIN_ROLE_ID) for role in getattr(interaction.user, "roles", []))
+
     return bool(interaction.user.guild_permissions.administrator)
 
 
+def safe_int(value, default=0):
+    try:
+        if value in ("", None):
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
 def base_price_from_overall(overall):
-    overall = int(overall or 0)
+    overall = safe_int(overall)
+
     if 60 <= overall <= 70:
         return 10
     if 71 <= overall <= 75:
@@ -49,7 +75,71 @@ def base_price_from_overall(overall):
         return 100
     if overall >= 91:
         return 150
+
     return 5
+
+
+def role_group(position):
+    pos = normalize_text(position).upper()
+
+    if pos in {"GK", "POR"}:
+        return "GK"
+
+    defenders = {"CB", "LB", "RB", "LWB", "RWB", "DC", "TS", "TD", "DIF"}
+    midfielders = {"CDM", "CM", "CAM", "LM", "RM", "MCO", "CDC", "CC", "CEN"}
+    attackers = {"ST", "CF", "LW", "RW", "LF", "RF", "ATT", "AS", "AD", "P"}
+
+    if pos in defenders:
+        return "DEF"
+    if pos in midfielders:
+        return "MID"
+    if pos in attackers:
+        return "ATT"
+
+    return "OTHER"
+
+
+def role_limit(group):
+    if group == "GK":
+        return MAX_GK
+    if group == "DEF":
+        return MAX_DEF
+    if group == "MID":
+        return MAX_MID
+    if group == "ATT":
+        return MAX_ATT
+    return 99
+
+
+def role_label(group):
+    labels = {
+        "GK": "Portieri",
+        "DEF": "Difensori",
+        "MID": "Centrocampisti",
+        "ATT": "Attaccanti",
+        "OTHER": "Altro"
+    }
+    return labels.get(group, group)
+
+
+def ensure_extra_tables():
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bid_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        auction_id INTEGER NOT NULL,
+        player_id TEXT NOT NULL,
+        bidder_id TEXT NOT NULL,
+        bidder_name TEXT,
+        amount INTEGER NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    conn.commit()
+    conn.close()
 
 
 def player_embed(player, title="FC26 Player Card"):
@@ -59,7 +149,7 @@ def player_embed(player, title="FC26 Player Card"):
     embed = discord.Embed(
         title=f"{title}: {player['name']}",
         description=f"**{player['position']}** • {player['team']} • OVR **{player['overall']}**",
-        color=discord.Color.gold() if int(player["overall"] or 0) >= 85 else discord.Color.dark_grey()
+        color=discord.Color.gold() if safe_int(player["overall"]) >= 85 else discord.Color.dark_grey()
     )
 
     embed.add_field(name="PAC", value=str(player["pace"]), inline=True)
@@ -98,24 +188,75 @@ def auction_embed(player, auction, remaining=None):
     bidder_id = auction["highest_bidder_id"]
     leader = f"<@{bidder_id}>" if bidder_id else "Nessuno"
 
+    auction_id = auction["id"]
+    recent = auction_last_bids.get(int(auction_id), [])
+    recent_text = "\n".join(recent[-5:]) if recent else "Nessuna offerta ancora."
+
     embed = discord.Embed(
         title="🔨 ASTA LIVE",
         description=f"**{player['name']}** è ora all'asta.",
         color=discord.Color.gold()
     )
+
     embed.add_field(name="Ruolo", value=player["position"], inline=True)
     embed.add_field(name="Squadra", value=player["team"], inline=True)
     embed.add_field(name="Overall", value=str(player["overall"]), inline=True)
     embed.add_field(name="Prezzo attuale", value=f"**{highest_bid}** crediti", inline=True)
     embed.add_field(name="Leader", value=leader, inline=True)
     embed.add_field(name="Tempo", value=f"⏱️ {remaining}s" if remaining is not None else f"{AUCTION_SECONDS}s", inline=True)
+    embed.add_field(name="Ultime offerte", value=recent_text, inline=False)
     embed.add_field(
         name="Offerte",
         value="Usa i bottoni sotto: **+10**, **+50**, **All In** oppure **Offerta custom**.",
         inline=False
     )
-    embed.set_footer(text=f"ID asta: {auction['id']} • ID giocatore: {player['id']}")
+    embed.set_footer(text=f"ID asta: {auction_id} • ID giocatore: {player['id']} • Anti-snipe attivo")
     return embed
+
+
+async def get_log_channel():
+    if not AUCTION_LOG_CHANNEL_ID:
+        return None
+
+    try:
+        channel = bot.get_channel(int(AUCTION_LOG_CHANNEL_ID))
+        if channel:
+            return channel
+        return await bot.fetch_channel(int(AUCTION_LOG_CHANNEL_ID))
+    except Exception:
+        return None
+
+
+def get_roster_role_count(discord_id, group):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT position
+        FROM players
+        WHERE owner_discord_id = ?
+    """, (str(discord_id),))
+    rows = cur.fetchall()
+    conn.close()
+
+    return sum(1 for r in rows if role_group(r["position"]) == group)
+
+
+def can_add_player_to_roster(discord_id, position):
+    group = role_group(position)
+    current = get_roster_role_count(discord_id, group)
+    limit = role_limit(group)
+    return current < limit, group, current, limit
+
+
+def record_bid(auction_id, player_id, bidder_id, bidder_name, amount):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO bid_history (auction_id, player_id, bidder_id, bidder_name, amount)
+        VALUES (?, ?, ?, ?, ?)
+    """, (auction_id, player_id, bidder_id, bidder_name, amount))
+    conn.commit()
+    conn.close()
 
 
 async def place_bid(interaction: discord.Interaction, increment=None, all_in=False):
@@ -131,7 +272,7 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
         return
 
     cur.execute("""
-        SELECT a.*, p.name AS player_name, p.id AS player_id
+        SELECT a.*, p.name AS player_name, p.id AS player_id, p.position AS player_position
         FROM auctions a
         JOIN players p ON p.id = a.player_id
         WHERE a.status = 'open'
@@ -144,8 +285,17 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
         await interaction.response.send_message("Non c'è nessuna asta aperta.", ephemeral=True)
         return
 
-    current_bid = int(auction["highest_bid"] or 0)
-    new_bid = int(manager["budget"]) if all_in else current_bid + int(increment or 0)
+    ok, group, current, limit = can_add_player_to_roster(interaction.user.id, auction["player_position"])
+    if not ok:
+        conn.close()
+        await interaction.response.send_message(
+            f"Non puoi offrire: hai già raggiunto il limite per {role_label(group)} ({current}/{limit}).",
+            ephemeral=True
+        )
+        return
+
+    current_bid = safe_int(auction["highest_bid"])
+    new_bid = safe_int(manager["budget"]) if all_in else current_bid + safe_int(increment)
 
     if new_bid <= current_bid:
         conn.close()
@@ -157,7 +307,7 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
         await interaction.response.send_message(f"Devi rilanciare almeno di {MIN_RAISE} crediti.", ephemeral=True)
         return
 
-    if int(manager["budget"]) < new_bid:
+    if safe_int(manager["budget"]) < new_bid:
         conn.close()
         await interaction.response.send_message("Budget insufficiente.", ephemeral=True)
         return
@@ -178,7 +328,21 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
     updated = cur.fetchone()
     conn.close()
 
-    embed = auction_embed(updated, updated)
+    auction_id = int(auction["id"])
+    player_id = str(auction["player_id"])
+    bidder_name = interaction.user.display_name
+
+    record_bid(auction_id, player_id, str(interaction.user.id), bidder_name, new_bid)
+
+    auction_last_bids.setdefault(auction_id, [])
+    label = "ALL IN" if all_in else f"+{increment}"
+    auction_last_bids[auction_id].append(f"• **{bidder_name}** {label} → **{new_bid}** cr")
+
+    if auction_id in auction_timers and auction_timers[auction_id] <= ANTI_SNIPE_THRESHOLD:
+        auction_timers[auction_id] += ANTI_SNIPE_EXTENSION
+        auction_last_bids[auction_id].append(f"⏱️ Anti-snipe: +{ANTI_SNIPE_EXTENSION}s")
+
+    embed = auction_embed(updated, updated, auction_timers.get(auction_id))
 
     try:
         await interaction.message.edit(embed=embed, view=AuctionView())
@@ -243,6 +407,7 @@ class AuctionView(discord.ui.View):
 @bot.event
 async def on_ready():
     init_db()
+    ensure_extra_tables()
     reset_auction_state()
 
     guild = get_guild()
@@ -413,7 +578,7 @@ async def card(interaction: discord.Interaction, player_id: str):
 @app_commands.describe(player_id="ID giocatore")
 async def asta(interaction: discord.Interaction, player_id: str):
     if AUCTION_CHANNEL_ID and str(interaction.channel_id) != str(AUCTION_CHANNEL_ID):
-        await interaction.response.send_message("❌ Puoi avviare le aste solo nel canale asta.", ephemeral=True)
+        await interaction.response.send_message("❌ Puoi avviare le aste solo nel canale aste.", ephemeral=True)
         return
 
     await interaction.response.defer()
@@ -441,8 +606,6 @@ async def asta(interaction: discord.Interaction, player_id: str):
         await interaction.followup.send("C'è già un'asta aperta. Chiudila prima con `/reset_asta`.", ephemeral=True)
         return
 
-    base = base_price_from_overall(player["overall"])
-
     cur.execute("SELECT * FROM managers WHERE discord_id = ?", (str(interaction.user.id),))
     starter_manager = cur.fetchone()
 
@@ -451,10 +614,18 @@ async def asta(interaction: discord.Interaction, player_id: str):
         await interaction.followup.send("Prima usa `/registrami` per partecipare alle aste.", ephemeral=True)
         return
 
-    if int(starter_manager["budget"]) < base:
+    base = base_price_from_overall(player["overall"])
+
+    if safe_int(starter_manager["budget"]) < base:
+        conn.close()
+        await interaction.followup.send(f"Budget insufficiente per aprire l'asta. Servono almeno {base} crediti.", ephemeral=True)
+        return
+
+    ok, group, current, limit = can_add_player_to_roster(interaction.user.id, player["position"])
+    if not ok:
         conn.close()
         await interaction.followup.send(
-            f"Budget insufficiente per aprire l'asta. Servono almeno {base} crediti.",
+            f"Non puoi aprire questa asta: hai già raggiunto il limite per {role_label(group)} ({current}/{limit}).",
             ephemeral=True
         )
         return
@@ -465,6 +636,9 @@ async def asta(interaction: discord.Interaction, player_id: str):
     """, (player_id, base, str(interaction.user.id), str(interaction.channel_id)))
     auction_id = cur.lastrowid
     conn.commit()
+
+    record_bid(auction_id, str(player_id), str(interaction.user.id), interaction.user.display_name, base)
+    auction_last_bids[int(auction_id)] = [f"• **{interaction.user.display_name}** apre → **{base}** cr"]
 
     cur.execute("""
         SELECT a.*, p.*
@@ -477,7 +651,7 @@ async def asta(interaction: discord.Interaction, player_id: str):
 
     card_path = create_player_card(player)
     file = discord.File(str(card_path), filename="auction_card.png")
-    embed = auction_embed(player, auction_row)
+    embed = auction_embed(player, auction_row, AUCTION_SECONDS)
     embed.set_image(url="attachment://auction_card.png")
 
     message = await interaction.followup.send(embed=embed, file=file, view=AuctionView(), wait=True)
@@ -488,8 +662,41 @@ async def asta(interaction: discord.Interaction, player_id: str):
     conn.commit()
     conn.close()
 
-    await asyncio.sleep(AUCTION_SECONDS)
-    await close_auction(interaction.channel, auction_id, message)
+    await run_auction_countdown(interaction.channel, auction_id, message)
+
+
+async def run_auction_countdown(channel, auction_id: int, message):
+    auction_timers[int(auction_id)] = AUCTION_SECONDS
+
+    while auction_timers.get(int(auction_id), 0) > 0:
+        remaining = auction_timers[int(auction_id)]
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT a.*, p.*
+            FROM auctions a
+            JOIN players p ON p.id = a.player_id
+            WHERE a.id = ? AND a.status = 'open'
+        """, (auction_id,))
+        row = cur.fetchone()
+        conn.close()
+
+        if not row:
+            auction_timers.pop(int(auction_id), None)
+            return
+
+        if remaining % 5 == 0 or remaining <= 10:
+            try:
+                await message.edit(embed=auction_embed(row, row, remaining), view=AuctionView())
+            except Exception:
+                pass
+
+        await asyncio.sleep(1)
+        auction_timers[int(auction_id)] -= 1
+
+    auction_timers.pop(int(auction_id), None)
+    await close_auction(channel, auction_id, message)
 
 
 async def close_auction(channel, auction_id: int, message=None):
@@ -497,7 +704,7 @@ async def close_auction(channel, auction_id: int, message=None):
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT a.*, p.name AS player_name, p.id AS player_id
+        SELECT a.*, p.name AS player_name, p.id AS player_id, p.position AS player_position
         FROM auctions a
         JOIN players p ON p.id = a.player_id
         WHERE a.id = ? AND a.status = 'open'
@@ -512,7 +719,9 @@ async def close_auction(channel, auction_id: int, message=None):
         cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (auction["highest_bidder_id"],))
         manager = cur.fetchone()
 
-        if manager and manager["budget"] >= auction["highest_bid"]:
+        ok, group, current, limit = can_add_player_to_roster(auction["highest_bidder_id"], auction["player_position"])
+
+        if manager and manager["budget"] >= auction["highest_bid"] and ok:
             cur.execute("UPDATE managers SET budget = budget - ? WHERE discord_id = ?", (auction["highest_bid"], auction["highest_bidder_id"]))
             cur.execute("UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?", (auction["highest_bidder_id"], auction["highest_bid"], auction["player_id"]))
             cur.execute("UPDATE auctions SET status = 'closed' WHERE id = ?", (auction_id,))
@@ -534,6 +743,19 @@ async def close_auction(channel, auction_id: int, message=None):
                     pass
 
             await channel.send(embed=embed)
+
+            log_channel = await get_log_channel()
+            if log_channel:
+                log_embed = discord.Embed(
+                    title="📜 Log asta",
+                    description=f"**{auction['player_name']}** → **{winner.display_name}**",
+                    color=discord.Color.green()
+                )
+                log_embed.add_field(name="Prezzo", value=f"{auction['highest_bid']} crediti", inline=True)
+                log_embed.add_field(name="ID giocatore", value=str(auction["player_id"]), inline=True)
+                await log_channel.send(embed=log_embed)
+
+            auction_last_bids.pop(int(auction_id), None)
             return
 
     cur.execute("UPDATE auctions SET status = 'closed' WHERE id = ?", (auction_id,))
@@ -552,6 +774,7 @@ async def close_auction(channel, auction_id: int, message=None):
         color=discord.Color.red()
     )
     await channel.send(embed=embed)
+    auction_last_bids.pop(int(auction_id), None)
 
 
 @tree.command(name="offri", description="Fai un'offerta manuale nell'asta aperta")
@@ -596,6 +819,10 @@ async def offri(interaction: discord.Interaction, prezzo: int):
     conn.commit()
     conn.close()
 
+    record_bid(auction["id"], auction["player_id"], str(interaction.user.id), interaction.user.display_name, prezzo)
+    auction_last_bids.setdefault(int(auction["id"]), [])
+    auction_last_bids[int(auction["id"])].append(f"• **{interaction.user.display_name}** manuale → **{prezzo}** cr")
+
     await interaction.response.send_message(f"🔥 **{interaction.user.display_name}** offre **{prezzo}** per **{auction['player_name']}**!", ephemeral=True)
 
 
@@ -630,6 +857,275 @@ async def rosa(interaction: discord.Interaction, utente: discord.Member = None):
         embed.add_field(
             name=f"{r['position']} • {r['name']}",
             value=f"{r['team']} • OVR {r['overall']} • {r['sold_price']} cr",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="mercato", description="Mostra giocatori liberi filtrabili")
+@app_commands.describe(ruolo="Ruolo, es. ST, CM, CB", overall_min="Overall minimo", overall_max="Overall massimo")
+async def mercato(interaction: discord.Interaction, ruolo: str = None, overall_min: int = 0, overall_max: int = 99):
+    await interaction.response.defer(ephemeral=True)
+
+    conn = connect()
+    cur = conn.cursor()
+
+    if ruolo:
+        cur.execute("""
+            SELECT *
+            FROM players
+            WHERE owner_discord_id IS NULL
+              AND LOWER(position) = LOWER(?)
+              AND overall BETWEEN ? AND ?
+            ORDER BY overall DESC
+            LIMIT 15
+        """, (ruolo, overall_min, overall_max))
+    else:
+        cur.execute("""
+            SELECT *
+            FROM players
+            WHERE owner_discord_id IS NULL
+              AND overall BETWEEN ? AND ?
+            ORDER BY overall DESC
+            LIMIT 15
+        """, (overall_min, overall_max))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await interaction.followup.send("Nessun giocatore libero trovato con questi filtri.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🛒 Mercato giocatori liberi",
+        description="Top risultati disponibili.",
+        color=discord.Color.blue()
+    )
+
+    for r in rows:
+        embed.add_field(
+            name=f"{r['name']} • ID {r['id']}",
+            value=f"{r['position']} • {r['team']} • OVR **{r['overall']}**",
+            inline=False
+        )
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="top_acquisti", description="Mostra gli acquisti più costosi")
+async def top_acquisti(interaction: discord.Interaction):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT name, team, position, overall, sold_price, owner_discord_id
+        FROM players
+        WHERE sold_price IS NOT NULL
+        ORDER BY sold_price DESC
+        LIMIT 10
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await interaction.response.send_message("Nessun acquisto registrato.")
+        return
+
+    embed = discord.Embed(title="💸 Top acquisti", color=discord.Color.gold())
+
+    for i, r in enumerate(rows, start=1):
+        embed.add_field(
+            name=f"{i}. {r['name']} — {r['sold_price']} cr",
+            value=f"{r['position']} • {r['team']} • OVR {r['overall']} • <@{r['owner_discord_id']}>",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="classifica_budget", description="Classifica budget residuo")
+async def classifica_budget(interaction: discord.Interaction):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT discord_id, name, budget
+        FROM managers
+        ORDER BY budget DESC
+        LIMIT 20
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await interaction.response.send_message("Nessun manager registrato.")
+        return
+
+    embed = discord.Embed(title="💰 Classifica budget", color=discord.Color.green())
+
+    for i, r in enumerate(rows, start=1):
+        embed.add_field(
+            name=f"{i}. {r['name']}",
+            value=f"Budget: **{r['budget']}** crediti",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="team_rating", description="Mostra overall medio della rosa")
+@app_commands.describe(utente="Manager da controllare")
+async def team_rating(interaction: discord.Interaction, utente: discord.Member = None):
+    target = utente or interaction.user
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*) AS total, AVG(overall) AS avg_ovr, MAX(overall) AS max_ovr
+        FROM players
+        WHERE owner_discord_id = ?
+    """, (str(target.id),))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row or not row["total"]:
+        await interaction.response.send_message(f"{target.display_name} non ha ancora giocatori.")
+        return
+
+    embed = discord.Embed(
+        title=f"⭐ Team rating — {target.display_name}",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="Giocatori", value=str(row["total"]), inline=True)
+    embed.add_field(name="Overall medio", value=f"{row['avg_ovr']:.1f}", inline=True)
+    embed.add_field(name="Miglior OVR", value=str(row["max_ovr"]), inline=True)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="svincola", description="Admin: svincola un giocatore")
+@app_commands.describe(player_id="ID giocatore da svincolare")
+async def svincola(interaction: discord.Interaction, player_id: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT name, owner_discord_id, sold_price FROM players WHERE id = ?", (player_id,))
+    player = cur.fetchone()
+
+    if not player:
+        conn.close()
+        await interaction.response.send_message("Giocatore non trovato.", ephemeral=True)
+        return
+
+    if player["owner_discord_id"] and player["sold_price"]:
+        cur.execute(
+            "UPDATE managers SET budget = budget + ? WHERE discord_id = ?",
+            (player["sold_price"], player["owner_discord_id"])
+        )
+
+    cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL WHERE id = ?", (player_id,))
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(f"✅ **{player['name']}** svincolato. Budget rimborsato.")
+
+
+@tree.command(name="assegna", description="Admin: assegna manualmente un giocatore")
+@app_commands.describe(player_id="ID giocatore", utente="Utente a cui assegnare", prezzo="Prezzo assegnazione")
+async def assegna(interaction: discord.Interaction, player_id: str, utente: discord.Member, prezzo: int):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM players WHERE id = ?", (player_id,))
+    player = cur.fetchone()
+
+    if not player:
+        conn.close()
+        await interaction.response.send_message("Giocatore non trovato.", ephemeral=True)
+        return
+
+    cur.execute("SELECT * FROM managers WHERE discord_id = ?", (str(utente.id),))
+    manager = cur.fetchone()
+
+    if not manager:
+        conn.close()
+        await interaction.response.send_message("L'utente deve prima usare `/registrami`.", ephemeral=True)
+        return
+
+    if safe_int(manager["budget"]) < prezzo:
+        conn.close()
+        await interaction.response.send_message("Budget insufficiente per questo utente.", ephemeral=True)
+        return
+
+    cur.execute("UPDATE managers SET budget = budget - ? WHERE discord_id = ?", (prezzo, str(utente.id)))
+    cur.execute("UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?", (str(utente.id), prezzo, player_id))
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(f"✅ **{player['name']}** assegnato a **{utente.display_name}** per **{prezzo}** crediti.")
+
+
+@tree.command(name="pack_gold", description="Admin: assegna un pack gold casuale a un utente")
+@app_commands.describe(utente="Utente che riceve il pack", numero="Numero giocatori da assegnare")
+async def pack_gold(interaction: discord.Interaction, utente: discord.Member, numero: int = 3):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        return
+
+    numero = max(1, min(numero, 5))
+
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM managers WHERE discord_id = ?", (str(utente.id),))
+    manager = cur.fetchone()
+
+    if not manager:
+        conn.close()
+        await interaction.response.send_message("L'utente deve prima usare `/registrami`.", ephemeral=True)
+        return
+
+    cur.execute("""
+        SELECT *
+        FROM players
+        WHERE owner_discord_id IS NULL
+          AND overall BETWEEN 75 AND 84
+        ORDER BY RANDOM()
+        LIMIT ?
+    """, (numero,))
+    players = cur.fetchall()
+
+    if not players:
+        conn.close()
+        await interaction.response.send_message("Non ci sono abbastanza giocatori liberi per il pack.", ephemeral=True)
+        return
+
+    for p in players:
+        cur.execute(
+            "UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?",
+            (str(utente.id), 0, p["id"])
+        )
+
+    conn.commit()
+    conn.close()
+
+    embed = discord.Embed(
+        title="🎁 Pack Gold assegnato",
+        description=f"Admin ha assegnato un pack a **{utente.display_name}**.",
+        color=discord.Color.gold()
+    )
+
+    for p in players:
+        embed.add_field(
+            name=f"{p['name']} • OVR {p['overall']}",
+            value=f"{p['position']} • {p['team']}",
             inline=False
         )
 
