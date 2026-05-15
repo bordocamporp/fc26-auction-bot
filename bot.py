@@ -2,6 +2,8 @@ import os
 import asyncio
 import random
 import unicodedata
+from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -23,6 +25,7 @@ MIN_RAISE = 10
 AUCTION_SECONDS = 45
 ANTI_SNIPE_THRESHOLD = 10
 ANTI_SNIPE_EXTENSION = 10
+MARKET_TAX = 5
 
 MAX_GK = 2
 MAX_DEF = 6
@@ -35,6 +38,10 @@ tree = bot.tree
 
 auction_timers = {}
 auction_last_bids = {}
+
+GRAPHICS_DIR = Path('generated_graphics')
+GRAPHICS_DIR.mkdir(exist_ok=True)
+WALKOUT_GIF = 'https://media.giphy.com/media/3oriO0OEd9QIDdllqo/giphy.gif'
 
 
 def get_guild():
@@ -142,6 +149,44 @@ def ensure_extra_tables():
         bidder_id TEXT NOT NULL,
         bidder_name TEXT,
         amount INTEGER NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS transfer_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player_id TEXT NOT NULL,
+        player_name TEXT,
+        manager_id TEXT NOT NULL,
+        manager_name TEXT,
+        price INTEGER DEFAULT 0,
+        source TEXT DEFAULT 'auction',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS blacklist_players (
+        player_id TEXT PRIMARY KEY,
+        reason TEXT,
+        created_by TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trade_offers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        proposer_id TEXT NOT NULL,
+        proposer_name TEXT,
+        target_id TEXT NOT NULL,
+        target_name TEXT,
+        offer_player_id TEXT,
+        request_player_id TEXT,
+        credits_to_target INTEGER DEFAULT 0,
+        credits_to_proposer INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'pending',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
     """)
@@ -267,6 +312,108 @@ def record_bid(auction_id, player_id, bidder_id, bidder_name, amount):
     conn.close()
 
 
+def record_transfer(player_id, player_name, manager_id, manager_name, price, source="auction"):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO transfer_history (player_id, player_name, manager_id, manager_name, price, source)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (str(player_id), player_name, str(manager_id), manager_name, int(price or 0), source))
+    conn.commit()
+    conn.close()
+
+
+def is_blacklisted(player_id):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT player_id FROM blacklist_players WHERE player_id = ?", (str(player_id),))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
+async def safe_dm(user_id, message=None, embed=None):
+    try:
+        user = await bot.fetch_user(int(user_id))
+        await user.send(content=message, embed=embed)
+        return True
+    except Exception:
+        return False
+
+
+def _font(size=24, bold=False):
+    candidates = [
+        "arialbd.ttf" if bold else "arial.ttf",
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/segoeuib.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf",
+    ]
+    for f in candidates:
+        try:
+            return ImageFont.truetype(f, size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def generate_roster_graphic(discord_id, display_name):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT name, team, position, overall, sold_price
+        FROM players
+        WHERE owner_discord_id = ?
+        ORDER BY overall DESC
+    """, (str(discord_id),))
+    rows = cur.fetchall()
+    conn.close()
+
+    width, height = 1100, 1500
+    img = Image.new("RGB", (width, height), (18, 95, 58))
+    draw = ImageDraw.Draw(img)
+
+    # pitch
+    draw.rounded_rectangle((45, 45, width-45, height-45), radius=30, outline=(235, 235, 235), width=5)
+    draw.line((45, height//2, width-45, height//2), fill=(235,235,235), width=4)
+    draw.ellipse((width//2-120, height//2-120, width//2+120, height//2+120), outline=(235,235,235), width=4)
+    draw.text((width//2, 105), f"ROSA {display_name}".upper(), font=_font(48, True), fill=(255,255,255), anchor="mm")
+
+    groups = {"GK": [], "DEF": [], "MID": [], "ATT": [], "OTHER": []}
+    for r in rows:
+        groups.setdefault(role_group(r["position"]), []).append(r)
+
+    slots = {
+        "GK": [(550, 1280), (350, 1280)],
+        "DEF": [(220, 1010), (440, 1040), (660, 1040), (880, 1010), (330, 900), (770, 900)],
+        "MID": [(220, 700), (440, 740), (660, 740), (880, 700), (330, 610), (770, 610)],
+        "ATT": [(300, 360), (550, 310), (800, 360), (550, 450)],
+        "OTHER": [(150, 1350), (950, 1350)]
+    }
+
+    def draw_card(x, y, p):
+        draw.rounded_rectangle((x-85, y-58, x+85, y+58), radius=18, fill=(31, 31, 36), outline=(255, 220, 130), width=3)
+        draw.text((x-68, y-35), str(p["overall"]), font=_font(30, True), fill=(255, 224, 130))
+        draw.text((x+55, y-35), str(p["position"]), font=_font(20, True), fill=(255, 255, 255), anchor="mm")
+        name = str(p["name"])
+        if len(name) > 16:
+            name = name[:15] + "…"
+        draw.text((x, y+5), name, font=_font(22, True), fill=(255,255,255), anchor="mm")
+        draw.text((x, y+34), f"{p['sold_price'] or 0} cr", font=_font(18), fill=(220,220,220), anchor="mm")
+
+    for group, players in groups.items():
+        for idx, p in enumerate(players[:len(slots.get(group, []))]):
+            x, y = slots[group][idx]
+            draw_card(x, y, p)
+
+    total_spent = sum(safe_int(r["sold_price"]) for r in rows)
+    avg_ovr = (sum(safe_int(r["overall"]) for r in rows) / len(rows)) if rows else 0
+    draw.rounded_rectangle((120, 1400, 980, 1460), radius=20, fill=(25,25,30))
+    draw.text((550, 1430), f"Giocatori: {len(rows)}  •  OVR medio: {avg_ovr:.1f}  •  Speso: {total_spent} cr", font=_font(28, True), fill=(255,255,255), anchor="mm")
+
+    out = GRAPHICS_DIR / f"rosa_{discord_id}.png"
+    img.save(out, quality=95)
+    return out
+
+
 async def place_bid(interaction: discord.Interaction, increment=None, all_in=False):
     conn = connect()
     cur = conn.cursor()
@@ -302,6 +449,7 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
         )
         return
 
+    previous_bidder_id = auction["highest_bidder_id"]
     current_bid = safe_int(auction["highest_bid"])
     new_bid = safe_int(manager["budget"]) if all_in else current_bid + safe_int(increment)
 
@@ -341,6 +489,12 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
     bidder_name = interaction.user.display_name
 
     record_bid(auction_id, player_id, str(interaction.user.id), bidder_name, new_bid)
+
+    if previous_bidder_id and str(previous_bidder_id) != str(interaction.user.id):
+        await safe_dm(
+            previous_bidder_id,
+            f"🔔 Sei stato superato nell'asta di **{auction['player_name']}**. Nuova offerta: **{new_bid}** crediti."
+        )
 
     auction_last_bids.setdefault(auction_id, [])
     label = "ALL IN" if all_in else f"+{increment}"
@@ -614,6 +768,11 @@ async def asta(interaction: discord.Interaction, player_id: str):
         await interaction.followup.send("Questo giocatore è già stato assegnato.", ephemeral=True)
         return
 
+    if is_blacklisted(player_id):
+        conn.close()
+        await interaction.followup.send("Questo giocatore è in blacklist e non può andare all'asta.", ephemeral=True)
+        return
+
     cur.execute("SELECT * FROM auctions WHERE status = 'open'")
     open_auction = cur.fetchone()
     if open_auction:
@@ -671,13 +830,24 @@ async def asta(interaction: discord.Interaction, player_id: str):
 
     message = await interaction.followup.send(embed=embed, file=file, view=AuctionView(), wait=True)
 
+    auction_thread = None
+    try:
+        auction_thread = await interaction.channel.create_thread(
+            name=f"Asta {player['name']}"[:90],
+            message=message,
+            auto_archive_duration=60
+        )
+        await auction_thread.send(f"Thread automatico per l'asta di **{player['name']}**.")
+    except Exception:
+        auction_thread = None
+
     conn = connect()
     cur = conn.cursor()
     cur.execute("UPDATE auctions SET message_id = ? WHERE id = ?", (str(message.id), auction_id))
     conn.commit()
     conn.close()
 
-    await run_auction_countdown(interaction.channel, auction_id, message)
+    await run_auction_countdown(auction_thread or interaction.channel, auction_id, message)
 
 
 async def run_auction_countdown(channel, auction_id: int, message):
@@ -737,19 +907,41 @@ async def close_auction(channel, auction_id: int, message=None):
         ok, group, current, limit = can_add_player_to_roster(auction["highest_bidder_id"], auction["player_position"])
 
         if manager and manager["budget"] >= auction["highest_bid"] and ok:
-            cur.execute("UPDATE managers SET budget = budget - ? WHERE discord_id = ?", (auction["highest_bid"], auction["highest_bidder_id"]))
-            cur.execute("UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?", (auction["highest_bidder_id"], auction["highest_bid"], auction["player_id"]))
+            tax_amount = int((auction["highest_bid"] * MARKET_TAX) / 100)
+            final_price = int(auction["highest_bid"]) + tax_amount
+
+            cur.execute(
+                "UPDATE managers SET budget = budget - ? WHERE discord_id = ?",
+                (final_price, auction["highest_bidder_id"])
+            )
+            cur.execute("UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?", (auction["highest_bidder_id"], final_price, auction["player_id"]))
             cur.execute("UPDATE auctions SET status = 'closed' WHERE id = ?", (auction_id,))
             conn.commit()
             conn.close()
 
             winner = await bot.fetch_user(int(auction["highest_bidder_id"]))
+            record_transfer(
+                auction["player_id"],
+                auction["player_name"],
+                auction["highest_bidder_id"],
+                winner.display_name,
+                final_price,
+                source="auction"
+            )
+            await safe_dm(
+                auction["highest_bidder_id"],
+                f"🏆 Hai vinto l'asta di **{auction['player_name']}** per **{auction['highest_bid']}** crediti!"
+            )
+
             embed = discord.Embed(
                 title="✅ ASTA CHIUSA",
                 description=f"**{auction['player_name']}** assegnato a **{winner.display_name}**.",
                 color=discord.Color.green()
             )
             embed.add_field(name="Prezzo finale", value=f"{auction['highest_bid']} crediti", inline=True)
+            embed.add_field(name="Tassa mercato", value=f"{tax_amount} crediti ({MARKET_TAX}%)", inline=True)
+            embed.add_field(name="Costo totale", value=f"{final_price} crediti", inline=True)
+            embed.set_image(url=WALKOUT_GIF)
 
             if message:
                 try:
@@ -1387,6 +1579,473 @@ async def liberi(interaction: discord.Interaction):
     embed.set_footer(text="La lista mostra i migliori 15 liberi per ruolo.")
 
     await interaction.response.send_message(embed=embed, view=LiberiView(), ephemeral=True)
+
+
+
+
+@tree.command(name="rosa_grafica", description="Genera una rosa grafica stile FUT")
+@app_commands.describe(utente="Manager da visualizzare")
+async def rosa_grafica(interaction: discord.Interaction, utente: discord.Member = None):
+    await interaction.response.defer()
+
+    target = utente or interaction.user
+    image_path = generate_roster_graphic(target.id, target.display_name)
+    file = discord.File(str(image_path), filename="rosa_grafica.png")
+
+    embed = discord.Embed(
+        title=f"🖼️ Rosa grafica di {target.display_name}",
+        color=discord.Color.green()
+    )
+    embed.set_image(url="attachment://rosa_grafica.png")
+
+    await interaction.followup.send(embed=embed, file=file)
+
+
+class StoricoSelect(discord.ui.Select):
+    def __init__(self, managers):
+        options = []
+        for manager in managers[:25]:
+            options.append(
+                discord.SelectOption(
+                    label=manager["name"][:100],
+                    value=str(manager["discord_id"]),
+                    description=f"Budget: {manager['budget']} crediti"
+                )
+            )
+
+        super().__init__(
+            placeholder="Scegli un manager...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="storico_select_manager"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        manager_id = self.values[0]
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("SELECT name, budget FROM managers WHERE discord_id = ?", (manager_id,))
+        manager = cur.fetchone()
+
+        cur.execute("""
+            SELECT player_name, price, source, created_at
+            FROM transfer_history
+            WHERE manager_id = ?
+            ORDER BY id DESC
+            LIMIT 15
+        """, (manager_id,))
+        rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT COUNT(*) AS total, AVG(overall) AS avg_ovr, SUM(sold_price) AS spent
+            FROM players
+            WHERE owner_discord_id = ?
+        """, (manager_id,))
+        summary = cur.fetchone()
+        conn.close()
+
+        if not manager:
+            await interaction.response.send_message("Manager non trovato.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title=f"📜 Storico di {manager['name']}",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Budget", value=f"{manager['budget']} crediti", inline=True)
+        embed.add_field(name="Giocatori rosa", value=str(summary["total"] or 0), inline=True)
+        embed.add_field(name="OVR medio", value=f"{(summary['avg_ovr'] or 0):.1f}", inline=True)
+        embed.add_field(name="Speso totale", value=f"{safe_int(summary['spent'])} crediti", inline=True)
+
+        if rows:
+            lines = []
+            for r in rows:
+                lines.append(f"• **{r['player_name']}** — {r['price']} cr — {r['source']}")
+            embed.add_field(name="Ultimi movimenti", value="\n".join(lines), inline=False)
+        else:
+            embed.add_field(name="Ultimi movimenti", value="Nessun movimento registrato.", inline=False)
+
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class StoricoView(discord.ui.View):
+    def __init__(self, managers):
+        super().__init__(timeout=180)
+        self.add_item(StoricoSelect(managers))
+
+
+@tree.command(name="storico", description="Mostra lo storico mercato scegliendo un manager")
+async def storico(interaction: discord.Interaction):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT discord_id, name, budget
+        FROM managers
+        ORDER BY name ASC
+    """)
+    managers = cur.fetchall()
+    conn.close()
+
+    if not managers:
+        await interaction.response.send_message("Nessun manager registrato.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="📜 Storico mercato",
+        description="Scegli un manager dalla tendina.",
+        color=discord.Color.blue()
+    )
+
+    await interaction.response.send_message(embed=embed, view=StoricoView(managers), ephemeral=True)
+
+
+class TradeView(discord.ui.View):
+    def __init__(self, trade_id):
+        super().__init__(timeout=86400)
+        self.trade_id = trade_id
+
+    @discord.ui.button(label="Accetta", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        conn = connect()
+        cur = conn.cursor()
+
+        cur.execute("SELECT * FROM trade_offers WHERE id = ? AND status = 'pending'", (self.trade_id,))
+        trade = cur.fetchone()
+
+        if not trade:
+            conn.close()
+            await interaction.response.send_message("Scambio non trovato o già concluso.", ephemeral=True)
+            return
+
+        if str(interaction.user.id) != str(trade["target_id"]):
+            conn.close()
+            await interaction.response.send_message("Solo il destinatario dello scambio può accettare.", ephemeral=True)
+            return
+
+        proposer_id = str(trade["proposer_id"])
+        target_id = str(trade["target_id"])
+        offer_player_id = trade["offer_player_id"]
+        request_player_id = trade["request_player_id"]
+        credits_to_target = safe_int(trade["credits_to_target"])
+        credits_to_proposer = safe_int(trade["credits_to_proposer"])
+
+        # Validate players ownership.
+        if offer_player_id:
+            cur.execute("SELECT name, owner_discord_id FROM players WHERE id = ?", (offer_player_id,))
+            p = cur.fetchone()
+            if not p or str(p["owner_discord_id"]) != proposer_id:
+                conn.close()
+                await interaction.response.send_message("Scambio non valido: il proponente non possiede più il giocatore offerto.", ephemeral=True)
+                return
+
+        if request_player_id:
+            cur.execute("SELECT name, owner_discord_id FROM players WHERE id = ?", (request_player_id,))
+            p = cur.fetchone()
+            if not p or str(p["owner_discord_id"]) != target_id:
+                conn.close()
+                await interaction.response.send_message("Scambio non valido: non possiedi più il giocatore richiesto.", ephemeral=True)
+                return
+
+        # Validate budgets.
+        cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (proposer_id,))
+        proposer = cur.fetchone()
+        cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (target_id,))
+        target = cur.fetchone()
+
+        if not proposer or not target:
+            conn.close()
+            await interaction.response.send_message("Uno dei due utenti non è registrato.", ephemeral=True)
+            return
+
+        if safe_int(proposer["budget"]) < credits_to_target:
+            conn.close()
+            await interaction.response.send_message("Scambio non valido: il proponente non ha abbastanza crediti.", ephemeral=True)
+            return
+
+        if safe_int(target["budget"]) < credits_to_proposer:
+            conn.close()
+            await interaction.response.send_message("Scambio non valido: non hai abbastanza crediti.", ephemeral=True)
+            return
+
+        # Money movements.
+        tax_target = int((credits_to_target * MARKET_TAX) / 100)
+        tax_proposer = int((credits_to_proposer * MARKET_TAX) / 100)
+
+        if credits_to_target:
+            cur.execute("UPDATE managers SET budget = budget - ? WHERE discord_id = ?", (credits_to_target + tax_target, proposer_id))
+            cur.execute("UPDATE managers SET budget = budget + ? WHERE discord_id = ?", (credits_to_target, target_id))
+
+        if credits_to_proposer:
+            cur.execute("UPDATE managers SET budget = budget - ? WHERE discord_id = ?", (credits_to_proposer + tax_proposer, target_id))
+            cur.execute("UPDATE managers SET budget = budget + ? WHERE discord_id = ?", (credits_to_proposer, proposer_id))
+
+        # Player movements.
+        if offer_player_id:
+            cur.execute("UPDATE players SET owner_discord_id = ? WHERE id = ?", (target_id, offer_player_id))
+
+        if request_player_id:
+            cur.execute("UPDATE players SET owner_discord_id = ? WHERE id = ?", (proposer_id, request_player_id))
+
+        cur.execute("UPDATE trade_offers SET status = 'accepted' WHERE id = ?", (self.trade_id,))
+        conn.commit()
+        conn.close()
+
+        await interaction.response.edit_message(content="✅ Scambio accettato e completato.", embed=None, view=None)
+
+    @discord.ui.button(label="Rifiuta", style=discord.ButtonStyle.danger)
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        conn = connect()
+        cur = conn.cursor()
+
+        cur.execute("SELECT * FROM trade_offers WHERE id = ? AND status = 'pending'", (self.trade_id,))
+        trade = cur.fetchone()
+
+        if not trade:
+            conn.close()
+            await interaction.response.send_message("Scambio non trovato o già concluso.", ephemeral=True)
+            return
+
+        if str(interaction.user.id) != str(trade["target_id"]):
+            conn.close()
+            await interaction.response.send_message("Solo il destinatario dello scambio può rifiutare.", ephemeral=True)
+            return
+
+        cur.execute("UPDATE trade_offers SET status = 'rejected' WHERE id = ?", (self.trade_id,))
+        conn.commit()
+        conn.close()
+
+        await interaction.response.edit_message(content="❌ Scambio rifiutato.", embed=None, view=None)
+
+
+@tree.command(name="scambio", description="Proponi uno scambio con giocatori e/o crediti")
+@app_commands.describe(
+    utente="Utente a cui proporre lo scambio",
+    offro_player_id="ID giocatore che offri, opzionale",
+    chiedo_player_id="ID giocatore che vuoi ricevere, opzionale",
+    crediti_offerti="Crediti che offri all'altro utente",
+    crediti_richiesti="Crediti che chiedi all'altro utente"
+)
+async def scambio(
+    interaction: discord.Interaction,
+    utente: discord.Member,
+    offro_player_id: str = None,
+    chiedo_player_id: str = None,
+    crediti_offerti: int = 0,
+    crediti_richiesti: int = 0
+):
+    if utente.id == interaction.user.id:
+        await interaction.response.send_message("Non puoi proporre uno scambio a te stesso.", ephemeral=True)
+        return
+
+    if not offro_player_id and not chiedo_player_id and crediti_offerti <= 0 and crediti_richiesti <= 0:
+        await interaction.response.send_message("Devi inserire almeno un giocatore o dei crediti.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM managers WHERE discord_id = ?", (str(interaction.user.id),))
+    proposer = cur.fetchone()
+    cur.execute("SELECT * FROM managers WHERE discord_id = ?", (str(utente.id),))
+    target = cur.fetchone()
+
+    if not proposer or not target:
+        conn.close()
+        await interaction.response.send_message("Entrambi gli utenti devono essere registrati con `/registrami`.", ephemeral=True)
+        return
+
+    if crediti_offerti > safe_int(proposer["budget"]):
+        conn.close()
+        await interaction.response.send_message("Non hai abbastanza crediti da offrire.", ephemeral=True)
+        return
+
+    if crediti_richiesti > safe_int(target["budget"]):
+        conn.close()
+        await interaction.response.send_message("L'altro utente non ha abbastanza crediti per questa proposta.", ephemeral=True)
+        return
+
+    offer_name = "Nessuno"
+    request_name = "Nessuno"
+
+    if offro_player_id:
+        cur.execute("SELECT name, owner_discord_id FROM players WHERE id = ?", (offro_player_id,))
+        p = cur.fetchone()
+        if not p or str(p["owner_discord_id"]) != str(interaction.user.id):
+            conn.close()
+            await interaction.response.send_message("Non possiedi il giocatore che vuoi offrire.", ephemeral=True)
+            return
+        offer_name = p["name"]
+
+    if chiedo_player_id:
+        cur.execute("SELECT name, owner_discord_id FROM players WHERE id = ?", (chiedo_player_id,))
+        p = cur.fetchone()
+        if not p or str(p["owner_discord_id"]) != str(utente.id):
+            conn.close()
+            await interaction.response.send_message("L'altro utente non possiede il giocatore richiesto.", ephemeral=True)
+            return
+        request_name = p["name"]
+
+    cur.execute("""
+        INSERT INTO trade_offers
+        (proposer_id, proposer_name, target_id, target_name, offer_player_id, request_player_id, credits_to_target, credits_to_proposer)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        str(interaction.user.id),
+        interaction.user.display_name,
+        str(utente.id),
+        utente.display_name,
+        offro_player_id,
+        chiedo_player_id,
+        crediti_offerti,
+        crediti_richiesti
+    ))
+    trade_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    embed = discord.Embed(
+        title="🔁 Proposta di scambio",
+        description=f"**{interaction.user.display_name}** propone uno scambio a **{utente.display_name}**.",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Offre", value=f"Giocatore: **{offer_name}**\nCrediti: **{crediti_offerti}**", inline=True)
+    embed.add_field(name="Chiede", value=f"Giocatore: **{request_name}**\nCrediti: **{crediti_richiesti}**", inline=True)
+    embed.set_footer(text=f"ID scambio: {trade_id}")
+
+    await interaction.response.send_message(content=f"{utente.mention}", embed=embed, view=TradeView(trade_id))
+
+
+@tree.command(name="blacklist_add", description="Admin: aggiungi un giocatore alla blacklist")
+@app_commands.describe(player_id="ID giocatore", motivo="Motivo blacklist")
+async def blacklist_add(interaction: discord.Interaction, player_id: str, motivo: str = "Non specificato"):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM players WHERE id = ?", (player_id,))
+    player = cur.fetchone()
+
+    if not player:
+        conn.close()
+        await interaction.response.send_message("Giocatore non trovato.", ephemeral=True)
+        return
+
+    cur.execute("""
+        INSERT OR REPLACE INTO blacklist_players (player_id, reason, created_by)
+        VALUES (?, ?, ?)
+    """, (player_id, motivo, str(interaction.user.id)))
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(f"🚫 **{player['name']}** aggiunto alla blacklist.")
+
+
+@tree.command(name="blacklist_remove", description="Admin: rimuovi un giocatore dalla blacklist")
+@app_commands.describe(player_id="ID giocatore")
+async def blacklist_remove(interaction: discord.Interaction, player_id: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM blacklist_players WHERE player_id = ?", (player_id,))
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message("✅ Giocatore rimosso dalla blacklist.")
+
+
+@tree.command(name="blacklist", description="Mostra i giocatori in blacklist")
+async def blacklist(interaction: discord.Interaction):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT b.player_id, b.reason, p.name
+        FROM blacklist_players b
+        LEFT JOIN players p ON p.id = b.player_id
+        ORDER BY b.created_at DESC
+        LIMIT 20
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await interaction.response.send_message("Blacklist vuota.")
+        return
+
+    embed = discord.Embed(title="🚫 Blacklist giocatori", color=discord.Color.red())
+
+    for r in rows:
+        embed.add_field(
+            name=f"{r['name'] or 'Sconosciuto'} • ID {r['player_id']}",
+            value=r["reason"] or "Nessun motivo",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed)
+
+
+
+
+@tree.command(name="dashboard_admin", description="Admin dashboard completa del bot")
+async def dashboard_admin(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) AS total FROM players")
+    total_players = cur.fetchone()["total"]
+
+    cur.execute("SELECT COUNT(*) AS total FROM players WHERE owner_discord_id IS NULL")
+    free_players = cur.fetchone()["total"]
+
+    cur.execute("SELECT COUNT(*) AS total FROM managers")
+    total_managers = cur.fetchone()["total"]
+
+    cur.execute("SELECT COUNT(*) AS total FROM auctions WHERE status = 'open'")
+    active_auctions = cur.fetchone()["total"]
+
+    cur.execute("SELECT COUNT(*) AS total FROM transfer_history")
+    total_transfers = cur.fetchone()["total"]
+
+    cur.execute("SELECT SUM(sold_price) AS total FROM players WHERE sold_price IS NOT NULL")
+    total_market = cur.fetchone()["total"] or 0
+
+    cur.execute("SELECT COUNT(*) AS total FROM blacklist_players")
+    blacklist_total = cur.fetchone()["total"]
+
+    conn.close()
+
+    embed = discord.Embed(
+        title="🛠️ Dashboard Admin",
+        description="Statistiche complete del bot FC26.",
+        color=discord.Color.red()
+    )
+
+    embed.add_field(name="👥 Manager registrati", value=str(total_managers), inline=True)
+    embed.add_field(name="⚽ Giocatori database", value=str(total_players), inline=True)
+    embed.add_field(name="🟢 Giocatori liberi", value=str(free_players), inline=True)
+    embed.add_field(name="🔨 Aste attive", value=str(active_auctions), inline=True)
+    embed.add_field(name="💸 Trasferimenti", value=str(total_transfers), inline=True)
+    embed.add_field(name="🏦 Mercato totale", value=f"{total_market} cr", inline=True)
+    embed.add_field(name="🚫 Blacklist", value=str(blacklist_total), inline=True)
+    embed.add_field(name="📈 Tassa mercato", value=f"{MARKET_TAX}%", inline=True)
+
+    embed.add_field(
+        name="⚙️ Comandi admin",
+        value="/reset_budget\n/reset_asta\n/svincola\n/assegna\n/blacklist_add\n/pack_gold",
+        inline=False
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 
