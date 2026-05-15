@@ -16,6 +16,7 @@ GUILD_ID = os.getenv("GUILD_ID")
 AUCTION_CHANNEL_ID = os.getenv("AUCTION_CHANNEL_ID")
 AUCTION_LOG_CHANNEL_ID = os.getenv("AUCTION_LOG_CHANNEL_ID", "1504830394908803142")
 ADMIN_ROLE_ID = os.getenv("ADMIN_ROLE_ID", "1398358193197027408")
+SEARCH_CHANNEL_ID = os.getenv("SEARCH_CHANNEL_ID", "1504833349414551703")
 
 DEFAULT_BUDGET = 500
 MIN_RAISE = 10
@@ -51,6 +52,13 @@ def is_admin(interaction: discord.Interaction):
         return any(str(role.id) == str(ADMIN_ROLE_ID) for role in getattr(interaction.user, "roles", []))
 
     return bool(interaction.user.guild_permissions.administrator)
+
+
+def is_search_channel(interaction: discord.Interaction):
+    if not SEARCH_CHANNEL_ID:
+        return True
+
+    return str(interaction.channel_id) == str(SEARCH_CHANNEL_ID)
 
 
 def safe_int(value, default=0):
@@ -507,6 +515,13 @@ async def database(interaction: discord.Interaction):
 @tree.command(name="cerca", description="Cerca un giocatore FC26")
 @app_commands.describe(nome="Nome o parte del nome")
 async def cerca(interaction: discord.Interaction, nome: str):
+    if not is_search_channel(interaction):
+        await interaction.response.send_message(
+            "❌ Puoi cercare i giocatori solo nel canale dedicato alla ricerca.",
+            ephemeral=True
+        )
+        return
+
     await interaction.response.defer(ephemeral=True)
 
     search = normalize_text(nome)
@@ -1130,6 +1145,127 @@ async def pack_gold(interaction: discord.Interaction, utente: discord.Member, nu
         )
 
     await interaction.response.send_message(embed=embed)
+
+
+
+def free_players_embed(title, groups, limit=15):
+    embed = discord.Embed(
+        title=title,
+        description="Lista dei migliori giocatori liberi. Usa l'ID per avviare un'asta.",
+        color=discord.Color.blue()
+    )
+
+    conn = connect()
+    cur = conn.cursor()
+
+    placeholders = ",".join(["?"] * len(groups))
+    query = f"""
+        SELECT *
+        FROM players
+        WHERE owner_discord_id IS NULL
+          AND UPPER(position) IN ({placeholders})
+        ORDER BY overall DESC
+        LIMIT ?
+    """
+
+    cur.execute(query, [g.upper() for g in groups] + [limit])
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        embed.add_field(name="Nessun giocatore", value="Non ci sono giocatori liberi per questo ruolo.", inline=False)
+        return embed
+
+    for i, r in enumerate(rows, start=1):
+        embed.add_field(
+            name=f"{i}. {r['name']} • ID {r['id']}",
+            value=f"{r['position']} • {r['team']} • OVR **{r['overall']}**",
+            inline=False
+        )
+
+    return embed
+
+
+class LiberiSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(
+                label="Portieri",
+                value="gk",
+                emoji="🧤",
+                description="Mostra i migliori portieri liberi"
+            ),
+            discord.SelectOption(
+                label="Difensori",
+                value="def",
+                emoji="🛡️",
+                description="Mostra i migliori difensori liberi"
+            ),
+            discord.SelectOption(
+                label="Centrocampisti",
+                value="mid",
+                emoji="🎯",
+                description="Mostra i migliori centrocampisti liberi"
+            ),
+            discord.SelectOption(
+                label="Attaccanti",
+                value="att",
+                emoji="⚽",
+                description="Mostra i migliori attaccanti liberi"
+            ),
+        ]
+
+        super().__init__(
+            placeholder="Scegli un ruolo...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="liberi_select_role"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+
+        if value == "gk":
+            embed = free_players_embed("🧤 Portieri liberi", ["GK", "POR"])
+        elif value == "def":
+            embed = free_players_embed("🛡️ Difensori liberi", ["CB", "LB", "RB", "LWB", "RWB", "DC", "TS", "TD", "DIF"])
+        elif value == "mid":
+            embed = free_players_embed("🎯 Centrocampisti liberi", ["CDM", "CM", "CAM", "LM", "RM", "MCO", "CDC", "CC", "CEN"])
+        elif value == "att":
+            embed = free_players_embed("⚽ Attaccanti liberi", ["ST", "CF", "LW", "RW", "LF", "RF", "ATT", "AS", "AD", "P"])
+        else:
+            await interaction.response.send_message("Ruolo non valido.", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class LiberiView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(LiberiSelect())
+
+
+@tree.command(name="liberi", description="Mostra i giocatori liberi divisi per ruolo")
+async def liberi(interaction: discord.Interaction):
+    if not is_search_channel(interaction):
+        await interaction.response.send_message(
+            "❌ Puoi usare `/liberi` solo nel canale dedicato alla ricerca giocatori.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="🛒 Giocatori liberi",
+        description="Scegli un ruolo dalla tendina qui sotto.",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Disponibili", value="🧤 Portieri\\n🛡️ Difensori\\n🎯 Centrocampisti\\n⚽ Attaccanti", inline=False)
+    embed.set_footer(text="La lista mostra i migliori 15 liberi per ruolo.")
+
+    await interaction.response.send_message(embed=embed, view=LiberiView(), ephemeral=True)
+
 
 
 if __name__ == "__main__":
