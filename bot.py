@@ -19,6 +19,10 @@ AUCTION_CHANNEL_ID = os.getenv("AUCTION_CHANNEL_ID")
 AUCTION_LOG_CHANNEL_ID = os.getenv("AUCTION_LOG_CHANNEL_ID", "1504830394908803142")
 ADMIN_ROLE_ID = os.getenv("ADMIN_ROLE_ID", "1398358193197027408")
 SEARCH_CHANNEL_ID = os.getenv("SEARCH_CHANNEL_ID", "1504833349414551703")
+SPAM_CHANNEL_ID = "1504846794142781480"
+ROSE_CHANNEL_ID = "1504847438727610519"
+SCAMBI_CHANNEL_ID = "1504847601361616996"
+PRE_ISCRITTO_ROLE_ID = "1398323859056365599"
 
 DEFAULT_BUDGET = 500
 MIN_RAISE = 10
@@ -66,6 +70,16 @@ def is_search_channel(interaction: discord.Interaction):
         return True
 
     return str(interaction.channel_id) == str(SEARCH_CHANNEL_ID)
+
+
+def is_spam_channel(interaction: discord.Interaction):
+    return str(interaction.channel_id) == str(SPAM_CHANNEL_ID)
+
+def is_rose_channel(interaction: discord.Interaction):
+    return str(interaction.channel_id) == str(ROSE_CHANNEL_ID)
+
+def is_scambi_channel(interaction: discord.Interaction):
+    return str(interaction.channel_id) == str(SCAMBI_CHANNEL_ID)
 
 
 def safe_int(value, default=0):
@@ -674,33 +688,208 @@ async def on_ready():
     print(f"Bot online come {bot.user}")
 
 
-@tree.command(name="registrami", description="Registrati al torneo FC26")
-async def registrami(interaction: discord.Interaction):
-    mode = get_league_mode()
 
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
-        (str(interaction.user.id), interaction.user.display_name, DEFAULT_BUDGET)
+class SquadraRealeModal(discord.ui.Modal, title="Assegna squadra reale"):
+    squadra = discord.ui.TextInput(
+        label="Nome squadra da assegnare",
+        placeholder="Esempio: Milan, Inter, Juventus...",
+        required=True,
+        max_length=80
     )
-    conn.commit()
-    conn.close()
 
-    if mode == "squadre_reali":
-        await interaction.response.send_message(
-            "✅ Registrato. Modalità attiva: **Squadre reali**. Un admin dovrà assegnarti una squadra con `/assegna_squadra`.",
-            ephemeral=True
+    def __init__(self, member_id: int, member_name: str):
+        super().__init__()
+        self.member_id = member_id
+        self.member_name = member_name
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può completare questa registrazione.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild
+        member = guild.get_member(int(self.member_id)) if guild else None
+
+        if not member:
+            await interaction.followup.send("Utente non trovato nel server.", ephemeral=True)
+            return
+
+        players, avg_ovr, budget = get_team_stats(str(self.squadra.value))
+
+        if not players:
+            await interaction.followup.send("Squadra non trovata o senza giocatori liberi disponibili.", ephemeral=True)
+            return
+
+        conn = connect()
+        cur = conn.cursor()
+
+        cur.execute(
+            "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
+            (str(member.id), member.display_name, budget)
+        )
+
+        # Se aveva già giocatori, li svincola prima.
+        cur.execute(
+            "UPDATE players SET owner_discord_id = NULL, sold_price = NULL WHERE owner_discord_id = ?",
+            (str(member.id),)
+        )
+
+        for p in players:
+            cur.execute(
+                "UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?",
+                (str(member.id), 0, p["id"])
+            )
+
+        cur.execute(
+            "UPDATE managers SET budget = ?, name = ? WHERE discord_id = ?",
+            (budget, member.display_name, str(member.id))
+        )
+
+        cur.execute("""
+            INSERT OR REPLACE INTO real_team_assignments
+            (discord_id, manager_name, team_name, avg_overall, assigned_budget)
+            VALUES (?, ?, ?, ?, ?)
+        """, (str(member.id), member.display_name, players[0]["team"], avg_ovr, budget))
+
+        conn.commit()
+        conn.close()
+
+        embed = discord.Embed(
+            title="✅ Registrazione completata",
+            description=f"**{member.display_name}** registrato in modalità **Squadre Reali**.",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Squadra", value=players[0]["team"], inline=True)
+        embed.add_field(name="Giocatori assegnati", value=str(len(players)), inline=True)
+        embed.add_field(name="OVR medio", value=f"{avg_ovr:.1f}", inline=True)
+        embed.add_field(name="Budget mercato", value=f"{budget} crediti", inline=True)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class RegistraPreIscrittoSelect(discord.ui.Select):
+    def __init__(self, members):
+        options = []
+
+        for member in members[:25]:
+            options.append(
+                discord.SelectOption(
+                    label=member.display_name[:100],
+                    value=str(member.id),
+                    description=f"ID: {member.id}"
+                )
+            )
+
+        super().__init__(
+            placeholder="Scegli un player PRE-ISCRITTO...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="registra_pre_iscritto_select"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può registrare i player.", ephemeral=True)
+            return
+
+        member_id = int(self.values[0])
+        member = interaction.guild.get_member(member_id) if interaction.guild else None
+
+        if not member:
+            await interaction.response.send_message("Utente non trovato nel server.", ephemeral=True)
+            return
+
+        mode = get_league_mode()
+
+        if mode == "squadre_reali":
+            await interaction.response.send_modal(SquadraRealeModal(member.id, member.display_name))
+            return
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
+            (str(member.id), member.display_name, DEFAULT_BUDGET)
+        )
+        cur.execute(
+            "UPDATE managers SET name = ?, budget = ? WHERE discord_id = ?",
+            (member.display_name, DEFAULT_BUDGET, str(member.id))
+        )
+        conn.commit()
+        conn.close()
+
+        embed = discord.Embed(
+            title="✅ Registrazione completata",
+            description=f"**{member.display_name}** registrato in modalità **Fantacalcio**.",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Budget iniziale", value=f"{DEFAULT_BUDGET} crediti", inline=True)
+
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+class RegistraPreIscrittoView(discord.ui.View):
+    def __init__(self, members):
+        super().__init__(timeout=180)
+        self.add_item(RegistraPreIscrittoSelect(members))
+
+
+@tree.command(name="registra", description="Staff: registra un player pre-iscritto")
+async def registra(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+
+    role = interaction.guild.get_role(int(PRE_ISCRITTO_ROLE_ID)) if interaction.guild else None
+
+    if not role:
+        await interaction.response.send_message("Ruolo PRE-ISCRITTO non trovato.", ephemeral=True)
+        return
+
+    members = [m for m in role.members if not m.bot]
+
+    if not members:
+        await interaction.response.send_message("Non ci sono player con il ruolo PRE-ISCRITTO.", ephemeral=True)
+        return
+
+    mode = get_league_mode()
+    mode_label = "Fantacalcio" if mode == "fantacalcio" else "Squadre Reali"
+
+    embed = discord.Embed(
+        title="📝 Registrazione player",
+        description=f"Modalità attuale: **{mode_label}**\\nScegli dalla tendina un player con ruolo **PRE-ISCRITTO**.",
+        color=discord.Color.blue()
+    )
+
+    if mode == "fantacalcio":
+        embed.add_field(
+            name="Effetto",
+            value=f"Il player verrà registrato con **{DEFAULT_BUDGET} crediti**.",
+            inline=False
         )
     else:
-        await interaction.response.send_message(
-            f"✅ Registrato. Modalità attiva: **Fantacalcio**. Budget iniziale: **{DEFAULT_BUDGET}** crediti.",
-            ephemeral=True
+        embed.add_field(
+            name="Effetto",
+            value="Dopo la selezione si aprirà una finestra dove inserire la squadra reale da assegnare.",
+            inline=False
         )
+
+    if len(members) > 25:
+        embed.set_footer(text="Discord permette massimo 25 utenti nella tendina. Mostro i primi 25.")
+
+    await interaction.response.send_message(embed=embed, view=RegistraPreIscrittoView(members), ephemeral=True)
+
 
 
 @tree.command(name="budget", description="Mostra il tuo budget residuo")
 async def budget(interaction: discord.Interaction):
+    if not is_spam_channel(interaction):
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale SPAM-CHAT.", ephemeral=True)
+        return
+
     conn = connect()
     cur = conn.cursor()
     cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (str(interaction.user.id),))
@@ -825,6 +1014,10 @@ async def cerca(interaction: discord.Interaction, nome: str):
 @tree.command(name="card", description="Mostra la card grafica di un giocatore")
 @app_commands.describe(player_id="ID giocatore")
 async def card(interaction: discord.Interaction, player_id: str):
+    if not is_spam_channel(interaction):
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale SPAM-CHAT.", ephemeral=True)
+        return
+
     await interaction.response.defer()
 
     conn = connect()
@@ -1085,53 +1278,6 @@ async def close_auction(channel, auction_id: int, message=None):
     auction_last_bids.pop(int(auction_id), None)
 
 
-@tree.command(name="offri", description="Fai un'offerta manuale nell'asta aperta")
-@app_commands.describe(prezzo="Prezzo totale offerto")
-async def offri(interaction: discord.Interaction, prezzo: int):
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("SELECT * FROM managers WHERE discord_id = ?", (str(interaction.user.id),))
-    manager = cur.fetchone()
-
-    if not manager:
-        conn.close()
-        await interaction.response.send_message("Prima usa /registrami.", ephemeral=True)
-        return
-
-    if manager["budget"] < prezzo:
-        conn.close()
-        await interaction.response.send_message("Budget insufficiente.", ephemeral=True)
-        return
-
-    cur.execute("""
-        SELECT a.*, p.name AS player_name
-        FROM auctions a
-        JOIN players p ON p.id = a.player_id
-        WHERE a.status = 'open'
-        LIMIT 1
-    """)
-    auction = cur.fetchone()
-
-    if not auction:
-        conn.close()
-        await interaction.response.send_message("Non c'è nessuna asta aperta.", ephemeral=True)
-        return
-
-    if prezzo < auction["highest_bid"] + MIN_RAISE:
-        conn.close()
-        await interaction.response.send_message(f"Devi offrire almeno {auction['highest_bid'] + MIN_RAISE}.", ephemeral=True)
-        return
-
-    cur.execute("UPDATE auctions SET highest_bid = ?, highest_bidder_id = ? WHERE id = ?", (prezzo, str(interaction.user.id), auction["id"]))
-    conn.commit()
-    conn.close()
-
-    record_bid(auction["id"], auction["player_id"], str(interaction.user.id), interaction.user.display_name, prezzo)
-    auction_last_bids.setdefault(int(auction["id"]), [])
-    auction_last_bids[int(auction["id"])].append(f"• **{interaction.user.display_name}** manuale → **{prezzo}** cr")
-
-    await interaction.response.send_message(f"🔥 **{interaction.user.display_name}** offre **{prezzo}** per **{auction['player_name']}**!", ephemeral=True)
 
 
 
@@ -1253,6 +1399,10 @@ class RosaView(discord.ui.View):
 
 @tree.command(name="rosa", description="Mostra una rosa scegliendo il manager da una tendina")
 async def rosa(interaction: discord.Interaction):
+    if not is_rose_channel(interaction):
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
+        return
+
     conn = connect()
     cur = conn.cursor()
     cur.execute("""
@@ -1346,6 +1496,10 @@ async def mercato(interaction: discord.Interaction, ruolo: str = None, overall_m
 
 @tree.command(name="top_acquisti", description="Mostra gli acquisti più costosi")
 async def top_acquisti(interaction: discord.Interaction):
+    if not is_rose_channel(interaction):
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
+        return
+
     conn = connect()
     cur = conn.cursor()
     cur.execute("""
@@ -1376,6 +1530,10 @@ async def top_acquisti(interaction: discord.Interaction):
 
 @tree.command(name="classifica_budget", description="Classifica budget residuo")
 async def classifica_budget(interaction: discord.Interaction):
+    if not is_spam_channel(interaction):
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale SPAM-CHAT.", ephemeral=True)
+        return
+
     conn = connect()
     cur = conn.cursor()
     cur.execute("""
@@ -1406,6 +1564,10 @@ async def classifica_budget(interaction: discord.Interaction):
 @tree.command(name="team_rating", description="Mostra overall medio della rosa")
 @app_commands.describe(utente="Manager da controllare")
 async def team_rating(interaction: discord.Interaction, utente: discord.Member = None):
+    if not is_rose_channel(interaction):
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
+        return
+
     target = utente or interaction.user
 
     conn = connect()
@@ -1687,6 +1849,10 @@ async def liberi(interaction: discord.Interaction):
 @tree.command(name="rosa_grafica", description="Genera una rosa grafica stile FUT")
 @app_commands.describe(utente="Manager da visualizzare")
 async def rosa_grafica(interaction: discord.Interaction, utente: discord.Member = None):
+    if not is_rose_channel(interaction):
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
+        return
+
     await interaction.response.defer()
 
     target = utente or interaction.user
@@ -1779,6 +1945,10 @@ class StoricoView(discord.ui.View):
 
 @tree.command(name="storico", description="Mostra lo storico mercato scegliendo un manager")
 async def storico(interaction: discord.Interaction):
+    if not is_rose_channel(interaction):
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
+        return
+
     conn = connect()
     cur = conn.cursor()
     cur.execute("""
@@ -1936,6 +2106,10 @@ async def scambio(
     crediti_offerti: int = 0,
     crediti_richiesti: int = 0
 ):
+    if not is_scambi_channel(interaction):
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale SCAMBI.", ephemeral=True)
+        return
+
     if utente.id == interaction.user.id:
         await interaction.response.send_message("Non puoi proporre uno scambio a te stesso.", ephemeral=True)
         return
