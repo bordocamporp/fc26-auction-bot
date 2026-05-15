@@ -191,6 +191,29 @@ def ensure_extra_tables():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS league_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS real_team_assignments (
+        discord_id TEXT PRIMARY KEY,
+        manager_name TEXT,
+        team_name TEXT,
+        avg_overall REAL,
+        assigned_budget INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+        INSERT OR IGNORE INTO league_settings (key, value)
+        VALUES ('mode', 'fantacalcio')
+    """)
+
     conn.commit()
     conn.close()
 
@@ -330,6 +353,72 @@ def is_blacklisted(player_id):
     row = cur.fetchone()
     conn.close()
     return row is not None
+
+
+def get_league_mode():
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM league_settings WHERE key = 'mode'")
+    row = cur.fetchone()
+    conn.close()
+    return row["value"] if row else "fantacalcio"
+
+
+def set_league_mode(mode):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO league_settings (key, value)
+        VALUES ('mode', ?)
+    """, (mode,))
+    conn.commit()
+    conn.close()
+
+
+def budget_from_team_overall(avg_ovr):
+    avg_ovr = float(avg_ovr or 0)
+
+    if avg_ovr >= 85:
+        return 150
+    if avg_ovr >= 82:
+        return 220
+    if avg_ovr >= 80:
+        return 280
+    if avg_ovr >= 78:
+        return 350
+    if avg_ovr >= 75:
+        return 430
+
+    return 500
+
+
+def normalize_team_name(team):
+    return normalize_text(team).strip()
+
+
+def get_team_stats(team_name):
+    search = normalize_team_name(team_name)
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM players
+        WHERE owner_discord_id IS NULL
+        ORDER BY overall DESC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    matched = [r for r in rows if normalize_team_name(r["team"]) == search]
+
+    if not matched:
+        return [], 0, 0
+
+    avg_ovr = sum(safe_int(r["overall"]) for r in matched) / len(matched)
+    budget = budget_from_team_overall(avg_ovr)
+
+    return matched, avg_ovr, budget
 
 
 async def safe_dm(user_id, message=None, embed=None):
@@ -587,6 +676,8 @@ async def on_ready():
 
 @tree.command(name="registrami", description="Registrati al torneo FC26")
 async def registrami(interaction: discord.Interaction):
+    mode = get_league_mode()
+
     conn = connect()
     cur = conn.cursor()
     cur.execute(
@@ -595,7 +686,17 @@ async def registrami(interaction: discord.Interaction):
     )
     conn.commit()
     conn.close()
-    await interaction.response.send_message(f"✅ Registrato con budget {DEFAULT_BUDGET} crediti.", ephemeral=True)
+
+    if mode == "squadre_reali":
+        await interaction.response.send_message(
+            "✅ Registrato. Modalità attiva: **Squadre reali**. Un admin dovrà assegnarti una squadra con `/assegna_squadra`.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"✅ Registrato. Modalità attiva: **Fantacalcio**. Budget iniziale: **{DEFAULT_BUDGET}** crediti.",
+            ephemeral=True
+        )
 
 
 @tree.command(name="budget", description="Mostra il tuo budget residuo")
@@ -1989,6 +2090,260 @@ async def blacklist(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed)
 
+
+
+
+
+class ModalitaSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(
+                label="Fantacalcio",
+                value="fantacalcio",
+                emoji="🏆",
+                description="Tutti partono da zero con lo stesso budget"
+            ),
+            discord.SelectOption(
+                label="Squadre reali",
+                value="squadre_reali",
+                emoji="🏟️",
+                description="Admin assegna squadre reali e budget compensativo"
+            ),
+        ]
+
+        super().__init__(
+            placeholder="Scegli la modalità della lega...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="modalita_select"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo gli admin possono cambiare modalità.", ephemeral=True)
+            return
+
+        mode = self.values[0]
+        set_league_mode(mode)
+
+        if mode == "fantacalcio":
+            description = (
+                "🏆 Modalità impostata su **Fantacalcio**.\n\n"
+                "Tutti i manager costruiscono la rosa da zero tramite aste.\n"
+                f"Budget standard consigliato: **{DEFAULT_BUDGET}** crediti.\n\n"
+                "Puoi usare `/reset_budget` per pareggiare tutti i budget."
+            )
+        else:
+            description = (
+                "🏟️ Modalità impostata su **Squadre reali**.\n\n"
+                "Gli admin assegnano una squadra reale ai player con `/assegna_squadra`.\n"
+                "Il bot assegna automaticamente i giocatori di quel club e calcola un budget compensativo:\n"
+                "• OVR medio 85+ → 150 crediti\n"
+                "• OVR medio 82-84 → 220 crediti\n"
+                "• OVR medio 80-81 → 280 crediti\n"
+                "• OVR medio 78-79 → 350 crediti\n"
+                "• OVR medio 75-77 → 430 crediti\n"
+                "• sotto 75 → 500 crediti"
+            )
+
+        embed = discord.Embed(
+            title="⚙️ Modalità lega aggiornata",
+            description=description,
+            color=discord.Color.gold()
+        )
+
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+class ModalitaView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(ModalitaSelect())
+
+
+@tree.command(name="modalita", description="Admin: scegli la modalità della lega")
+async def modalita(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        return
+
+    current_mode = get_league_mode()
+    pretty = "Fantacalcio" if current_mode == "fantacalcio" else "Squadre reali"
+
+    embed = discord.Embed(
+        title="⚙️ Modalità lega",
+        description=f"Modalità attuale: **{pretty}**\n\nScegli la nuova modalità dalla tendina.",
+        color=discord.Color.blue()
+    )
+
+    await interaction.response.send_message(embed=embed, view=ModalitaView(), ephemeral=True)
+
+
+@tree.command(name="modalita_attuale", description="Mostra la modalità attuale della lega")
+async def modalita_attuale(interaction: discord.Interaction):
+    current_mode = get_league_mode()
+    pretty = "Fantacalcio" if current_mode == "fantacalcio" else "Squadre reali"
+
+    await interaction.response.send_message(f"⚙️ Modalità attuale: **{pretty}**.", ephemeral=True)
+
+
+@tree.command(name="lista_squadre", description="Mostra le squadre reali disponibili")
+@app_commands.describe(nome="Filtro nome squadra, opzionale")
+async def lista_squadre(interaction: discord.Interaction, nome: str = None):
+    await interaction.response.defer(ephemeral=True)
+
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT team, COUNT(*) AS total, AVG(overall) AS avg_ovr
+        FROM players
+        WHERE team IS NOT NULL AND team != ''
+        GROUP BY team
+        HAVING COUNT(*) >= 8
+        ORDER BY avg_ovr DESC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    if nome:
+        search = normalize_text(nome)
+        rows = [r for r in rows if search in normalize_text(r["team"])]
+
+    rows = rows[:20]
+
+    if not rows:
+        await interaction.followup.send("Nessuna squadra trovata.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🏟️ Squadre disponibili",
+        description="Lista squadre presenti nel database. Usa il nome con `/assegna_squadra`.",
+        color=discord.Color.blue()
+    )
+
+    for r in rows:
+        budget = budget_from_team_overall(r["avg_ovr"])
+        embed.add_field(
+            name=f"{r['team']}",
+            value=f"Giocatori: **{r['total']}** • OVR medio: **{r['avg_ovr']:.1f}** • Budget stimato: **{budget} cr**",
+            inline=False
+        )
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="assegna_squadra", description="Admin: assegna una squadra reale a un manager")
+@app_commands.describe(utente="Manager a cui assegnare la squadra", squadra="Nome squadra, es. Milan")
+async def assegna_squadra(interaction: discord.Interaction, utente: discord.Member, squadra: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        return
+
+    if get_league_mode() != "squadre_reali":
+        await interaction.response.send_message(
+            "❌ Questo comando funziona solo in modalità **Squadre reali**. Usa `/modalita` per cambiarla.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+
+    players, avg_ovr, budget = get_team_stats(squadra)
+
+    if not players:
+        await interaction.followup.send("Squadra non trovata o senza giocatori liberi disponibili.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute(
+        "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
+        (str(utente.id), utente.display_name, budget)
+    )
+
+    # Se l'utente aveva già una rosa, la svincoliamo prima di assegnare la squadra.
+    cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL WHERE owner_discord_id = ?", (str(utente.id),))
+
+    for p in players:
+        cur.execute(
+            "UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?",
+            (str(utente.id), 0, p["id"])
+        )
+
+    cur.execute("UPDATE managers SET budget = ?, name = ? WHERE discord_id = ?", (budget, utente.display_name, str(utente.id)))
+
+    cur.execute("""
+        INSERT OR REPLACE INTO real_team_assignments
+        (discord_id, manager_name, team_name, avg_overall, assigned_budget)
+        VALUES (?, ?, ?, ?, ?)
+    """, (str(utente.id), utente.display_name, players[0]["team"], avg_ovr, budget))
+
+    conn.commit()
+    conn.close()
+
+    embed = discord.Embed(
+        title="🏟️ Squadra reale assegnata",
+        description=f"**{utente.display_name}** ora controlla **{players[0]['team']}**.",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Giocatori assegnati", value=str(len(players)), inline=True)
+    embed.add_field(name="OVR medio squadra", value=f"{avg_ovr:.1f}", inline=True)
+    embed.add_field(name="Budget mercato", value=f"{budget} crediti", inline=True)
+    embed.set_footer(text="Prezzo giocatori impostato a 0 perché assegnazione iniziale.")
+
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="squadre_assegnate", description="Mostra le squadre reali già assegnate")
+async def squadre_assegnate(interaction: discord.Interaction):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM real_team_assignments
+        ORDER BY team_name ASC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await interaction.response.send_message("Nessuna squadra reale assegnata.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🏟️ Squadre assegnate",
+        color=discord.Color.blue()
+    )
+
+    for r in rows[:25]:
+        embed.add_field(
+            name=f"{r['team_name']} → {r['manager_name']}",
+            value=f"OVR medio: **{r['avg_overall']:.1f}** • Budget: **{r['assigned_budget']} cr**",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="reset_modalita", description="Admin: resetta modalità, rose e squadre assegnate")
+async def reset_modalita(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL")
+    cur.execute("UPDATE managers SET budget = ?", (DEFAULT_BUDGET,))
+    cur.execute("DELETE FROM real_team_assignments")
+    cur.execute("UPDATE auctions SET status = 'closed' WHERE status = 'open'")
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message("✅ Reset completato: rose svuotate, budget ripristinato, squadre assegnate cancellate.")
 
 
 
