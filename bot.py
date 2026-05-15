@@ -27,7 +27,7 @@ PRE_ISCRITTO_ROLE_ID = "1398323859056365599"
 RESULTS_CHANNEL_ID = "1504874612805337229"
 STANDINGS_CHANNEL_ID = "1504874671064223784"
 STATS_CHANNEL_ID = "1504874788349542431"
-CALENDAR_CHANNEL_ID = "1504877133359747175"
+CALENDAR_CHANNEL_ID = "1504884471286075532"
 LEAGUE_PLAYER_ROLE_ID = "1398332847655358554"
 LEAGUE_ADMIN_ROLE_ID = "1398358193197027408"
 
@@ -3439,6 +3439,212 @@ async def revisioni(interaction: discord.Interaction):
             )
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+
+class ReplaceNewPlayerSelect(discord.ui.Select):
+    def __init__(self, old_member, candidates):
+        self.old_member = old_member
+
+        options = []
+        for m in candidates[:25]:
+            options.append(
+                discord.SelectOption(
+                    label=m.display_name[:100],
+                    value=str(m.id),
+                    description=f"Nuovo player • ID {m.id}"
+                )
+            )
+
+        super().__init__(
+            placeholder="Scegli il nuovo player PRE-ISCRITTO...",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_league_admin(interaction):
+            await interaction.response.send_message("❌ Solo gli admin possono sostituire player.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        new_member = guild.get_member(int(self.values[0])) if guild else None
+
+        if not new_member:
+            await interaction.response.send_message("Nuovo player non trovato.", ephemeral=True)
+            return
+
+        old_id = str(self.old_member.id)
+        new_id = str(new_member.id)
+
+        conn = connect()
+        cur = conn.cursor()
+
+        # Managers
+        cur.execute("SELECT * FROM managers WHERE discord_id = ?", (old_id,))
+        old_manager = cur.fetchone()
+
+        if old_manager:
+            cur.execute("""
+                INSERT OR REPLACE INTO managers (discord_id, name, budget)
+                VALUES (?, ?, ?)
+            """, (
+                new_id,
+                new_member.display_name,
+                old_manager["budget"]
+            ))
+
+            cur.execute("DELETE FROM managers WHERE discord_id = ?", (old_id,))
+
+        # Rosa
+        cur.execute("""
+            UPDATE players
+            SET owner_discord_id = ?
+            WHERE owner_discord_id = ?
+        """, (new_id, old_id))
+
+        # Championship players
+        cur.execute("""
+            UPDATE championship_players
+            SET discord_id = ?, display_name = ?
+            WHERE discord_id = ?
+        """, (new_id, new_member.display_name, old_id))
+
+        # Matches
+        cur.execute("""
+            UPDATE championship_matches
+            SET home_id = ?, home_name = ?
+            WHERE home_id = ?
+        """, (new_id, new_member.display_name, old_id))
+
+        cur.execute("""
+            UPDATE championship_matches
+            SET away_id = ?, away_name = ?
+            WHERE away_id = ?
+        """, (new_id, new_member.display_name, old_id))
+
+        # Real team assignments
+        cur.execute("""
+            UPDATE real_team_assignments
+            SET discord_id = ?, manager_name = ?
+            WHERE discord_id = ?
+        """, (new_id, new_member.display_name, old_id))
+
+        conn.commit()
+        conn.close()
+
+        embed = discord.Embed(
+            title="🔄 Player sostituito",
+            description=f"**{new_member.display_name}** prende il posto di **{self.old_member.display_name}**.",
+            color=discord.Color.green()
+        )
+
+        embed.add_field(name="Trasferito", value="✅ Rosa\n✅ Budget\n✅ Girone\n✅ Calendario\n✅ Statistiche", inline=False)
+
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+class ReplaceNewPlayerView(discord.ui.View):
+    def __init__(self, old_member, candidates):
+        super().__init__(timeout=180)
+        self.add_item(ReplaceNewPlayerSelect(old_member, candidates))
+
+
+class ReplaceOldPlayerSelect(discord.ui.Select):
+    def __init__(self, registered_members):
+        options = []
+
+        for m in registered_members[:25]:
+            options.append(
+                discord.SelectOption(
+                    label=m.display_name[:100],
+                    value=str(m.id),
+                    description=f"Player iscritto • ID {m.id}"
+                )
+            )
+
+        super().__init__(
+            placeholder="Scegli il player da sostituire...",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_league_admin(interaction):
+            await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+
+        old_member = guild.get_member(int(self.values[0])) if guild else None
+
+        if not old_member:
+            await interaction.response.send_message("Player non trovato.", ephemeral=True)
+            return
+
+        pre_role = guild.get_role(int(PRE_ISCRITTO_ROLE_ID)) if guild else None
+
+        if not pre_role:
+            await interaction.response.send_message("Ruolo PRE-ISCRITTO non trovato.", ephemeral=True)
+            return
+
+        candidates = [m for m in pre_role.members if not m.bot]
+
+        if not candidates:
+            await interaction.response.send_message("Nessun player PRE-ISCRITTO disponibile.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="🔄 Sostituzione player",
+            description=f"Hai scelto di sostituire **{old_member.display_name}**.\n\nOra scegli il nuovo player PRE-ISCRITTO.",
+            color=discord.Color.orange()
+        )
+
+        await interaction.response.edit_message(
+            embed=embed,
+            view=ReplaceNewPlayerView(old_member, candidates)
+        )
+
+
+class ReplaceOldPlayerView(discord.ui.View):
+    def __init__(self, registered_members):
+        super().__init__(timeout=180)
+        self.add_item(ReplaceOldPlayerSelect(registered_members))
+
+
+@tree.command(name="sostituisci_player", description="Admin: sostituisce un player nel campionato")
+async def sostituisci_player(interaction: discord.Interaction):
+    if not is_league_admin(interaction):
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+
+    role = guild.get_role(int(LEAGUE_PLAYER_ROLE_ID)) if guild else None
+
+    if not role:
+        await interaction.response.send_message("Ruolo ISCRITTI non trovato.", ephemeral=True)
+        return
+
+    registered_members = [m for m in role.members if not m.bot]
+
+    if not registered_members:
+        await interaction.response.send_message("Nessun player ISCRITTO trovato.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🔄 Sostituzione player campionato",
+        description="Seleziona dalla tendina il player ISCRITTO da sostituire.",
+        color=discord.Color.blue()
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=ReplaceOldPlayerView(registered_members),
+        ephemeral=True
+    )
 
 
 if __name__ == "__main__":
