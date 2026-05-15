@@ -24,6 +24,13 @@ ROSE_CHANNEL_ID = "1504847438727610519"
 SCAMBI_CHANNEL_ID = "1504847601361616996"
 PRE_ISCRITTO_ROLE_ID = "1398323859056365599"
 
+RESULTS_CHANNEL_ID = "1504874612805337229"
+STANDINGS_CHANNEL_ID = "1504874671064223784"
+STATS_CHANNEL_ID = "1504874788349542431"
+CALENDAR_CHANNEL_ID = "1504877133359747175"
+LEAGUE_PLAYER_ROLE_ID = "1398332847655358554"
+LEAGUE_ADMIN_ROLE_ID = "1398358193197027408"
+
 DEFAULT_BUDGET = 500
 MIN_RAISE = 10
 AUCTION_SECONDS = 45
@@ -80,6 +87,24 @@ def is_rose_channel(interaction: discord.Interaction):
 
 def is_scambi_channel(interaction: discord.Interaction):
     return str(interaction.channel_id) == str(SCAMBI_CHANNEL_ID)
+
+
+def is_results_channel(interaction: discord.Interaction):
+    return str(interaction.channel_id) == str(RESULTS_CHANNEL_ID)
+
+def is_standings_channel(interaction: discord.Interaction):
+    return str(interaction.channel_id) == str(STANDINGS_CHANNEL_ID)
+
+def is_stats_channel(interaction: discord.Interaction):
+    return str(interaction.channel_id) == str(STATS_CHANNEL_ID)
+
+def is_calendar_channel(interaction: discord.Interaction):
+    return str(interaction.channel_id) == str(CALENDAR_CHANNEL_ID)
+
+def is_league_admin(interaction: discord.Interaction):
+    if LEAGUE_ADMIN_ROLE_ID:
+        return any(str(role.id) == str(LEAGUE_ADMIN_ROLE_ID) for role in getattr(interaction.user, "roles", []))
+    return is_admin(interaction)
 
 
 def safe_int(value, default=0):
@@ -228,6 +253,65 @@ def ensure_extra_tables():
         VALUES ('mode', 'fantacalcio')
     """)
 
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS championships (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        status TEXT DEFAULT 'active',
+        group_count INTEGER DEFAULT 1,
+        teams_per_group INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS championship_groups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        championship_id INTEGER NOT NULL,
+        name TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS championship_players (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        championship_id INTEGER NOT NULL,
+        group_id INTEGER NOT NULL,
+        discord_id TEXT NOT NULL,
+        display_name TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS championship_matches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        championship_id INTEGER NOT NULL,
+        group_id INTEGER NOT NULL,
+        round_number INTEGER NOT NULL,
+        home_id TEXT NOT NULL,
+        away_id TEXT NOT NULL,
+        home_name TEXT,
+        away_name TEXT,
+        home_goals INTEGER,
+        away_goals INTEGER,
+        status TEXT DEFAULT 'pending',
+        submitted_by TEXT,
+        confirm_by TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS match_scorers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        match_id INTEGER NOT NULL,
+        scorer_player_id TEXT,
+        scorer_name TEXT NOT NULL,
+        team_owner_id TEXT NOT NULL,
+        goals INTEGER DEFAULT 1
+    )
+    """)
     conn.commit()
     conn.close()
 
@@ -2576,6 +2660,785 @@ async def dashboard_admin(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+
+
+
+def active_championship():
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM championships WHERE status = 'active' ORDER BY id DESC LIMIT 1")
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def generate_round_robin(players):
+    # players: list of (discord_id, display_name)
+    players = list(players)
+    if len(players) % 2 == 1:
+        players.append((None, "Riposo"))
+
+    n = len(players)
+    rounds = []
+
+    for rnd in range(n - 1):
+        pairs = []
+        for i in range(n // 2):
+            home = players[i]
+            away = players[n - 1 - i]
+            if home[0] is not None and away[0] is not None:
+                if rnd % 2 == 0:
+                    pairs.append((home, away))
+                else:
+                    pairs.append((away, home))
+        rounds.append(pairs)
+        players = [players[0]] + [players[-1]] + players[1:-1]
+
+    # ritorno
+    second_leg = []
+    for pairs in rounds:
+        second_leg.append([(away, home) for home, away in pairs])
+
+    return rounds + second_leg
+
+
+def calculate_group_standings(championship_id, group_id):
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT discord_id, display_name
+        FROM championship_players
+        WHERE championship_id = ? AND group_id = ?
+    """, (championship_id, group_id))
+    players = cur.fetchall()
+
+    table = {}
+    for p in players:
+        table[p["discord_id"]] = {
+            "name": p["display_name"],
+            "pg": 0,
+            "w": 0,
+            "d": 0,
+            "l": 0,
+            "gf": 0,
+            "ga": 0,
+            "gd": 0,
+            "pts": 0,
+        }
+
+    cur.execute("""
+        SELECT *
+        FROM championship_matches
+        WHERE championship_id = ? AND group_id = ? AND status = 'confirmed'
+    """, (championship_id, group_id))
+    matches = cur.fetchall()
+    conn.close()
+
+    for m in matches:
+        h = m["home_id"]
+        a = m["away_id"]
+        hg = int(m["home_goals"] or 0)
+        ag = int(m["away_goals"] or 0)
+
+        if h not in table or a not in table:
+            continue
+
+        table[h]["pg"] += 1
+        table[a]["pg"] += 1
+        table[h]["gf"] += hg
+        table[h]["ga"] += ag
+        table[a]["gf"] += ag
+        table[a]["ga"] += hg
+
+        if hg > ag:
+            table[h]["w"] += 1
+            table[a]["l"] += 1
+            table[h]["pts"] += 3
+        elif hg < ag:
+            table[a]["w"] += 1
+            table[h]["l"] += 1
+            table[a]["pts"] += 3
+        else:
+            table[h]["d"] += 1
+            table[a]["d"] += 1
+            table[h]["pts"] += 1
+            table[a]["pts"] += 1
+
+    for row in table.values():
+        row["gd"] = row["gf"] - row["ga"]
+
+    return sorted(table.values(), key=lambda x: (x["pts"], x["gd"], x["gf"]), reverse=True)
+
+
+class CreaCampionatoModal(discord.ui.Modal, title="Crea campionato"):
+    nome = discord.ui.TextInput(
+        label="Nome campionato",
+        placeholder="Esempio: FC26 League",
+        required=True,
+        max_length=80
+    )
+    numero_gironi = discord.ui.TextInput(
+        label="Numero gironi",
+        placeholder="Esempio: 2",
+        required=True,
+        max_length=2
+    )
+    nomi_gironi = discord.ui.TextInput(
+        label="Nomi gironi separati da virgola",
+        placeholder="Esempio: Girone A, Girone B",
+        required=True,
+        max_length=200
+    )
+    squadre_per_girone = discord.ui.TextInput(
+        label="Squadre per girone",
+        placeholder="Esempio: 8",
+        required=True,
+        max_length=2
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_league_admin(interaction):
+            await interaction.response.send_message("❌ Solo gli admin possono creare il campionato.", ephemeral=True)
+            return
+
+        try:
+            group_count = int(str(self.numero_gironi.value).strip())
+            teams_per_group = int(str(self.squadre_per_girone.value).strip())
+        except Exception:
+            await interaction.response.send_message("Numero gironi e squadre per girone devono essere numeri.", ephemeral=True)
+            return
+
+        group_names = [g.strip() for g in str(self.nomi_gironi.value).split(",") if g.strip()]
+
+        if group_count <= 0 or teams_per_group <= 1:
+            await interaction.response.send_message("Valori non validi.", ephemeral=True)
+            return
+
+        if len(group_names) != group_count:
+            await interaction.response.send_message("Il numero dei nomi girone deve coincidere con il numero gironi.", ephemeral=True)
+            return
+
+        role = interaction.guild.get_role(int(LEAGUE_PLAYER_ROLE_ID)) if interaction.guild else None
+        if not role:
+            await interaction.response.send_message("Ruolo ISCRITTI non trovato.", ephemeral=True)
+            return
+
+        members = [m for m in role.members if not m.bot]
+        random.shuffle(members)
+
+        total_needed = group_count * teams_per_group
+        selected = members[:total_needed]
+
+        if len(selected) < total_needed:
+            await interaction.response.send_message(
+                f"⚠️ Non ci sono abbastanza iscritti. Richiesti {total_needed}, trovati {len(selected)}.",
+                ephemeral=True
+            )
+            return
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("UPDATE championships SET status = 'archived' WHERE status = 'active'")
+        cur.execute("""
+            INSERT INTO championships (name, status, group_count, teams_per_group)
+            VALUES (?, 'active', ?, ?)
+        """, (str(self.nome.value), group_count, teams_per_group))
+        championship_id = cur.lastrowid
+
+        group_ids = []
+        for gname in group_names:
+            cur.execute("INSERT INTO championship_groups (championship_id, name) VALUES (?, ?)", (championship_id, gname))
+            group_ids.append(cur.lastrowid)
+
+        idx = 0
+        groups = {}
+        for group_id, gname in zip(group_ids, group_names):
+            groups[group_id] = []
+            for _ in range(teams_per_group):
+                member = selected[idx]
+                idx += 1
+                groups[group_id].append((str(member.id), member.display_name))
+                cur.execute("""
+                    INSERT INTO championship_players (championship_id, group_id, discord_id, display_name)
+                    VALUES (?, ?, ?, ?)
+                """, (championship_id, group_id, str(member.id), member.display_name))
+
+        # Generate fixtures
+        for group_id, players in groups.items():
+            rounds = generate_round_robin(players)
+            for round_idx, pairs in enumerate(rounds, start=1):
+                for home, away in pairs:
+                    cur.execute("""
+                        INSERT INTO championship_matches
+                        (championship_id, group_id, round_number, home_id, away_id, home_name, away_name)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        championship_id, group_id, round_idx,
+                        home[0], away[0], home[1], away[1]
+                    ))
+
+        conn.commit()
+        conn.close()
+
+        embed = discord.Embed(
+            title="🏆 Campionato creato",
+            description=f"**{self.nome.value}** creato con calendario andata/ritorno.",
+            color=discord.Color.gold()
+        )
+        embed.add_field(name="Gironi", value=str(group_count), inline=True)
+        embed.add_field(name="Squadre per girone", value=str(teams_per_group), inline=True)
+        embed.add_field(name="Iscritti usati", value=str(len(selected)), inline=True)
+        embed.add_field(name="Nomi gironi", value=", ".join(group_names), inline=False)
+
+        await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="crea_campionato", description="Admin: crea gironi e calendario automatico")
+async def crea_campionato(interaction: discord.Interaction):
+    if not is_league_admin(interaction):
+        await interaction.response.send_message("❌ Solo gli admin possono creare il campionato.", ephemeral=True)
+        return
+
+    await interaction.response.send_modal(CreaCampionatoModal())
+
+
+@tree.command(name="reset_campionato", description="Admin: archivia il campionato attivo")
+async def reset_campionato(interaction: discord.Interaction):
+    if not is_league_admin(interaction):
+        await interaction.response.send_message("❌ Solo gli admin possono resettare il campionato.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE championships SET status = 'archived' WHERE status = 'active'")
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message("✅ Campionato attivo archiviato.")
+
+
+class ResultOpponentSelect(discord.ui.Select):
+    def __init__(self, matches):
+        options = []
+        for m in matches[:25]:
+            opponent_id = m["away_id"] if str(m["home_id"]) == str(m["requester_id"]) else m["home_id"]
+            opponent_name = m["away_name"] if str(m["home_id"]) == str(m["requester_id"]) else m["home_name"]
+            label = f"G{m['round_number']} vs {opponent_name}"
+            options.append(
+                discord.SelectOption(
+                    label=label[:100],
+                    value=str(m["id"]),
+                    description="Partita non ancora giocata"
+                )
+            )
+
+        super().__init__(placeholder="Scegli la partita...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        match_id = int(self.values[0])
+        await interaction.response.send_modal(ResultModal(match_id))
+
+
+class ResultOpponentView(discord.ui.View):
+    def __init__(self, matches):
+        super().__init__(timeout=180)
+        self.add_item(ResultOpponentSelect(matches))
+
+
+class ResultModal(discord.ui.Modal, title="Inserisci risultato"):
+    gol_miei = discord.ui.TextInput(label="Gol tuoi", placeholder="Esempio: 2", required=True, max_length=2)
+    gol_avversario = discord.ui.TextInput(label="Gol avversario", placeholder="Esempio: 1", required=True, max_length=2)
+    marcatori_miei = discord.ui.TextInput(
+        label="Marcatori tuoi",
+        placeholder="Nomi separati da virgola. Se doppietta ripeti il nome.",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=800
+    )
+    marcatori_avversario = discord.ui.TextInput(
+        label="Marcatori avversario",
+        placeholder="Nomi separati da virgola. Se doppietta ripeti il nome.",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=800
+    )
+
+    def __init__(self, match_id):
+        super().__init__()
+        self.match_id = match_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            my_goals = int(str(self.gol_miei.value).strip())
+            opp_goals = int(str(self.gol_avversario.value).strip())
+        except Exception:
+            await interaction.response.send_message("I gol devono essere numeri.", ephemeral=True)
+            return
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM championship_matches WHERE id = ? AND status = 'pending'", (self.match_id,))
+        match = cur.fetchone()
+
+        if not match:
+            conn.close()
+            await interaction.response.send_message("Partita non trovata o già giocata.", ephemeral=True)
+            return
+
+        user_id = str(interaction.user.id)
+        if user_id not in (str(match["home_id"]), str(match["away_id"])):
+            conn.close()
+            await interaction.response.send_message("Non fai parte di questa partita.", ephemeral=True)
+            return
+
+        is_home = user_id == str(match["home_id"])
+        home_goals = my_goals if is_home else opp_goals
+        away_goals = opp_goals if is_home else my_goals
+        confirm_by = match["away_id"] if is_home else match["home_id"]
+
+        # scorers check: skip if 0-0
+        my_scorers = [s.strip() for s in str(self.marcatori_miei.value).split(",") if s.strip()]
+        opp_scorers = [s.strip() for s in str(self.marcatori_avversario.value).split(",") if s.strip()]
+
+        if my_goals == 0 and opp_goals == 0:
+            my_scorers = []
+            opp_scorers = []
+        else:
+            if len(my_scorers) != my_goals:
+                conn.close()
+                await interaction.response.send_message("Il numero dei tuoi marcatori deve coincidere con i tuoi gol.", ephemeral=True)
+                return
+            if len(opp_scorers) != opp_goals:
+                conn.close()
+                await interaction.response.send_message("Il numero dei marcatori avversari deve coincidere con i gol avversari.", ephemeral=True)
+                return
+
+        cur.execute("""
+            UPDATE championship_matches
+            SET home_goals = ?, away_goals = ?, status = 'awaiting_confirmation', submitted_by = ?, confirm_by = ?
+            WHERE id = ?
+        """, (home_goals, away_goals, user_id, str(confirm_by), self.match_id))
+
+        cur.execute("DELETE FROM match_scorers WHERE match_id = ?", (self.match_id,))
+
+        home_owner = str(match["home_id"])
+        away_owner = str(match["away_id"])
+
+        if is_home:
+            home_scorers = my_scorers
+            away_scorers = opp_scorers
+        else:
+            home_scorers = opp_scorers
+            away_scorers = my_scorers
+
+        def insert_scorers(names, owner_id):
+            counts = {}
+            for name in names:
+                counts[name] = counts.get(name, 0) + 1
+            for name, goals in counts.items():
+                cur.execute("""
+                    INSERT INTO match_scorers (match_id, scorer_name, team_owner_id, goals)
+                    VALUES (?, ?, ?, ?)
+                """, (self.match_id, name, owner_id, goals))
+
+        insert_scorers(home_scorers, home_owner)
+        insert_scorers(away_scorers, away_owner)
+
+        conn.commit()
+        conn.close()
+
+        embed = build_result_embed(self.match_id)
+        await interaction.response.send_message(
+            content=f"<@{confirm_by}> devi confermare o contestare il risultato.",
+            embed=embed,
+            view=ResultConfirmView(self.match_id, str(confirm_by))
+        )
+
+
+def build_result_embed(match_id):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM championship_matches WHERE id = ?", (match_id,))
+    m = cur.fetchone()
+    cur.execute("SELECT scorer_name, team_owner_id, goals FROM match_scorers WHERE match_id = ?", (match_id,))
+    scorers = cur.fetchall()
+    conn.close()
+
+    status_label = {
+        "awaiting_confirmation": "⏳ In attesa conferma",
+        "confirmed": "✅ Ufficiale",
+        "contested": "⚠️ Contestato",
+        "pending": "📅 Da giocare"
+    }.get(m["status"], m["status"])
+
+    embed = discord.Embed(
+        title=f"⚽ Risultato — Giornata {m['round_number']}",
+        description=f"**{m['home_name']} {m['home_goals']} - {m['away_goals']} {m['away_name']}**",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="Stato", value=status_label, inline=False)
+
+    if not scorers:
+        embed.add_field(name="Marcatori", value="Nessun marcatore.", inline=False)
+    else:
+        lines = []
+        for s in scorers:
+            suffix = f" x{s['goals']}" if int(s["goals"]) > 1 else ""
+            lines.append(f"⚽ {s['scorer_name']}{suffix}")
+        embed.add_field(name="Marcatori", value="\n".join(lines), inline=False)
+
+    embed.set_footer(text=f"ID partita: {match_id}")
+    return embed
+
+
+class ResultConfirmView(discord.ui.View):
+    def __init__(self, match_id, confirm_by):
+        super().__init__(timeout=86400)
+        self.match_id = match_id
+        self.confirm_by = str(confirm_by)
+
+    @discord.ui.button(label="Conferma", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.confirm_by:
+            await interaction.response.send_message("Solo l'avversario può confermare questo risultato.", ephemeral=True)
+            return
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("UPDATE championship_matches SET status = 'confirmed' WHERE id = ?", (self.match_id,))
+        conn.commit()
+        conn.close()
+
+        embed = build_result_embed(self.match_id)
+        await interaction.response.edit_message(content="✅ Risultato confermato.", embed=embed, view=None)
+
+    @discord.ui.button(label="Contesta", style=discord.ButtonStyle.danger)
+    async def contest(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.confirm_by:
+            await interaction.response.send_message("Solo l'avversario può contestare questo risultato.", ephemeral=True)
+            return
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("UPDATE championship_matches SET status = 'contested' WHERE id = ?", (self.match_id,))
+        conn.commit()
+        conn.close()
+
+        embed = build_result_embed(self.match_id)
+        await interaction.response.edit_message(content="⚠️ Risultato contestato. Staff richiesto.", embed=embed, view=None)
+
+
+@tree.command(name="risultato", description="Inserisci un risultato del tuo girone")
+async def risultato(interaction: discord.Interaction):
+    if not is_results_channel(interaction):
+        await interaction.response.send_message("❌ I risultati si inseriscono solo nel canale RISULTATI.", ephemeral=True)
+        return
+
+    champ = active_championship()
+    if not champ:
+        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *, ? AS requester_id
+        FROM championship_matches
+        WHERE championship_id = ?
+          AND status = 'pending'
+          AND (home_id = ? OR away_id = ?)
+        ORDER BY round_number ASC
+        LIMIT 25
+    """, (str(interaction.user.id), champ["id"], str(interaction.user.id), str(interaction.user.id)))
+    matches = cur.fetchall()
+    conn.close()
+
+    if not matches:
+        await interaction.response.send_message("Non hai partite da inserire.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="⚽ Inserisci risultato",
+        description="Scegli dalla tendina la partita da aggiornare.",
+        color=discord.Color.blue()
+    )
+
+    await interaction.response.send_message(embed=embed, view=ResultOpponentView(matches), ephemeral=True)
+
+
+@tree.command(name="classifica", description="Mostra la classifica del campionato")
+async def classifica(interaction: discord.Interaction):
+    if not is_standings_channel(interaction):
+        await interaction.response.send_message("❌ La classifica si vede solo nel canale CLASSIFICHE.", ephemeral=True)
+        return
+
+    champ = active_championship()
+    if not champ:
+        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM championship_groups WHERE championship_id = ? ORDER BY id ASC", (champ["id"],))
+    groups = cur.fetchall()
+    conn.close()
+
+    embed = discord.Embed(
+        title=f"📊 Classifica — {champ['name']}",
+        color=discord.Color.green()
+    )
+
+    for g in groups:
+        standings = calculate_group_standings(champ["id"], g["id"])
+        if not standings:
+            value = "Nessun dato."
+        else:
+            lines = []
+            for i, row in enumerate(standings, start=1):
+                lines.append(
+                    f"**{i}. {row['name']}** — {row['pts']} pt | {row['pg']} PG | {row['w']}V {row['d']}N {row['l']}P | DR {row['gd']}"
+                )
+            value = "\n".join(lines[:10])
+        embed.add_field(name=g["name"], value=value, inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="calendario", description="Mostra le partite ancora da disputare")
+async def calendario(interaction: discord.Interaction):
+    if not is_calendar_channel(interaction):
+        await interaction.response.send_message("❌ Il calendario si vede solo nel canale CALENDARIO.", ephemeral=True)
+        return
+
+    champ = active_championship()
+    if not champ:
+        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+
+    # Calcola quante giornate totali ci sono.
+    cur.execute("""
+        SELECT MAX(round_number) AS max_round
+        FROM championship_matches
+        WHERE championship_id = ?
+    """, (champ["id"],))
+    max_round_row = cur.fetchone()
+    max_round = int(max_round_row["max_round"] or 0)
+    first_leg_last_round = max_round // 2 if max_round else 0
+
+    # Prima mostriamo solo l'andata. Il ritorno compare solo quando tutta l'andata è completata.
+    cur.execute("""
+        SELECT COUNT(*) AS pending_first_leg
+        FROM championship_matches
+        WHERE championship_id = ?
+          AND status = 'pending'
+          AND round_number <= ?
+    """, (champ["id"], first_leg_last_round))
+    pending_first_leg = int(cur.fetchone()["pending_first_leg"] or 0)
+
+    if pending_first_leg > 0:
+        leg_label = "Andata"
+        round_filter_min = 1
+        round_filter_max = first_leg_last_round
+    else:
+        leg_label = "Ritorno"
+        round_filter_min = first_leg_last_round + 1
+        round_filter_max = max_round
+
+    # Mostra solo partite ancora da disputare, ordinate per giornata.
+    cur.execute("""
+        SELECT m.*, g.name AS group_name
+        FROM championship_matches m
+        JOIN championship_groups g ON g.id = m.group_id
+        WHERE m.championship_id = ?
+          AND m.status = 'pending'
+          AND m.round_number BETWEEN ? AND ?
+        ORDER BY m.round_number ASC, g.id ASC, m.id ASC
+        LIMIT 30
+    """, (champ["id"], round_filter_min, round_filter_max))
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await interaction.response.send_message("✅ Non ci sono partite da disputare in calendario.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"📅 Calendario — {champ['name']}",
+        description=f"Fase visualizzata: **{leg_label}**\\nMostro solo le prossime partite ancora da disputare.",
+        color=discord.Color.blue()
+    )
+
+    for m in rows:
+        embed.add_field(
+            name=f"{m['group_name']} • Giornata {m['round_number']}",
+            value=f"**{m['home_name']}** vs **{m['away_name']}**",
+            inline=False
+        )
+
+    embed.set_footer(text="Il ritorno comparirà solo quando tutte le partite di andata saranno completate.")
+    await interaction.response.send_message(embed=embed)
+
+
+
+@tree.command(name="prossima_partita", description="Mostra la tua prossima partita")
+async def prossima_partita(interaction: discord.Interaction):
+    if not is_calendar_channel(interaction):
+        await interaction.response.send_message("❌ Questo comando si usa solo nel canale CALENDARIO.", ephemeral=True)
+        return
+
+    champ = active_championship()
+    if not champ:
+        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT m.*, g.name AS group_name
+        FROM championship_matches m
+        JOIN championship_groups g ON g.id = m.group_id
+        WHERE m.championship_id = ?
+          AND m.status = 'pending'
+          AND (m.home_id = ? OR m.away_id = ?)
+        ORDER BY m.round_number ASC
+        LIMIT 1
+    """, (champ["id"], str(interaction.user.id), str(interaction.user.id)))
+    m = cur.fetchone()
+    conn.close()
+
+    if not m:
+        await interaction.response.send_message("Non hai prossime partite.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="⏭️ Prossima partita", color=discord.Color.blue())
+    embed.add_field(name="Girone", value=m["group_name"], inline=True)
+    embed.add_field(name="Giornata", value=str(m["round_number"]), inline=True)
+    embed.add_field(name="Match", value=f"**{m['home_name']}** vs **{m['away_name']}**", inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="capocannonieri", description="Classifica marcatori")
+async def capocannonieri(interaction: discord.Interaction):
+    if not is_stats_channel(interaction):
+        await interaction.response.send_message("❌ Le statistiche si vedono solo nel canale STATISTICHE.", ephemeral=True)
+        return
+
+    champ = active_championship()
+    if not champ:
+        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT s.scorer_name, SUM(s.goals) AS goals
+        FROM match_scorers s
+        JOIN championship_matches m ON m.id = s.match_id
+        WHERE m.championship_id = ? AND m.status = 'confirmed'
+        GROUP BY s.scorer_name
+        ORDER BY goals DESC
+        LIMIT 20
+    """, (champ["id"],))
+    rows = cur.fetchall()
+    conn.close()
+
+    embed = discord.Embed(title="⚽ Capocannonieri", color=discord.Color.gold())
+
+    if not rows:
+        embed.description = "Nessun marcatore registrato."
+    else:
+        for i, r in enumerate(rows, start=1):
+            embed.add_field(name=f"{i}. {r['scorer_name']}", value=f"{r['goals']} gol", inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="miglior_difesa", description="Mostra le migliori difese")
+async def miglior_difesa(interaction: discord.Interaction):
+    if not is_stats_channel(interaction):
+        await interaction.response.send_message("❌ Le statistiche si vedono solo nel canale STATISTICHE.", ephemeral=True)
+        return
+
+    champ = active_championship()
+    if not champ:
+        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM championship_groups WHERE championship_id = ?", (champ["id"],))
+    groups = cur.fetchall()
+    conn.close()
+
+    all_rows = []
+    for g in groups:
+        all_rows.extend(calculate_group_standings(champ["id"], g["id"]))
+
+    all_rows.sort(key=lambda x: (x["ga"], -x["pts"]))
+
+    embed = discord.Embed(title="🧤 Miglior difesa", color=discord.Color.blue())
+    for i, r in enumerate(all_rows[:15], start=1):
+        embed.add_field(name=f"{i}. {r['name']}", value=f"Gol subiti: {r['ga']} | PG: {r['pg']}", inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="forza_risultato", description="Admin: forza o corregge un risultato")
+@app_commands.describe(match_id="ID partita", home_goals="Gol casa", away_goals="Gol trasferta")
+async def forza_risultato(interaction: discord.Interaction, match_id: int, home_goals: int, away_goals: int):
+    if not is_league_admin(interaction):
+        await interaction.response.send_message("❌ Solo gli admin possono forzare risultati.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE championship_matches
+        SET home_goals = ?, away_goals = ?, status = 'confirmed', submitted_by = ?, confirm_by = NULL
+        WHERE id = ?
+    """, (home_goals, away_goals, str(interaction.user.id), match_id))
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(f"✅ Risultato forzato per partita ID {match_id}: {home_goals}-{away_goals}")
+
+
+@tree.command(name="revisioni", description="Admin: mostra risultati contestati")
+async def revisioni(interaction: discord.Interaction):
+    if not is_league_admin(interaction):
+        await interaction.response.send_message("❌ Solo gli admin possono vedere le revisioni.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM championship_matches
+        WHERE status = 'contested'
+        ORDER BY round_number ASC
+        LIMIT 20
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    embed = discord.Embed(title="⚠️ Risultati contestati", color=discord.Color.orange())
+
+    if not rows:
+        embed.description = "Nessun risultato contestato."
+    else:
+        for m in rows:
+            embed.add_field(
+                name=f"ID {m['id']} • G{m['round_number']}",
+                value=f"{m['home_name']} {m['home_goals']} - {m['away_goals']} {m['away_name']}",
+                inline=False
+            )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 if __name__ == "__main__":
