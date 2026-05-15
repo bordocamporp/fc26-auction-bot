@@ -841,41 +841,163 @@ async def offri(interaction: discord.Interaction, prezzo: int):
     await interaction.response.send_message(f"🔥 **{interaction.user.display_name}** offre **{prezzo}** per **{auction['player_name']}**!", ephemeral=True)
 
 
-@tree.command(name="rosa", description="Mostra la rosa tua o di un altro manager")
-@app_commands.describe(utente="Manager da controllare")
-async def rosa(interaction: discord.Interaction, utente: discord.Member = None):
-    target = utente or interaction.user
 
+def build_roster_embed(discord_id, display_name):
     conn = connect()
     cur = conn.cursor()
+
+    cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (str(discord_id),))
+    manager = cur.fetchone()
+    budget = manager["budget"] if manager else 0
+
     cur.execute("""
         SELECT name, team, position, overall, sold_price
         FROM players
         WHERE owner_discord_id = ?
-        ORDER BY position, overall DESC
-    """, (str(target.id),))
+        ORDER BY overall DESC
+    """, (str(discord_id),))
     rows = cur.fetchall()
     conn.close()
 
     if not rows:
-        await interaction.response.send_message(f"{target.display_name} non ha ancora giocatori.")
-        return
+        embed = discord.Embed(
+            title=f"📋 Rosa di {display_name}",
+            description="Questa rosa non ha ancora giocatori.",
+            color=discord.Color.dark_grey()
+        )
+        embed.add_field(name="Budget residuo", value=f"{budget} crediti", inline=True)
+        return embed
 
-    total = sum(r["sold_price"] or 0 for r in rows)
+    total_spent = sum(r["sold_price"] or 0 for r in rows)
+    avg_ovr = sum(int(r["overall"] or 0) for r in rows) / len(rows)
+
+    grouped = {
+        "🧤 Portieri": [],
+        "🛡️ Difensori": [],
+        "🎯 Centrocampisti": [],
+        "⚽ Attaccanti": [],
+        "📌 Altro": []
+    }
+
+    for r in rows:
+        group = role_group(r["position"])
+        line = f"**{r['name']}** — {r['position']} • OVR {r['overall']} • {r['sold_price']} cr"
+
+        if group == "GK":
+            grouped["🧤 Portieri"].append(line)
+        elif group == "DEF":
+            grouped["🛡️ Difensori"].append(line)
+        elif group == "MID":
+            grouped["🎯 Centrocampisti"].append(line)
+        elif group == "ATT":
+            grouped["⚽ Attaccanti"].append(line)
+        else:
+            grouped["📌 Altro"].append(line)
+
     embed = discord.Embed(
-        title=f"📋 Rosa di {target.display_name}",
-        description=f"Totale speso: **{total}** crediti",
+        title=f"📋 Rosa di {display_name}",
+        description=f"Giocatori: **{len(rows)}** • Overall medio: **{avg_ovr:.1f}**",
         color=discord.Color.green()
     )
 
-    for r in rows[:25]:
-        embed.add_field(
-            name=f"{r['position']} • {r['name']}",
-            value=f"{r['team']} • OVR {r['overall']} • {r['sold_price']} cr",
-            inline=False
+    embed.add_field(name="Budget residuo", value=f"{budget} crediti", inline=True)
+    embed.add_field(name="Totale speso", value=f"{total_spent} crediti", inline=True)
+
+    for title, items in grouped.items():
+        if items:
+            # Discord limita ogni field a 1024 caratteri.
+            value = "\n".join(items)
+            if len(value) > 1000:
+                value = value[:997] + "..."
+            embed.add_field(name=title, value=value, inline=False)
+
+    return embed
+
+
+class RosaSelect(discord.ui.Select):
+    def __init__(self, managers):
+        options = []
+
+        for manager in managers[:25]:
+            options.append(
+                discord.SelectOption(
+                    label=manager["name"][:100],
+                    value=str(manager["discord_id"]),
+                    description=f"Budget: {manager['budget']} crediti"
+                )
+            )
+
+        super().__init__(
+            placeholder="Scegli una rosa da visualizzare...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="rosa_select_manager"
         )
 
-    await interaction.response.send_message(embed=embed)
+    async def callback(self, interaction: discord.Interaction):
+        selected_id = self.values[0]
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM managers WHERE discord_id = ?", (selected_id,))
+        manager = cur.fetchone()
+        conn.close()
+
+        if not manager:
+            await interaction.response.send_message("Manager non trovato.", ephemeral=True)
+            return
+
+        embed = build_roster_embed(selected_id, manager["name"])
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class RosaView(discord.ui.View):
+    def __init__(self, managers):
+        super().__init__(timeout=180)
+        self.add_item(RosaSelect(managers))
+
+
+@tree.command(name="rosa", description="Mostra una rosa scegliendo il manager da una tendina")
+async def rosa(interaction: discord.Interaction):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT m.discord_id, m.name, m.budget, COUNT(p.id) AS player_count
+        FROM managers m
+        LEFT JOIN players p ON p.owner_discord_id = m.discord_id
+        GROUP BY m.discord_id, m.name, m.budget
+        ORDER BY m.name ASC
+    """)
+    managers = cur.fetchall()
+    conn.close()
+
+    if not managers:
+        await interaction.response.send_message("Nessun manager registrato.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="📋 Rose disponibili",
+        description="Scegli dalla tendina quale rosa vuoi visualizzare.",
+        color=discord.Color.green()
+    )
+
+    preview_lines = []
+    for m in managers[:15]:
+        preview_lines.append(f"• **{m['name']}** — {m['player_count']} giocatori — {m['budget']} cr")
+
+    embed.add_field(
+        name="Manager",
+        value="\n".join(preview_lines) if preview_lines else "Nessun manager disponibile.",
+        inline=False
+    )
+
+    if len(managers) > 25:
+        embed.set_footer(text="Mostro solo i primi 25 manager nella tendina per limite Discord.")
+
+    await interaction.response.send_message(embed=embed, view=RosaView(managers), ephemeral=True)
+
+
 
 
 @tree.command(name="mercato", description="Mostra giocatori liberi filtrabili")
