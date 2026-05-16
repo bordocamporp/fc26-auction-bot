@@ -1124,13 +1124,28 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     embed.add_field(name="ID PSN/Xbox/EA", value=request["game_id"], inline=True)
     embed.add_field(name="Budget", value=f"{DEFAULT_BUDGET} crediti", inline=True)
 
-    if interaction.response.is_done():
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    else:
-        try:
-            await interaction.response.edit_message(embed=embed, view=None)
-        except Exception:
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+    # Aggiorna il messaggio staff rimuovendo la tendina dei club.
+    # Uso interaction.message.edit perché dopo DM/log/DB l'interaction può risultare già gestita
+    # o scaduta, mentre il messaggio originale resta modificabile.
+    try:
+        await interaction.message.edit(embed=embed, view=None)
+    except Exception:
+        pass
+
+    # Conferma privata allo staff che ha completato l'assegnazione.
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"✅ Club **{club_name}** assegnato a {member.mention}.",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"✅ Club **{club_name}** assegnato a {member.mention}.",
+                ephemeral=True
+            )
+    except Exception:
+        pass
 
 
 class StaffDecisionSelect(discord.ui.Select):
