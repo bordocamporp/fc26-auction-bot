@@ -115,6 +115,9 @@ MAX_MID = 6
 MAX_ATT = 4
 
 intents = discord.Intents.default()
+# Necessario per recuperare i membri del server quando lo staff accetta/rifiuta
+# e per assegnare/rimuovere i ruoli. Va attivato anche nel Discord Developer Portal.
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
@@ -643,6 +646,22 @@ async def safe_dm(user_id, message=None, embed=None):
         return False
 
 
+async def get_member_safe(guild, member_id):
+    """Recupera un membro anche se non è nella cache Discord."""
+    if not guild or not member_id:
+        return None
+
+    member_id = int(member_id)
+    member = guild.get_member(member_id)
+    if member is not None:
+        return member
+
+    try:
+        return await guild.fetch_member(member_id)
+    except Exception:
+        return None
+
+
 def _font(size=24, bold=False):
     candidates = [
         "arialbd.ttf" if bold else "arial.ttf",
@@ -1016,7 +1035,7 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
         return
 
     guild = interaction.guild
-    member = guild.get_member(int(request["discord_id"])) if guild else None
+    member = await get_member_safe(guild, request["discord_id"])
     if not member:
         await interaction.response.send_message("Player non trovato nel server.", ephemeral=True)
         return
@@ -1138,7 +1157,7 @@ class StaffDecisionSelect(discord.ui.Select):
 
         if self.values[0] == "reject":
             guild = interaction.guild
-            member = guild.get_member(int(request["discord_id"])) if guild else None
+            member = await get_member_safe(guild, request["discord_id"])
 
             conn = connect()
             cur = conn.cursor()
@@ -1371,7 +1390,7 @@ class SquadraRealeModal(discord.ui.Modal, title="Assegna squadra reale"):
         await interaction.response.defer(ephemeral=True)
 
         guild = interaction.guild
-        member = guild.get_member(int(self.member_id)) if guild else None
+        member = await get_member_safe(guild, self.member_id)
 
         if not member:
             await interaction.followup.send("Utente non trovato nel server.", ephemeral=True)
@@ -1457,7 +1476,7 @@ class RegistraPreIscrittoSelect(discord.ui.Select):
             return
 
         member_id = int(self.values[0])
-        member = interaction.guild.get_member(member_id) if interaction.guild else None
+        member = await get_member_safe(interaction.guild, member_id)
 
         if not member:
             await interaction.response.send_message("Utente non trovato nel server.", ephemeral=True)
@@ -4088,7 +4107,7 @@ class ReplaceNewPlayerSelect(discord.ui.Select):
             return
 
         guild = interaction.guild
-        new_member = guild.get_member(int(self.values[0])) if guild else None
+        new_member = await get_member_safe(guild, self.values[0])
 
         if not new_member:
             await interaction.response.send_message("Nuovo player non trovato.", ephemeral=True)
@@ -4197,7 +4216,7 @@ class ReplaceOldPlayerSelect(discord.ui.Select):
 
         guild = interaction.guild
 
-        old_member = guild.get_member(int(self.values[0])) if guild else None
+        old_member = await get_member_safe(guild, self.values[0])
 
         if not old_member:
             await interaction.response.send_message("Player non trovato.", ephemeral=True)
