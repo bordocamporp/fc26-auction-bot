@@ -35,7 +35,8 @@ LEAGUE_ADMIN_ROLE_ID = "1505151387015581757"
 # === FC26 ISCRIZIONI AUTOMATICHE ===
 SIGNUP_REQUEST_CHANNEL_ID = "1505146998779674765"   # RICHIESTA ISCRIZIONE
 SIGNUP_STAFF_CHANNEL_ID = "1505227395882422535"     # Canale staff richieste
-SIGNUP_LOG_CHANNEL_ID = "1505229160057143366"       # Esiti pubblici/log
+SIGNUP_REJECT_CHANNEL_ID = "1505229160057143366"    # Canale richieste rifiutate
+SIGNUP_ACCEPT_CHANNEL_ID = "1505228998668456057"    # Canale richieste accettate
 SIGNUP_PENDING_ROLE_ID = PRE_ISCRITTO_ROLE_ID        # 1505180973208440954
 SIGNUP_REGISTERED_ROLE_ID = LEAGUE_PLAYER_ROLE_ID    # 1505181066695016619
 
@@ -941,15 +942,23 @@ def get_club_row_by_name(club_name):
     return row
 
 
-async def send_signup_log(guild, content=None, embed=None):
-    channel = guild.get_channel(int(SIGNUP_LOG_CHANNEL_ID)) if guild else None
+async def send_signup_channel_log(guild, channel_id, content=None, embed=None):
+    channel = guild.get_channel(int(channel_id)) if guild else None
     if not channel:
         try:
-            channel = await bot.fetch_channel(int(SIGNUP_LOG_CHANNEL_ID))
+            channel = await bot.fetch_channel(int(channel_id))
         except Exception:
             channel = None
     if channel:
         await channel.send(content=content, embed=embed)
+
+
+async def send_signup_accept_log(guild, content=None, embed=None):
+    await send_signup_channel_log(guild, SIGNUP_ACCEPT_CHANNEL_ID, content=content, embed=embed)
+
+
+async def send_signup_reject_log(guild, content=None, embed=None):
+    await send_signup_channel_log(guild, SIGNUP_REJECT_CHANNEL_ID, content=content, embed=embed)
 
 
 class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
@@ -1103,7 +1112,7 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     except Exception:
         pass
 
-    await send_signup_log(
+    await send_signup_accept_log(
         guild,
         content=(
             f"✅ **Richiesta accettata**\n\n"
@@ -1196,7 +1205,7 @@ class StaffDecisionSelect(discord.ui.Select):
                 except Exception:
                     pass
 
-            await send_signup_log(
+            await send_signup_reject_log(
                 guild,
                 content=f"❌ **Richiesta rifiutata**\n\n👤 Player: <@{request['discord_id']}>"
             )
