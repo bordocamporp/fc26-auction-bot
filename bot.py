@@ -32,6 +32,22 @@ CALENDAR_CHANNEL_ID = "1505147549063843980"
 LEAGUE_PLAYER_ROLE_ID = "1505181066695016619"
 LEAGUE_ADMIN_ROLE_ID = "1505151387015581757"
 
+# === FC26 ISCRIZIONI AUTOMATICHE ===
+SIGNUP_REQUEST_CHANNEL_ID = "1505146998779674765"   # RICHIESTA ISCRIZIONE
+SIGNUP_STAFF_CHANNEL_ID = "1505227395882422535"     # Canale staff richieste
+SIGNUP_LOG_CHANNEL_ID = "1505229160057143366"       # Esiti pubblici/log
+SIGNUP_PENDING_ROLE_ID = PRE_ISCRITTO_ROLE_ID        # 1505180973208440954
+SIGNUP_REGISTERED_ROLE_ID = LEAGUE_PLAYER_ROLE_ID    # 1505181066695016619
+
+FANTACALCIO_CLUBS = [
+    "Milan", "Inter", "Juventus", "Napoli", "Roma", "Lazio",
+    "Atalanta", "Fiorentina", "Bologna", "Torino", "Genoa",
+    "Real Madrid", "Barcellona", "Atletico Madrid", "Manchester City",
+    "Manchester United", "Liverpool", "Chelsea", "Arsenal", "Tottenham",
+    "PSG", "Bayern Monaco", "Borussia Dortmund", "Bayer Leverkusen"
+]
+# ===================================
+
 BOT_ONLY_BYPASS_ROLE_IDS = {
     "1505151387015581757",
     "1498341567105339492",
@@ -330,6 +346,37 @@ def ensure_extra_tables():
         goals INTEGER DEFAULT 1
     )
     """)
+
+    # Tabelle sistema iscrizioni FC26
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS signup_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        discord_id TEXT NOT NULL,
+        discord_name TEXT,
+        real_name TEXT,
+        age TEXT,
+        platform TEXT,
+        game_id TEXT,
+        status TEXT DEFAULT 'pending',
+        club_name TEXT,
+        handled_by TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        handled_at DATETIME
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS fc26_clubs (
+        name TEXT PRIMARY KEY,
+        assigned_to TEXT,
+        assigned_at DATETIME
+    )
+    """)
+
+    cur.executemany(
+        "INSERT OR IGNORE INTO fc26_clubs (name, assigned_to) VALUES (?, NULL)",
+        [(club,) for club in FANTACALCIO_CLUBS]
+    )
     conn.commit()
     conn.close()
 
@@ -771,11 +818,342 @@ class AuctionView(discord.ui.View):
         await interaction.response.send_modal(CustomBidModal())
 
 
+# ================= SISTEMA ISCRIZIONI FC26 =================
+
+def get_signup_request(request_id):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM signup_requests WHERE id = ?", (int(request_id),))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_free_signup_clubs():
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM fc26_clubs WHERE assigned_to IS NULL ORDER BY name ASC")
+    rows = cur.fetchall()
+    conn.close()
+    return [r["name"] for r in rows]
+
+
+async def send_signup_log(guild, content=None, embed=None):
+    channel = guild.get_channel(int(SIGNUP_LOG_CHANNEL_ID)) if guild else None
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(int(SIGNUP_LOG_CHANNEL_ID))
+        except Exception:
+            channel = None
+    if channel:
+        await channel.send(content=content, embed=embed)
+
+
+class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
+    nome = discord.ui.TextInput(label="Nome", placeholder="Inserisci il tuo nome", required=True, max_length=50)
+    eta = discord.ui.TextInput(label="Età", placeholder="Esempio: 18", required=True, max_length=3)
+    piattaforma = discord.ui.TextInput(label="Piattaforma", placeholder="PS5 / Xbox / PC", required=True, max_length=30)
+    game_id = discord.ui.TextInput(label="ID PSN/Xbox/EA", placeholder="Inserisci il tuo ID", required=True, max_length=60)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if str(interaction.channel_id) != str(SIGNUP_REQUEST_CHANNEL_ID):
+            await interaction.response.send_message("❌ Puoi richiedere l'iscrizione solo nel canale dedicato.", ephemeral=True)
+            return
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM signup_requests WHERE discord_id = ? AND status = 'pending'", (str(interaction.user.id),))
+        existing = cur.fetchone()
+        if existing:
+            conn.close()
+            await interaction.response.send_message("⚠️ Hai già una richiesta in attesa di valutazione.", ephemeral=True)
+            return
+
+        cur.execute("""
+            INSERT INTO signup_requests (discord_id, discord_name, real_name, age, platform, game_id, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+        """, (
+            str(interaction.user.id),
+            interaction.user.display_name,
+            str(self.nome.value).strip(),
+            str(self.eta.value).strip(),
+            str(self.piattaforma.value).strip(),
+            str(self.game_id.value).strip()
+        ))
+        request_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+        pending_role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID)) if interaction.guild else None
+        if pending_role:
+            try:
+                await interaction.user.add_roles(pending_role, reason="Richiesta iscrizione FC26 inviata")
+            except Exception:
+                pass
+
+        staff_channel = interaction.guild.get_channel(int(SIGNUP_STAFF_CHANNEL_ID)) if interaction.guild else None
+        if not staff_channel:
+            try:
+                staff_channel = await bot.fetch_channel(int(SIGNUP_STAFF_CHANNEL_ID))
+            except Exception:
+                staff_channel = None
+
+        embed = discord.Embed(
+            title="📩 Nuova richiesta iscrizione FC26",
+            description=f"Richiesta ID: **{request_id}**",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Player Discord", value=interaction.user.mention, inline=False)
+        embed.add_field(name="Nome", value=str(self.nome.value), inline=True)
+        embed.add_field(name="Età", value=str(self.eta.value), inline=True)
+        embed.add_field(name="Piattaforma", value=str(self.piattaforma.value), inline=True)
+        embed.add_field(name="ID PSN/Xbox/EA", value=str(self.game_id.value), inline=False)
+        embed.set_footer(text="Lo staff deve scegliere ACCETTA o RIFIUTA.")
+
+        if staff_channel:
+            await staff_channel.send(embed=embed, view=StaffDecisionView(request_id))
+
+        await interaction.response.send_message("✅ Richiesta inviata allo staff. Ti è stato assegnato il ruolo PRE-ISCRITTO.", ephemeral=True)
+
+
+class SignupStartView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Richiedi iscrizione", style=discord.ButtonStyle.green, custom_id="fc26_signup_start")
+    async def signup_start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SignupModal())
+
+
+class StaffDecisionSelect(discord.ui.Select):
+    def __init__(self, request_id):
+        self.request_id = int(request_id)
+        options = [
+            discord.SelectOption(label="ACCETTA", value="accept", emoji="✅", description="Accetta e scegli il club"),
+            discord.SelectOption(label="RIFIUTA", value="reject", emoji="❌", description="Rifiuta la richiesta")
+        ]
+        super().__init__(placeholder="Scegli esito richiesta...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può gestire le richieste.", ephemeral=True)
+            return
+
+        request = get_signup_request(self.request_id)
+        if not request:
+            await interaction.response.send_message("Richiesta non trovata.", ephemeral=True)
+            return
+        if request["status"] != "pending":
+            await interaction.response.send_message("Questa richiesta è già stata gestita.", ephemeral=True)
+            return
+
+        if self.values[0] == "reject":
+            guild = interaction.guild
+            member = guild.get_member(int(request["discord_id"])) if guild else None
+
+            conn = connect()
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE signup_requests
+                SET status = 'rejected', handled_by = ?, handled_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (str(interaction.user.id), self.request_id))
+            conn.commit()
+            conn.close()
+
+            if member:
+                pending_role = guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
+                if pending_role:
+                    try:
+                        await member.remove_roles(pending_role, reason="Richiesta FC26 rifiutata")
+                    except Exception:
+                        pass
+                try:
+                    await member.send("❌ **Richiesta rifiutata**\n\nLa tua richiesta per il torneo **FC 26** è stata rifiutata dallo staff.")
+                except Exception:
+                    pass
+
+            await send_signup_log(
+                guild,
+                content=f"❌ **Richiesta rifiutata**\n\n👤 Player: <@{request['discord_id']}>"
+            )
+
+            embed = discord.Embed(
+                title="❌ Richiesta rifiutata",
+                description=f"Player: <@{request['discord_id']}>\nGestita da: {interaction.user.mention}",
+                color=discord.Color.red()
+            )
+            await interaction.response.edit_message(embed=embed, view=None)
+            return
+
+        free_clubs = get_free_signup_clubs()
+        if not free_clubs:
+            await interaction.response.send_message("❌ Non ci sono club liberi disponibili.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="✅ Richiesta accettata: scegli club",
+            description=f"Player: <@{request['discord_id']}>\nSeleziona un club libero da assegnare.",
+            color=discord.Color.green()
+        )
+        await interaction.response.edit_message(embed=embed, view=ClubAssignView(self.request_id, free_clubs))
+
+
+class StaffDecisionView(discord.ui.View):
+    def __init__(self, request_id):
+        super().__init__(timeout=None)
+        self.add_item(StaffDecisionSelect(request_id))
+
+
+class ClubAssignSelect(discord.ui.Select):
+    def __init__(self, request_id, clubs):
+        self.request_id = int(request_id)
+        options = [discord.SelectOption(label=club[:100], value=club) for club in clubs[:25]]
+        super().__init__(placeholder="Scegli il club libero da assegnare...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può assegnare il club.", ephemeral=True)
+            return
+
+        request = get_signup_request(self.request_id)
+        if not request or request["status"] != "pending":
+            await interaction.response.send_message("Richiesta non valida o già gestita.", ephemeral=True)
+            return
+
+        club = self.values[0]
+        guild = interaction.guild
+        member = guild.get_member(int(request["discord_id"])) if guild else None
+        if not member:
+            await interaction.response.send_message("Player non trovato nel server.", ephemeral=True)
+            return
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("SELECT assigned_to FROM fc26_clubs WHERE name = ?", (club,))
+        club_row = cur.fetchone()
+        if not club_row or club_row["assigned_to"]:
+            conn.close()
+            await interaction.response.send_message("❌ Questo club non è più libero. Riapri il menu e scegli un altro club.", ephemeral=True)
+            return
+
+        cur.execute(
+            "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
+            (str(member.id), member.display_name, DEFAULT_BUDGET)
+        )
+        cur.execute(
+            "UPDATE managers SET name = ?, budget = ? WHERE discord_id = ?",
+            (member.display_name, DEFAULT_BUDGET, str(member.id))
+        )
+        cur.execute("UPDATE fc26_clubs SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP WHERE name = ?", (str(member.id), club))
+        cur.execute("""
+            UPDATE signup_requests
+            SET status = 'accepted', club_name = ?, handled_by = ?, handled_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (club, str(interaction.user.id), self.request_id))
+        conn.commit()
+        conn.close()
+
+        pending_role = guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
+        registered_role = guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
+        if registered_role:
+            try:
+                await member.add_roles(registered_role, reason="Iscrizione FC26 accettata")
+            except Exception:
+                pass
+        if pending_role:
+            try:
+                await member.remove_roles(pending_role, reason="Iscrizione FC26 completata")
+            except Exception:
+                pass
+
+        dm_embed = discord.Embed(
+            title="✅ Richiesta accettata!",
+            description="La tua iscrizione al torneo **FC 26 Manager Mode** è stata approvata.",
+            color=discord.Color.green()
+        )
+        dm_embed.add_field(name="Club assegnato", value=club, inline=True)
+        dm_embed.add_field(name="Piattaforma", value=request["platform"], inline=True)
+        dm_embed.add_field(name="ID PSN/Xbox/EA", value=request["game_id"], inline=False)
+        dm_embed.add_field(name="Budget iniziale", value=f"{DEFAULT_BUDGET} crediti", inline=True)
+        dm_embed.add_field(name="Stato", value="Iscritto ufficiale", inline=True)
+        dm_embed.set_footer(text="Usa il club assegnato per le partite ufficiali su FC 26.")
+        try:
+            await member.send(embed=dm_embed)
+        except Exception:
+            pass
+
+        await send_signup_log(
+            guild,
+            content=(
+                f"✅ **Richiesta accettata**\n\n"
+                f"👤 Player: {member.mention}\n"
+                f"🏟️ Club assegnato: **{club}**\n"
+                f"🆔 ID PSN/Xbox/EA: **{request['game_id']}**"
+            )
+        )
+
+        embed = discord.Embed(
+            title="✅ Iscrizione completata",
+            description=f"{member.mention} è stato registrato ufficialmente.",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Club", value=club, inline=True)
+        embed.add_field(name="ID PSN/Xbox/EA", value=request["game_id"], inline=True)
+        embed.add_field(name="Budget", value=f"{DEFAULT_BUDGET} crediti", inline=True)
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+class ClubAssignView(discord.ui.View):
+    def __init__(self, request_id, clubs):
+        super().__init__(timeout=180)
+        self.add_item(ClubAssignSelect(request_id, clubs))
+
+
+@tree.command(name="setup_iscrizioni", description="Staff: pubblica il pannello richiesta iscrizione FC26")
+async def setup_iscrizioni(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+
+    channel = interaction.guild.get_channel(int(SIGNUP_REQUEST_CHANNEL_ID)) if interaction.guild else None
+    if not channel:
+        await interaction.response.send_message("Canale richiesta iscrizione non trovato.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="📋 Richiesta iscrizione torneo FC 26",
+        description=(
+            "Premi il pulsante qui sotto e compila:\n\n"
+            "• **Nome**\n"
+            "• **Età**\n"
+            "• **Piattaforma**\n"
+            "• **ID PSN/Xbox/EA**\n\n"
+            "Dopo l'invio, lo staff controllerà la richiesta e assegnerà un club libero."
+        ),
+        color=discord.Color.blue()
+    )
+    await channel.send(embed=embed, view=SignupStartView())
+    await interaction.response.send_message("✅ Pannello iscrizioni pubblicato.", ephemeral=True)
+
+
+@tree.command(name="club_liberi", description="Mostra i club liberi per le iscrizioni")
+async def club_liberi(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+    clubs = get_free_signup_clubs()
+    text = "\n".join(f"• {c}" for c in clubs[:50]) if clubs else "Nessun club libero."
+    await interaction.response.send_message(f"🏟️ **Club liberi**\n{text}", ephemeral=True)
+
+# ===========================================================
+
 @bot.event
 async def on_ready():
     init_db()
     ensure_extra_tables()
     reset_auction_state()
+    bot.add_view(SignupStartView())
 
     guild = get_guild()
 
