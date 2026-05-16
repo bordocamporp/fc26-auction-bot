@@ -411,13 +411,23 @@ def ensure_extra_tables():
         name TEXT PRIMARY KEY,
         league TEXT,
         assigned_to TEXT,
-        assigned_at DATETIME
+        assigned_at DATETIME,
+        previous_owner_id TEXT,
+        previous_owner_name TEXT
     )
     """)
 
     # Migrazione per chi aveva già la vecchia tabella senza colonna league.
     try:
         cur.execute("ALTER TABLE fc26_clubs ADD COLUMN league TEXT")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE fc26_clubs ADD COLUMN previous_owner_id TEXT")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE fc26_clubs ADD COLUMN previous_owner_name TEXT")
     except Exception:
         pass
 
@@ -942,6 +952,74 @@ def get_club_row_by_name(club_name):
     return row
 
 
+def transfer_club_data_to_new_owner(cur, old_id, new_id, new_name):
+    """Trasferisce rosa, budget, partite e storico dal vecchio owner al nuovo owner."""
+    old_id = str(old_id)
+    new_id = str(new_id)
+    new_name = str(new_name)
+
+    if old_id == new_id:
+        cur.execute("UPDATE managers SET name = ? WHERE discord_id = ?", (new_name, new_id))
+        return
+
+    cur.execute("DELETE FROM managers WHERE discord_id = ?", (new_id,))
+    cur.execute("UPDATE managers SET discord_id = ?, name = ? WHERE discord_id = ?", (new_id, new_name, old_id))
+    if cur.rowcount == 0:
+        cur.execute(
+            "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
+            (new_id, new_name, DEFAULT_BUDGET)
+        )
+
+    cur.execute("UPDATE players SET owner_discord_id = ? WHERE owner_discord_id = ?", (new_id, old_id))
+    cur.execute("UPDATE championship_players SET discord_id = ?, display_name = ? WHERE discord_id = ?", (new_id, new_name, old_id))
+    cur.execute("UPDATE championship_matches SET home_id = ?, home_name = ? WHERE home_id = ?", (new_id, new_name, old_id))
+    cur.execute("UPDATE championship_matches SET away_id = ?, away_name = ? WHERE away_id = ?", (new_id, new_name, old_id))
+    cur.execute("UPDATE match_scorers SET team_owner_id = ? WHERE team_owner_id = ?", (new_id, old_id))
+    cur.execute("UPDATE transfer_history SET manager_id = ?, manager_name = ? WHERE manager_id = ?", (new_id, new_name, old_id))
+    cur.execute("UPDATE bid_history SET bidder_id = ?, bidder_name = ? WHERE bidder_id = ?", (new_id, new_name, old_id))
+    cur.execute("UPDATE trade_offers SET proposer_id = ?, proposer_name = ? WHERE proposer_id = ?", (new_id, new_name, old_id))
+    cur.execute("UPDATE trade_offers SET target_id = ?, target_name = ? WHERE target_id = ?", (new_id, new_name, old_id))
+    cur.execute("UPDATE real_team_assignments SET discord_id = ?, manager_name = ? WHERE discord_id = ?", (new_id, new_name, old_id))
+
+
+async def reset_registered_players_to_request_role(guild):
+    """Toglie ISCRITTO e assegna RICHIESTA ISCRIZIONE ai player iscritti."""
+    if not guild:
+        return 0
+
+    registered_role = guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
+    request_role = guild.get_role(int(REQUEST_ROLE_ID))
+
+    if not registered_role or not request_role:
+        return 0
+
+    updated = 0
+    seen = set()
+    members = list(getattr(registered_role, "members", []))
+
+    try:
+        async for member in guild.fetch_members(limit=None):
+            if registered_role in member.roles and member.id not in seen:
+                members.append(member)
+                seen.add(member.id)
+    except Exception:
+        pass
+
+    seen.clear()
+    for member in members:
+        if member.id in seen:
+            continue
+        seen.add(member.id)
+        try:
+            await member.remove_roles(registered_role, reason="Reset competizione/modalità FC26")
+            await member.add_roles(request_role, reason="Reset competizione/modalità FC26")
+            updated += 1
+        except Exception:
+            pass
+
+    return updated
+
+
 async def send_signup_channel_log(guild, channel_id, content=None, embed=None):
     channel = guild.get_channel(int(channel_id)) if guild else None
     if not channel:
@@ -1051,7 +1129,7 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT name, league, assigned_to FROM fc26_clubs WHERE LOWER(name) = LOWER(?)", (str(club).strip(),))
+    cur.execute("SELECT name, league, assigned_to, previous_owner_id, previous_owner_name FROM fc26_clubs WHERE LOWER(name) = LOWER(?)", (str(club).strip(),))
     club_row = cur.fetchone()
     if not club_row:
         conn.close()
@@ -1064,21 +1142,36 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
 
     club_name = club_row["name"]
     league_name = club_row["league"] or "N/D"
+    previous_owner_id = club_row["previous_owner_id"] if "previous_owner_id" in club_row.keys() else None
+    inherited_from = None
+
+    if previous_owner_id and str(previous_owner_id) != str(member.id):
+        inherited_from = club_row["previous_owner_name"] or f"ID {previous_owner_id}"
+        transfer_club_data_to_new_owner(cur, previous_owner_id, str(member.id), member.display_name)
+    else:
+        cur.execute(
+            "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
+            (str(member.id), member.display_name, DEFAULT_BUDGET)
+        )
+        cur.execute(
+            "UPDATE managers SET name = ?, budget = ? WHERE discord_id = ?",
+            (member.display_name, DEFAULT_BUDGET, str(member.id))
+        )
 
     cur.execute(
-        "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
-        (str(member.id), member.display_name, DEFAULT_BUDGET)
+        "UPDATE fc26_clubs SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP, previous_owner_id = NULL, previous_owner_name = NULL WHERE name = ?",
+        (str(member.id), club_name)
     )
-    cur.execute(
-        "UPDATE managers SET name = ?, budget = ? WHERE discord_id = ?",
-        (member.display_name, DEFAULT_BUDGET, str(member.id))
-    )
-    cur.execute("UPDATE fc26_clubs SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP WHERE name = ?", (str(member.id), club_name))
     cur.execute("""
         UPDATE signup_requests
         SET status = 'accepted', club_name = ?, handled_by = ?, handled_at = CURRENT_TIMESTAMP
         WHERE id = ?
     """, (club_name, str(interaction.user.id), int(request_id)))
+
+    cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (str(member.id),))
+    budget_row = cur.fetchone()
+    effective_budget = budget_row["budget"] if budget_row else DEFAULT_BUDGET
+
     conn.commit()
     conn.close()
 
@@ -1104,7 +1197,9 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     dm_embed.add_field(name="Campionato", value=league_name, inline=True)
     dm_embed.add_field(name="Piattaforma", value=request["platform"], inline=True)
     dm_embed.add_field(name="ID PSN/Xbox/EA", value=request["game_id"], inline=False)
-    dm_embed.add_field(name="Budget iniziale", value=f"{DEFAULT_BUDGET} crediti", inline=True)
+    dm_embed.add_field(name="Budget", value=f"{effective_budget} crediti", inline=True)
+    if inherited_from:
+        dm_embed.add_field(name="Squadra ereditata da", value=str(inherited_from), inline=False)
     dm_embed.add_field(name="Stato", value="Iscritto ufficiale", inline=True)
     dm_embed.set_footer(text="Usa il club assegnato per le partite ufficiali su FC 26.")
     try:
@@ -1120,6 +1215,7 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
             f"🏟️ Club assegnato: **{club_name}**\n"
             f"🏆 Campionato: **{league_name}**\n"
             f"🆔 ID PSN/Xbox/EA: **{request['game_id']}**"
+            + (f"\n🔁 Squadra ereditata da: **{inherited_from}**" if inherited_from else "")
         )
     )
 
@@ -1131,7 +1227,9 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     embed.add_field(name="Club", value=club_name, inline=True)
     embed.add_field(name="Campionato", value=league_name, inline=True)
     embed.add_field(name="ID PSN/Xbox/EA", value=request["game_id"], inline=True)
-    embed.add_field(name="Budget", value=f"{DEFAULT_BUDGET} crediti", inline=True)
+    embed.add_field(name="Budget", value=f"{effective_budget} crediti", inline=True)
+    if inherited_from:
+        embed.add_field(name="Eredità squadra", value=f"Dati ereditati da **{inherited_from}**", inline=False)
 
     # Aggiorna il messaggio staff rimuovendo la tendina dei club.
     # Uso interaction.message.edit perché dopo DM/log/DB l'interaction può risultare già gestita
@@ -1381,6 +1479,70 @@ async def club_liberi(interaction: discord.Interaction):
     clubs = get_free_signup_clubs()
     text = "\n".join(f"• {c}" for c in clubs[:50]) if clubs else "Nessun club libero."
     await interaction.response.send_message(f"🏟️ **Club liberi**\n{text}", ephemeral=True)
+
+
+@tree.command(name="libera_club", description="Staff: libera il club di un player mantenendo rosa, budget e dati per il prossimo assegnatario")
+@app_commands.describe(utente="Player che abbandona o da rimuovere dal club")
+async def libera_club(interaction: discord.Interaction, utente: discord.Member):
+    if not can_manage_signup(interaction.user):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT name, league FROM fc26_clubs WHERE assigned_to = ?", (str(utente.id),))
+    club = cur.fetchone()
+
+    if not club:
+        conn.close()
+        await interaction.followup.send("❌ Questo player non ha nessun club assegnato.", ephemeral=True)
+        return
+
+    club_name = club["name"]
+    league_name = club["league"] or "N/D"
+
+    cur.execute("""
+        UPDATE fc26_clubs
+        SET assigned_to = NULL,
+            assigned_at = NULL,
+            previous_owner_id = ?,
+            previous_owner_name = ?
+        WHERE name = ?
+    """, (str(utente.id), utente.display_name, club_name))
+
+    cur.execute("""
+        UPDATE signup_requests
+        SET status = 'released'
+        WHERE discord_id = ? AND status = 'accepted'
+    """, (str(utente.id),))
+
+    conn.commit()
+    conn.close()
+
+    registered_role = interaction.guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID)) if interaction.guild else None
+    request_role = interaction.guild.get_role(int(REQUEST_ROLE_ID)) if interaction.guild else None
+
+    if registered_role:
+        try:
+            await utente.remove_roles(registered_role, reason="Club liberato dallo staff")
+        except Exception:
+            pass
+
+    if request_role:
+        try:
+            await utente.add_roles(request_role, reason="Club liberato dallo staff")
+        except Exception:
+            pass
+
+    await interaction.followup.send(
+        f"✅ Club **{club_name}** liberato.\n"
+        f"👤 Vecchio player: {utente.mention}\n"
+        f"🏆 Campionato: **{league_name}**\n\n"
+        f"Il club torna disponibile nel menu iscrizioni. Il prossimo player che riceverà **{club_name}** erediterà rosa, budget, partite e statistiche.",
+        ephemeral=True
+    )
 
 # ===========================================================
 
@@ -3266,16 +3428,26 @@ async def reset_modalita(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     conn = connect()
     cur = conn.cursor()
     cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL")
     cur.execute("UPDATE managers SET budget = ?", (DEFAULT_BUDGET,))
     cur.execute("DELETE FROM real_team_assignments")
     cur.execute("UPDATE auctions SET status = 'closed' WHERE status = 'open'")
+    cur.execute("UPDATE fc26_clubs SET assigned_to = NULL, assigned_at = NULL, previous_owner_id = NULL, previous_owner_name = NULL")
+    cur.execute("UPDATE signup_requests SET status = 'reset' WHERE status IN ('pending', 'accepted', 'released')")
     conn.commit()
     conn.close()
 
-    await interaction.response.send_message("✅ Reset completato: rose svuotate, budget ripristinato, squadre assegnate cancellate.")
+    updated_roles = await reset_registered_players_to_request_role(interaction.guild)
+
+    await interaction.followup.send(
+        f"✅ Reset completato: rose svuotate, budget ripristinato, squadre assegnate cancellate.\n"
+        f"🔁 Ruoli aggiornati: **{updated_roles}** player hanno perso ISCRITTO e ricevuto RICHIESTA ISCRIZIONE.",
+        ephemeral=True
+    )
 
 
 
@@ -3583,13 +3755,21 @@ async def reset_campionato(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Solo gli admin possono resettare il campionato.", ephemeral=True)
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     conn = connect()
     cur = conn.cursor()
     cur.execute("UPDATE championships SET status = 'archived' WHERE status = 'active'")
     conn.commit()
     conn.close()
 
-    await interaction.response.send_message("✅ Campionato attivo archiviato.")
+    updated_roles = await reset_registered_players_to_request_role(interaction.guild)
+
+    await interaction.followup.send(
+        f"✅ Campionato attivo archiviato.\n"
+        f"🔁 Ruoli aggiornati: **{updated_roles}** player hanno perso ISCRITTO e ricevuto RICHIESTA ISCRIZIONE.",
+        ephemeral=True
+    )
 
 
 class ResultOpponentSelect(discord.ui.Select):
