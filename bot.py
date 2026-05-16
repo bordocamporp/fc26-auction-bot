@@ -32,6 +32,11 @@ CALENDAR_CHANNEL_ID = "1505147549063843980"
 LEAGUE_PLAYER_ROLE_ID = "1505181066695016619"
 LEAGUE_ADMIN_ROLE_ID = "1505151387015581757"
 
+BOT_ONLY_BYPASS_ROLE_IDS = {
+    "1505151387015581757",
+    "1498341567105339492",
+}
+
 BOT_ONLY_CHANNELS = {
     1505147549063843980,  # calendario
     1505147679636717610,  # risultati
@@ -934,9 +939,19 @@ class RegistraPreIscrittoView(discord.ui.View):
         self.add_item(RegistraPreIscrittoSelect(members))
 
 
+
+def can_bypass_bot_only(member):
+    return any(str(role.id) in BOT_ONLY_BYPASS_ROLE_IDS for role in getattr(member, "roles", []))
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
+        return
+
+    # Gli admin/staff con questi ruoli possono scrivere liberamente nei canali bot-only.
+    if can_bypass_bot_only(message.author):
+        await bot.process_commands(message)
         return
 
     if message.channel.id in BOT_ONLY_CHANNELS:
