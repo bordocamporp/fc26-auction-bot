@@ -1170,7 +1170,7 @@ async def card(interaction: discord.Interaction, player_id: str):
 @app_commands.describe(player_id="ID giocatore")
 async def asta(interaction: discord.Interaction, player_id: str):
     if AUCTION_CHANNEL_ID and str(interaction.channel_id) != str(AUCTION_CHANNEL_ID):
-        await interaction.response.send_message("❌ Puoi avviare le aste solo nel canale aste.", ephemeral=True)
+        await interaction.response.send_message("❌ Puoi avviare le aste solo nel canale aste.", delete_after=10)
         return
 
     await interaction.response.defer()
@@ -3177,7 +3177,7 @@ class ResultConfirmView(discord.ui.View):
 @tree.command(name="risultato", description="Inserisci un risultato del tuo girone")
 async def risultato(interaction: discord.Interaction):
     if not is_results_channel(interaction):
-        await interaction.response.send_message("❌ I risultati si inseriscono solo nel canale RISULTATI.", ephemeral=True)
+        await interaction.response.send_message("❌ I risultati si inseriscono solo nel canale RISULTATI.", delete_after=10)
         return
 
     champ = active_championship()
@@ -3215,7 +3215,7 @@ async def risultato(interaction: discord.Interaction):
 @tree.command(name="classifica", description="Mostra la classifica del campionato")
 async def classifica(interaction: discord.Interaction):
     if not is_standings_channel(interaction):
-        await interaction.response.send_message("❌ La classifica si vede solo nel canale CLASSIFICHE.", ephemeral=True)
+        await interaction.response.send_message("❌ La classifica si vede solo nel canale CLASSIFICHE.", delete_after=10)
         return
 
     champ = active_championship()
@@ -3253,7 +3253,7 @@ async def classifica(interaction: discord.Interaction):
 @tree.command(name="calendario", description="Mostra le partite ancora da disputare")
 async def calendario(interaction: discord.Interaction):
     if not is_calendar_channel(interaction):
-        await interaction.response.send_message("❌ Il calendario si vede solo nel canale CALENDARIO.", ephemeral=True)
+        await interaction.response.send_message("❌ Il calendario si vede solo nel canale CALENDARIO.", delete_after=10)
         return
 
     champ = active_championship()
@@ -3332,7 +3332,7 @@ async def calendario(interaction: discord.Interaction):
 @tree.command(name="prossima_partita", description="Mostra la tua prossima partita")
 async def prossima_partita(interaction: discord.Interaction):
     if not is_calendar_channel(interaction):
-        await interaction.response.send_message("❌ Questo comando si usa solo nel canale CALENDARIO.", ephemeral=True)
+        await interaction.response.send_message("❌ Questo comando si usa solo nel canale CALENDARIO.", delete_after=10)
         return
 
     champ = active_championship()
@@ -3370,7 +3370,7 @@ async def prossima_partita(interaction: discord.Interaction):
 @tree.command(name="capocannonieri", description="Classifica marcatori")
 async def capocannonieri(interaction: discord.Interaction):
     if not is_stats_channel(interaction):
-        await interaction.response.send_message("❌ Le statistiche si vedono solo nel canale STATISTICHE.", ephemeral=True)
+        await interaction.response.send_message("❌ Le statistiche si vedono solo nel canale STATISTICHE.", delete_after=10)
         return
 
     champ = active_championship()
@@ -3406,7 +3406,7 @@ async def capocannonieri(interaction: discord.Interaction):
 @tree.command(name="miglior_difesa", description="Mostra le migliori difese")
 async def miglior_difesa(interaction: discord.Interaction):
     if not is_stats_channel(interaction):
-        await interaction.response.send_message("❌ Le statistiche si vedono solo nel canale STATISTICHE.", ephemeral=True)
+        await interaction.response.send_message("❌ Le statistiche si vedono solo nel canale STATISTICHE.", delete_after=10)
         return
 
     champ = active_championship()
