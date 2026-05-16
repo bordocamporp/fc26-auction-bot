@@ -1204,23 +1204,18 @@ class StaffDecisionSelect(discord.ui.Select):
                     except Exception:
                         pass
                 try:
-                    await member.send("❌ **Richiesta rifiutata**
-
-La tua richiesta per il torneo **FC 26** è stata rifiutata dallo staff.")
+                    await member.send("❌ **Richiesta rifiutata**\n\nLa tua richiesta per il torneo **FC 26** è stata rifiutata dallo staff.")
                 except Exception:
                     pass
 
             await send_signup_reject_log(
                 guild,
-                content=f"❌ **Richiesta rifiutata**
-
-👤 Player: <@{request['discord_id']}>"
+                content=f"❌ **Richiesta rifiutata**\n\n👤 Player: <@{request['discord_id']}>"
             )
 
             embed = discord.Embed(
                 title="❌ Richiesta rifiutata",
-                description=f"Player: <@{request['discord_id']}>
-Gestita da: {interaction.user.mention}",
+                description=f"Player: <@{request['discord_id']}>\nGestita da: {interaction.user.mention}",
                 color=discord.Color.red()
             )
 
