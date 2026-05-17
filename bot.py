@@ -2489,6 +2489,34 @@ async def libera_club(interaction: discord.Interaction, utente: discord.Member):
 
 # ===========================================================
 
+
+
+class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
+    nome = discord.ui.TextInput(label="Nome", placeholder="Inserisci il tuo nome", required=True, max_length=50)
+    eta = discord.ui.TextInput(label="Età", placeholder="Esempio: 18", required=True, max_length=3)
+    piattaforma = discord.ui.TextInput(label="Piattaforma", placeholder="PS5 / Xbox / PC", required=True, max_length=30)
+    game_id = discord.ui.TextInput(label="ID PSN/Xbox/EA", placeholder="Inserisci il tuo ID", required=True, max_length=60)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "✅ Richiesta ricevuta. Lo staff la gestirà dal canale dedicato.",
+            ephemeral=True
+        )
+
+
+class SignupStartView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Richiedi iscrizione",
+        style=discord.ButtonStyle.green,
+        custom_id="fc26_signup_start"
+    )
+    async def signup_start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SignupModal())
+
+
 @bot.event
 async def on_ready():
     init_db()
