@@ -342,6 +342,7 @@ intents = discord.Intents.default()
 # Necessario per recuperare i membri del server quando lo staff accetta/rifiuta
 # e per assegnare/rimuovere i ruoli. Va attivato anche nel Discord Developer Portal.
 intents.members = True
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
