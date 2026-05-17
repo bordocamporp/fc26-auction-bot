@@ -2979,165 +2979,160 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        if str(interaction.channel_id) != str(SIGNUP_REQUEST_CHANNEL_ID):
-            await interaction.response.send_message("❌ Puoi richiedere l'iscrizione solo nel canale dedicato.", ephemeral=True)
+        # Risposta immediata al modal: evita "Unknown interaction" / "Qualcosa è andato storto".
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception as e:
+            print(f"[SIGNUP MODAL] Defer fallito: {e}")
             return
 
-        mode = get_league_mode() if "get_league_mode" in globals() else "fantacalcio"
-        preferences = str(self.club_preferiti.value or "").strip()
+        try:
+            real_name = str(self.real_name.value).strip()
+            age = str(self.age.value).strip()
+            platform = str(self.platform.value).strip()
+            game_id = str(self.game_id.value).strip()
 
-        if mode == "squadre_reali":
-            clubs = [c.strip() for c in preferences.replace(";", ",").replace("\n", ",").split(",") if c.strip()]
-            if len(clubs) < 2:
-                await interaction.response.send_message(
-                    "❌ In modalità Squadre Reali devi inserire almeno **2 club preferiti** nel campo `Club che vorresti`.",
+            try:
+                club_preferences = str(self.club_preferences.value).strip()
+            except Exception:
+                club_preferences = ""
+
+            conn = connect()
+            cur = conn.cursor()
+
+            # Sicurezza schema: aggiunge colonne mancanti se il DB Supabase era stato creato prima.
+            for sql in [
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS discord_name TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS real_name TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS age TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS platform TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS ea_id TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS game_id TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS preferred_clubs TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_preferences TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_name TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_by TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_at TIMESTAMP",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            ]:
+                try:
+                    cur.execute(sql)
+                except Exception:
+                    pass
+
+            # Blocca doppia richiesta pending
+            cur.execute(
+                "SELECT id FROM signup_requests WHERE discord_id = %s AND status = 'pending' LIMIT 1",
+                (str(interaction.user.id),)
+            )
+            existing = cur.fetchone()
+
+            if existing:
+                conn.close()
+                await interaction.followup.send(
+                    "⚠️ Hai già una richiesta in attesa di valutazione.",
                     ephemeral=True
                 )
                 return
-            preferences = ", ".join(clubs)
 
-        conn = connect()
-        cur = conn.cursor()
-
-        try:
-            cur.execute("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_preferences TEXT")
-        except Exception:
-            pass
-
-        # Blocca richieste duplicate pending
-        cur.execute(
-            "SELECT id FROM signup_requests WHERE discord_id = %s AND status = 'pending'",
-            (str(interaction.user.id),)
-        )
-        existing = cur.fetchone()
-
-        if existing:
-            conn.close()
-            await interaction.response.send_message(
-                "⚠️ Hai già una richiesta in attesa di valutazione.",
-                ephemeral=True
+            # Blocca utenti già accettati
+            cur.execute(
+                "SELECT id FROM signup_requests WHERE discord_id = %s AND status = 'accepted' LIMIT 1",
+                (str(interaction.user.id),)
             )
-            return
+            accepted = cur.fetchone()
 
-        # Blocca utenti già ACCETTATI
-        cur.execute(
-            "SELECT id FROM signup_requests WHERE discord_id = %s AND status = 'accepted'",
-            (str(interaction.user.id),)
-        )
-        already_accepted = cur.fetchone()
+            if accepted:
+                conn.close()
+                await interaction.followup.send(
+                    "❌ Sei già iscritto al torneo. Non puoi inviare una nuova richiesta.",
+                    ephemeral=True
+                )
+                return
 
-        if already_accepted:
-            conn.close()
-            await interaction.response.send_message(
-                "❌ Sei già iscritto al torneo. Non puoi inviare una nuova richiesta.",
-                ephemeral=True
-            )
-            return
-
-        # Blocca utenti che hanno già un club assegnato
-        try:
+            # Salva richiesta
             cur.execute("""
-                SELECT name
-                FROM fc26_clubs
-                WHERE assigned_to = %s
+                INSERT INTO signup_requests
+                (discord_id, discord_name, real_name, age, platform, game_id,
+                 ea_id, preferred_clubs, club_preferences, status, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', CURRENT_TIMESTAMP)
+            """, (
+                str(interaction.user.id),
+                str(interaction.user),
+                real_name,
+                age,
+                platform,
+                game_id,
+                game_id,
+                club_preferences,
+                club_preferences
+            ))
+
+            conn.commit()
+
+            cur.execute("""
+                SELECT id
+                FROM signup_requests
+                WHERE discord_id = %s
+                ORDER BY id DESC
                 LIMIT 1
             """, (str(interaction.user.id),))
+            req = cur.fetchone()
+            request_id = req["id"] if req else "?"
 
-            already_club = cur.fetchone()
+            conn.close()
 
-            if already_club:
-                conn.close()
-                await interaction.response.send_message(
-                    f"❌ Risulti già assegnato al club **{already_club['name']}**.",
-                    ephemeral=True
-                )
-                return
-        except Exception:
-            pass
-
-        # Blocca utenti con ruolo iscritto
-        try:
-            registered_role = interaction.guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
-
-            if registered_role and registered_role in interaction.user.roles:
-                conn.close()
-                await interaction.response.send_message(
-                    "❌ Hai già il ruolo iscritto e non puoi inviare una nuova richiesta.",
-                    ephemeral=True
-                )
-                return
-        except Exception:
-            pass
-
-        cur.execute("""
-            INSERT INTO signup_requests
-            (discord_id, discord_name, real_name, age, platform, game_id, club_preferences, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
-        """, (
-            str(interaction.user.id),
-            interaction.user.display_name,
-            str(self.nome.value).strip(),
-            str(self.eta.value).strip(),
-            str(self.piattaforma.value).strip(),
-            str(self.game_id.value).strip(),
-            preferences
-        ))
-
-        request_id = cur.lastrowid
-        conn.commit()
-        conn.close()
-
-        pending_role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID)) if interaction.guild else None
-        if pending_role:
+            # Ruolo pending
             try:
-                await interaction.user.add_roles(pending_role, reason="Richiesta iscrizione FC26 inviata")
+                role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
+                if role:
+                    await interaction.user.add_roles(role)
+            except Exception as e:
+                print(f"[SIGNUP MODAL] Errore ruolo pending: {e}")
+
+            # Invio canale staff
+            try:
+                staff_channel = interaction.guild.get_channel(int(SIGNUP_STAFF_CHANNEL_ID))
+                if not staff_channel:
+                    staff_channel = await bot.fetch_channel(int(SIGNUP_STAFF_CHANNEL_ID))
+
+                embed = discord.Embed(
+                    title="📩 Nuova richiesta iscrizione FC26",
+                    description=f"Richiesta ID: **{request_id}**",
+                    color=discord.Color.orange()
+                )
+                embed.add_field(name="Player Discord", value=interaction.user.mention, inline=False)
+                embed.add_field(name="Nome", value=real_name or "-", inline=True)
+                embed.add_field(name="Età", value=age or "-", inline=True)
+                embed.add_field(name="Piattaforma", value=platform or "-", inline=True)
+                embed.add_field(name="ID PSN/Xbox/EA", value=game_id or "-", inline=False)
+
+                if club_preferences:
+                    embed.add_field(name="Club preferiti", value=club_preferences, inline=False)
+
+                embed.add_field(name="Modalità attiva", value=get_league_mode(), inline=False)
+                embed.set_footer(text="Lo staff deve scegliere ACCETTA o RIFIUTA.")
+
+                await staff_channel.send(embed=embed, view=SignupStaffView(int(request_id)))
+            except Exception as e:
+                print(f"[SIGNUP MODAL] Errore invio staff: {e}")
+
+            await interaction.followup.send(
+                "✅ Richiesta inviata correttamente. Lo staff la controllerà appena possibile.",
+                ephemeral=True
+            )
+
+        except Exception as e:
+            print(f"[SIGNUP MODAL] Errore submit: {e}")
+            try:
+                await interaction.followup.send(
+                    f"❌ Errore invio richiesta: `{e}`",
+                    ephemeral=True
+                )
             except Exception:
                 pass
 
-        staff_channel = interaction.guild.get_channel(int(SIGNUP_STAFF_CHANNEL_ID)) if interaction.guild else None
-        if not staff_channel:
-            try:
-                staff_channel = await bot.fetch_channel(int(SIGNUP_STAFF_CHANNEL_ID))
-            except Exception:
-                staff_channel = None
-
-        embed = discord.Embed(
-            title="📩 Nuova richiesta iscrizione FC26",
-            description=f"Richiesta ID: **{request_id}**",
-            color=discord.Color.orange()
-        )
-        embed.add_field(name="Player Discord", value=interaction.user.mention, inline=False)
-        embed.add_field(name="Nome", value=str(self.nome.value), inline=True)
-        embed.add_field(name="Età", value=str(self.eta.value), inline=True)
-        embed.add_field(name="Piattaforma", value=str(self.piattaforma.value), inline=True)
-        embed.add_field(name="ID PSN/Xbox/EA", value=str(self.game_id.value), inline=False)
-        embed.add_field(name="Modalità attiva", value=str(mode), inline=True)
-        if mode == "squadre_reali":
-            embed.add_field(name="Club preferiti", value=preferences or "N/D", inline=False)
-        embed.set_footer(text="Lo staff deve scegliere ACCETTA o RIFIUTA.")
-
-        if staff_channel:
-            await staff_channel.send(embed=embed, view=StaffDecisionView(request_id))
-
-        try:
-            await send_staff_log(
-                interaction.guild,
-                "📩 Nuova richiesta iscrizione inviata",
-                f"Player: {interaction.user.mention}\nRichiesta ID: **{request_id}**",
-                user=interaction.user,
-                color=discord.Color.orange()
-            )
-        except Exception:
-            pass
-
-        await interaction.response.send_message(
-            "✅ Richiesta inviata allo staff. Ti è stato assegnato il ruolo PRE-ISCRITTO.",
-            ephemeral=True
-        )
-
-
-
-# ================= VIEW STAFF ACCETTA/RIFIUTA ISCRIZIONE =================
 
 def get_signup_request(request_id):
     conn = connect()
