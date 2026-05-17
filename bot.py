@@ -954,11 +954,11 @@ def budget_from_team_overall(avg_ovr):
     avg_ovr = float(avg_ovr or 0)
 
     if avg_ovr >= 85:
-        return 150
+        return 50
     if avg_ovr >= 82:
-        return 220
+        return 80
     if avg_ovr >= 80:
-        return 280
+        return 150
     if avg_ovr >= 78:
         return 350
     if avg_ovr >= 75:
@@ -5091,9 +5091,9 @@ class ModalitaSelect(discord.ui.Select):
                 "🏟️ Modalità impostata su **Squadre reali**.\n\n"
                 "Gli admin assegnano una squadra reale ai player con `/assegna_squadra`.\n"
                 "Il bot assegna automaticamente i giocatori di quel club e calcola un budget compensativo:\n"
-                "• OVR medio 85+ → 150 crediti\n"
-                "• OVR medio 82-84 → 220 crediti\n"
-                "• OVR medio 80-81 → 280 crediti\n"
+                "• OVR medio 85+ → 50 crediti\n"
+                "• OVR medio 82–84 → 80 crediti\n"
+                "• OVR medio 80–81 → 150 crediti\n"
                 "• OVR medio 78-79 → 350 crediti\n"
                 "• OVR medio 75-77 → 430 crediti\n"
                 "• sotto 75 → 500 crediti"
@@ -7720,5 +7720,107 @@ async def cerc(interaction: discord.Interaction, tipo: app_commands.Choice[str],
     await cerca.callback(interaction, tipo, testo)
 
 # ===========================================================
+
+
+# ================= AGGIORNA BUDGET SQUADRE REALI =================
+
+@tree.command(name="aggiorna_budget_reali", description="Staff: ricalcola il budget dei club già iscritti in modalità reale")
+async def aggiorna_budget_reali(interaction: discord.Interaction):
+    if not can_use_normal_staff(interaction.user):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    conn = connect()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT c.name AS club_name, c.assigned_to, m.name AS manager_name
+            FROM fc26_clubs c
+            LEFT JOIN managers m ON m.discord_id = c.assigned_to
+            WHERE c.assigned_to IS NOT NULL
+            ORDER BY c.name ASC
+        """)
+        assigned = cur.fetchall()
+    except Exception as e:
+        conn.close()
+        await interaction.followup.send(f"❌ Errore lettura club assegnati: `{e}`", ephemeral=True)
+        return
+
+    updated = []
+    skipped = []
+
+    for row in assigned:
+        club_name = row["club_name"]
+        discord_id = row["assigned_to"]
+
+        players, avg_ovr, new_budget = get_team_stats_reale(club_name, include_owned_by=str(discord_id))
+
+        if not players:
+            skipped.append(club_name)
+            continue
+
+        cur.execute("""
+            UPDATE managers
+            SET budget = ?
+            WHERE discord_id = ?
+        """, (new_budget, str(discord_id)))
+
+        try:
+            cur.execute("""
+                INSERT OR REPLACE INTO real_team_assignments
+                (discord_id, manager_name, team_name, avg_overall, assigned_budget)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                str(discord_id),
+                row["manager_name"] or str(discord_id),
+                players[0]["team"],
+                avg_ovr,
+                new_budget
+            ))
+        except Exception:
+            pass
+
+        updated.append((club_name, discord_id, avg_ovr, new_budget))
+
+    conn.commit()
+    conn.close()
+
+    embed = discord.Embed(
+        title="✅ Budget squadre reali aggiornati",
+        description=f"Aggiornati **{len(updated)}** club assegnati.",
+        color=discord.Color.green()
+    )
+
+    if updated:
+        lines = []
+        for club_name, discord_id, avg_ovr, budget in updated[:20]:
+            lines.append(f"• **{club_name}** — <@{discord_id}> — OVR {avg_ovr:.1f} → **{budget} crediti**")
+        embed.add_field(name="Aggiornati", value="\n".join(lines), inline=False)
+
+    if skipped:
+        embed.add_field(
+            name="Saltati",
+            value="\n".join(f"• {club}" for club in skipped[:15]),
+            inline=False
+        )
+        embed.set_footer(text="I club saltati non hanno rosa trovata nel database. Usa /diagnostica_squadra.")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    try:
+        await send_staff_log(
+            interaction.guild,
+            "💰 Budget squadre reali aggiornati",
+            f"Aggiornati **{len(updated)}** club. Saltati **{len(skipped)}** club.",
+            user=interaction.user,
+            color=discord.Color.green()
+        )
+    except Exception:
+        pass
+
+# ===============================================================
 
 bot.run(TOKEN)
