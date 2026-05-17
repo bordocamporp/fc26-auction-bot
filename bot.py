@@ -973,6 +973,8 @@ def market_status_label():
 def budget_from_team_overall(avg_ovr):
     avg_ovr = float(avg_ovr or 0)
 
+    # Budget modalità squadre reali
+    # Top club: pochi crediti, club più deboli: più crediti.
     if avg_ovr >= 85:
         return 50
     if avg_ovr >= 82:
@@ -1071,8 +1073,9 @@ def get_team_aliases(team_name):
 
 def get_team_stats_reale(team_name, include_owned_by=None):
     """
-    Trova i giocatori reali del club anche con alias.
-    Se include_owned_by è valorizzato, considera anche giocatori già assegnati a quel manager.
+    Trova i giocatori reali del club usando la colonna corretta players.team.
+    Considera liberi i giocatori con owner_discord_id NULL o vuoto.
+    Se include_owned_by è valorizzato, include anche i giocatori già assegnati a quel manager.
     """
     aliases = get_team_aliases(team_name)
 
@@ -1082,25 +1085,29 @@ def get_team_stats_reale(team_name, include_owned_by=None):
     cur.execute("""
         SELECT *
         FROM players
-        ORDER BY overall DESC
+        ORDER BY overall DESC NULLS LAST
     """)
     rows = cur.fetchall()
     conn.close()
 
     matched = []
     for r in rows:
-        team_norm = normalize_team_name(r["team"])
-        owner = r["owner_discord_id"]
+        team_value = r.get("team") if hasattr(r, "get") else r["team"]
+        team_norm = normalize_team_name(team_value)
+
+        owner = r.get("owner_discord_id") if hasattr(r, "get") else r["owner_discord_id"]
+        owner_empty = owner is None or str(owner).strip() == ""
 
         if team_norm in aliases:
-            if owner is None or str(owner) == "" or (include_owned_by and str(owner) == str(include_owned_by)):
+            if owner_empty or (include_owned_by and str(owner) == str(include_owned_by)):
                 matched.append(r)
 
     if not matched:
         return [], 0, 0
 
-    avg_ovr = sum(safe_int(r["overall"]) for r in matched) / len(matched)
+    avg_ovr = sum(safe_int(r.get("overall") if hasattr(r, "get") else r["overall"]) for r in matched) / len(matched)
     budget = budget_from_team_overall(avg_ovr)
+
     return matched, avg_ovr, budget
 
 
@@ -1129,75 +1136,121 @@ def get_exact_team_names_like(team_name):
 
 def sync_real_team_roster_to_manager(discord_id, club_name):
     """
-    Assegna tutti i giocatori reali del club al manager e ricalcola budget.
+    Assegna automaticamente al manager tutti i giocatori reali del club scelto.
+
+    Usa:
+    - players.team per trovare il club reale
+    - players.owner_discord_id per assegnare la rosa
+    - players.sold_price = 0 per giocatori ricevuti con squadra reale
+    - managers.budget calcolato da OVR medio reale
+
     Ritorna: players_count, avg_ovr, budget, real_team_name.
     """
-    players, avg_ovr, budget = get_team_stats_reale(club_name, include_owned_by=str(discord_id))
+    discord_id = str(discord_id)
+    club_name = str(club_name).strip()
+
+    players, avg_ovr, budget = get_team_stats_reale(club_name, include_owned_by=discord_id)
 
     if not players:
+        print(f"[REAL TEAM SYNC] Nessun giocatore trovato per club={club_name}")
         return 0, 0, 0, None
 
-    real_team_name = players[0]["team"]
+    first_team = players[0].get("team") if hasattr(players[0], "get") else players[0]["team"]
+    real_team_name = first_team or club_name
 
     conn = connect()
     cur = conn.cursor()
 
-    # Libera rosa precedente del manager per evitare doppie rose
+    # Compatibilità schema
+    for sql in [
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS name TEXT",
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS manager_name TEXT",
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS club_name TEXT",
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS budget INTEGER DEFAULT 500",
+        "ALTER TABLE players ADD COLUMN IF NOT EXISTS owner_discord_id TEXT",
+        "ALTER TABLE players ADD COLUMN IF NOT EXISTS sold_price INTEGER",
+        "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_to TEXT",
+        "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP",
+        "ALTER TABLE real_team_assignments ADD COLUMN IF NOT EXISTS manager_name TEXT",
+        "ALTER TABLE real_team_assignments ADD COLUMN IF NOT EXISTS team_name TEXT",
+        "ALTER TABLE real_team_assignments ADD COLUMN IF NOT EXISTS avg_overall DOUBLE PRECISION",
+        "ALTER TABLE real_team_assignments ADD COLUMN IF NOT EXISTS assigned_budget INTEGER"
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception:
+            pass
+
+    # Libera eventuale rosa precedente del manager
     cur.execute("""
         UPDATE players
-        SET owner_discord_id = NULL, sold_price = NULL
+        SET owner_discord_id = NULL,
+            sold_price = NULL
         WHERE owner_discord_id = %s
-    """, (str(discord_id),))
+    """, (discord_id,))
 
-    # Assegna rosa reale
+    # Assegna tutti i giocatori trovati
+    assigned_count = 0
     for p in players:
+        pid = p.get("id") if hasattr(p, "get") else p["id"]
         cur.execute("""
             UPDATE players
-            SET owner_discord_id = %s, sold_price = %s
+            SET owner_discord_id = %s,
+                sold_price = 0
             WHERE id = %s
-        """, (str(discord_id), 0, p["id"]))
+        """, (discord_id, pid))
+        assigned_count += 1
 
-    # Manager/budget
+    # Crea/aggiorna manager
     cur.execute("""
-        INSERT INTO managers (discord_id, name, budget)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (discord_id) DO NOTHING
-    """, (str(discord_id), str(discord_id), budget))
+        INSERT INTO managers (discord_id, name, manager_name, club_name, budget)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (discord_id) DO UPDATE SET
+            name = EXCLUDED.name,
+            manager_name = EXCLUDED.manager_name,
+            club_name = EXCLUDED.club_name,
+            budget = EXCLUDED.budget
+    """, (discord_id, discord_id, discord_id, club_name, int(budget)))
 
+    # Libera eventuale club precedente assegnato allo stesso manager
     cur.execute("""
-        UPDATE managers
-        SET budget = %s
-        WHERE discord_id = %s
-    """, (budget, str(discord_id)))
+        UPDATE fc26_clubs
+        SET assigned_to = NULL,
+            assigned_at = NULL
+        WHERE assigned_to = %s
+    """, (discord_id,))
 
-    # Club assegnato
-    try:
-        cur.execute("""
-            UPDATE fc26_clubs
-            SET assigned_to = NULL
-            WHERE assigned_to = %s
-        """, (str(discord_id),))
+    # Assegna club scelto
+    cur.execute("""
+        UPDATE fc26_clubs
+        SET assigned_to = %s,
+            assigned_at = CURRENT_TIMESTAMP
+        WHERE LOWER(name) = LOWER(%s)
+    """, (discord_id, club_name))
 
-        cur.execute("""
-            UPDATE fc26_clubs
-            SET assigned_to = %s, assigned_at = CURRENT_TIMESTAMP
-            WHERE LOWER(name) = LOWER(%s)
-        """, (str(discord_id), str(club_name).strip()))
-    except Exception:
-        pass
-
-    # real_team_assignments
-    try:
-        cur.execute("""
-            INSERT INTO real_team_assignments (discord_id, manager_name, team_name, avg_overall, assigned_budget) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (discord_id) DO UPDATE SET manager_name = EXCLUDED.manager_name, team_name = EXCLUDED.team_name, avg_overall = EXCLUDED.avg_overall, assigned_budget = EXCLUDED.assigned_budget
-        """, (str(discord_id), str(discord_id), real_team_name, avg_ovr, budget))
-    except Exception:
-        pass
+    # Salva assegnazione reale
+    cur.execute("""
+        INSERT INTO real_team_assignments
+        (discord_id, manager_name, team_name, avg_overall, assigned_budget)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (discord_id) DO UPDATE SET
+            manager_name = EXCLUDED.manager_name,
+            team_name = EXCLUDED.team_name,
+            avg_overall = EXCLUDED.avg_overall,
+            assigned_budget = EXCLUDED.assigned_budget
+    """, (discord_id, discord_id, real_team_name, float(avg_ovr), int(budget)))
 
     conn.commit()
     conn.close()
 
-    return len(players), avg_ovr, budget, real_team_name
+    print(
+        f"[REAL TEAM SYNC] Manager={discord_id} Club={club_name} "
+        f"RealTeam={real_team_name} Giocatori={assigned_count} "
+        f"OVR={avg_ovr:.2f} Budget={budget}"
+    )
+
+    return assigned_count, avg_ovr, int(budget), real_team_name
+
 
 # ===========================================================
 
@@ -3532,6 +3585,14 @@ class SignupClubSelect(discord.ui.Select):
 
         # Sync rosa reale + budget
         players_count, avg_ovr, budget, real_team_name = sync_real_team_roster_to_manager(discord_id, club_name)
+
+        if players_count <= 0:
+            await interaction.followup.send(
+                f"❌ Nessun giocatore trovato per **{club_name}** nella tabella `players.team`. "
+                "Controlla che il nome squadra nel database coincida con il club scelto.",
+                ephemeral=True
+            )
+            return
 
         # Ruoli
         try:
