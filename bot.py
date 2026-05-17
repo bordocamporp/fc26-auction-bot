@@ -478,6 +478,25 @@ def ensure_extra_tables():
     conn = connect()
     cur = conn.cursor()
 
+    # Compatibilità PostgreSQL/Supabase: alcune versioni hanno manager_name invece di name.
+    try:
+        cur.execute("ALTER TABLE managers ADD COLUMN IF NOT EXISTS name TEXT")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE managers ADD COLUMN IF NOT EXISTS manager_name TEXT")
+    except Exception:
+        pass
+    try:
+        cur.execute("UPDATE managers SET name = COALESCE(name, manager_name, discord_id) WHERE name IS NULL")
+    except Exception:
+        pass
+    try:
+        cur.execute("UPDATE managers SET manager_name = COALESCE(manager_name, name, discord_id) WHERE manager_name IS NULL")
+    except Exception:
+        pass
+
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS bid_history (
         id SERIAL PRIMARY KEY,
@@ -1631,7 +1650,7 @@ def cleanup_old_backups():
 def create_database_backup(reason="manuale"):
     db_path = get_database_path()
     if not db_path:
-        return None, "Database non trovato. Controlla il nome del file database in DATABASE_CANDIDATES."
+        return None, "Backup locale SQLite non disponibile: il bot ora usa PostgreSQL/Supabase."
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     safe_reason = normalize_text(reason).replace(" ", "_")[:40] or "manuale"
@@ -2389,25 +2408,16 @@ def ensure_season_tables():
     )
     """)
 
-    try:
-        cur.execute("ALTER TABLE seasons ADD COLUMN IF NOT EXISTS name TEXT")
-    except Exception:
-        pass
-
-    try:
-        cur.execute("ALTER TABLE seasons ADD COLUMN IF NOT EXISTS season_name TEXT")
-    except Exception:
-        pass
-
-    try:
-        cur.execute("ALTER TABLE seasons ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'")
-    except Exception:
-        pass
-
-    try:
-        cur.execute("ALTER TABLE seasons ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE")
-    except Exception:
-        pass
+    for sql in [
+        "ALTER TABLE seasons ADD COLUMN IF NOT EXISTS name TEXT",
+        "ALTER TABLE seasons ADD COLUMN IF NOT EXISTS season_name TEXT",
+        "ALTER TABLE seasons ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
+        "ALTER TABLE seasons ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE"
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception:
+            pass
 
     try:
         cur.execute("""
@@ -2782,7 +2792,6 @@ async def fine_stagione(interaction: discord.Interaction):
 
 @tree.command(name="setup_iscrizioni", description="Staff: pubblica il pannello richiesta iscrizione FC26")
 async def setup_iscrizioni(interaction: discord.Interaction):
-    # Risposta immediata: deve essere la PRIMA cosa possibile.
     try:
         await interaction.response.defer(ephemeral=True)
     except Exception as e:
@@ -4353,11 +4362,11 @@ async def rosa(interaction: discord.Interaction):
     conn = connect()
     cur = conn.cursor()
     cur.execute("""
-        SELECT m.discord_id, m.name, m.budget, COUNT(p.id) AS player_count
+        SELECT m.discord_id, COALESCE(m.name, m.manager_name, m.discord_id) AS name, m.budget, COUNT(p.id) AS player_count
         FROM managers m
         LEFT JOIN players p ON p.owner_discord_id = m.discord_id
-        GROUP BY m.discord_id, m.name, m.budget
-        ORDER BY m.name ASC
+        GROUP BY m.discord_id, COALESCE(m.name, m.manager_name, m.discord_id) AS name, m.budget
+        ORDER BY COALESCE(m.name, m.manager_name, m.discord_id) ASC
     """)
     managers = cur.fetchall()
     conn.close()
@@ -5058,6 +5067,7 @@ async def blacklist_add(interaction: discord.Interaction, player_id: str, motivo
     cur.execute("""
         INSERT INTO blacklist_players (player_id, reason, created_by)
         VALUES (%s, %s, %s)
+        ON CONFLICT (player_id) DO UPDATE SET reason = EXCLUDED.reason, created_by = EXCLUDED.created_by
         ON CONFLICT (player_id) DO UPDATE SET
             reason = EXCLUDED.reason,
             created_by = EXCLUDED.created_by
@@ -7153,7 +7163,7 @@ def get_occupied_clubs_for_autocomplete():
     cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT c.name, c.league, c.assigned_to, m.name AS manager_name
+            SELECT c.name, c.league, c.assigned_to, COALESCE(COALESCE(m.name, m.manager_name, m.discord_id) AS name, m.manager_name, m.discord_id) AS manager_name
             FROM fc26_clubs c
             LEFT JOIN managers m ON m.discord_id = c.assigned_to
             WHERE c.assigned_to IS NOT NULL
@@ -7809,7 +7819,7 @@ async def aggiorna_budget_reali(interaction: discord.Interaction):
 
     try:
         cur.execute("""
-            SELECT c.name AS club_name, c.assigned_to, m.name AS manager_name
+            SELECT c.name AS club_name, c.assigned_to, COALESCE(COALESCE(m.name, m.manager_name, m.discord_id) AS name, m.manager_name, m.discord_id) AS manager_name
             FROM fc26_clubs c
             LEFT JOIN managers m ON m.discord_id = c.assigned_to
             WHERE c.assigned_to IS NOT NULL
