@@ -14,6 +14,7 @@ from db import connect, init_db, reset_auction_state
 from card_generator import create_player_card
 
 load_dotenv()
+print("[BOOT] Avvio bot.py")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID", "1280605547455840440")
@@ -673,7 +674,7 @@ def ensure_extra_tables():
                 (club, league_name)
             )
             cur.execute(
-                "UPDATE fc26_clubs SET league = ? WHERE name = ? AND (league IS NULL OR league = '')",
+                "UPDATE fc26_clubs SET league = %s WHERE name = %s AND (league IS NULL OR league = '')",
                 (league_name, club)
             )
 
@@ -2417,7 +2418,7 @@ def create_next_season():
     cur.execute("SELECT MAX(id) AS max_id FROM seasons")
     row = cur.fetchone()
     next_num = safe_int(row["max_id"], 0) + 1
-    cur.execute("INSERT INTO seasons (name, status) VALUES (?, 'active')", (f"Stagione {next_num}",))
+    cur.execute("INSERT INTO seasons (name, status) VALUES (%s, 'active')", (f"Stagione {next_num}",))
     season_id = cur.lastrowid
     conn.commit()
     conn.close()
@@ -2934,7 +2935,7 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
 
         # Blocca richieste duplicate pending
         cur.execute(
-            "SELECT id FROM signup_requests WHERE discord_id = ? AND status = 'pending'",
+            "SELECT id FROM signup_requests WHERE discord_id = %s AND status = 'pending'",
             (str(interaction.user.id),)
         )
         existing = cur.fetchone()
@@ -2949,7 +2950,7 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
 
         # Blocca utenti già ACCETTATI
         cur.execute(
-            "SELECT id FROM signup_requests WHERE discord_id = ? AND status = 'accepted'",
+            "SELECT id FROM signup_requests WHERE discord_id = %s AND status = 'accepted'",
             (str(interaction.user.id),)
         )
         already_accepted = cur.fetchone()
@@ -4093,7 +4094,7 @@ async def close_auction(channel, auction_id: int, message=None):
                 (final_price, auction["highest_bidder_id"])
             )
             cur.execute("UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s", (auction["highest_bidder_id"], final_price, auction["player_id"]))
-            cur.execute("UPDATE auctions SET status = 'closed' WHERE id = ?", (auction_id,))
+            cur.execute("UPDATE auctions SET status = 'closed' WHERE id = %s", (auction_id,))
             conn.commit()
             conn.close()
 
@@ -4143,7 +4144,7 @@ async def close_auction(channel, auction_id: int, message=None):
             auction_last_bids.pop(int(auction_id), None)
             return
 
-    cur.execute("UPDATE auctions SET status = 'closed' WHERE id = ?", (auction_id,))
+    cur.execute("UPDATE auctions SET status = 'closed' WHERE id = %s", (auction_id,))
     conn.commit()
     conn.close()
 
@@ -4866,7 +4867,7 @@ class TradeView(discord.ui.View):
         conn = connect()
         cur = conn.cursor()
 
-        cur.execute("SELECT * FROM trade_offers WHERE id = ? AND status = 'pending'", (self.trade_id,))
+        cur.execute("SELECT * FROM trade_offers WHERE id = %s AND status = 'pending'", (self.trade_id,))
         trade = cur.fetchone()
 
         if not trade:
@@ -4943,7 +4944,7 @@ class TradeView(discord.ui.View):
         if request_player_id:
             cur.execute("UPDATE players SET owner_discord_id = %s WHERE id = %s", (proposer_id, request_player_id))
 
-        cur.execute("UPDATE trade_offers SET status = 'accepted' WHERE id = ?", (self.trade_id,))
+        cur.execute("UPDATE trade_offers SET status = 'accepted' WHERE id = %s", (self.trade_id,))
         conn.commit()
         conn.close()
 
@@ -4954,7 +4955,7 @@ class TradeView(discord.ui.View):
         conn = connect()
         cur = conn.cursor()
 
-        cur.execute("SELECT * FROM trade_offers WHERE id = ? AND status = 'pending'", (self.trade_id,))
+        cur.execute("SELECT * FROM trade_offers WHERE id = %s AND status = 'pending'", (self.trade_id,))
         trade = cur.fetchone()
 
         if not trade:
@@ -4967,7 +4968,7 @@ class TradeView(discord.ui.View):
             await interaction.response.send_message("Solo il destinatario dello scambio può rifiutare.", ephemeral=True)
             return
 
-        cur.execute("UPDATE trade_offers SET status = 'rejected' WHERE id = ?", (self.trade_id,))
+        cur.execute("UPDATE trade_offers SET status = 'rejected' WHERE id = %s", (self.trade_id,))
         conn.commit()
         conn.close()
 
@@ -5878,7 +5879,7 @@ class ResultModal(discord.ui.Modal, title="Inserisci risultato"):
 
         conn = connect()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM championship_matches WHERE id = ? AND status = 'pending'", (self.match_id,))
+        cur.execute("SELECT * FROM championship_matches WHERE id = %s AND status = 'pending'", (self.match_id,))
         match = cur.fetchone()
 
         if not match:
@@ -6006,7 +6007,7 @@ class ResultConfirmView(discord.ui.View):
 
         conn = connect()
         cur = conn.cursor()
-        cur.execute("UPDATE championship_matches SET status = 'confirmed' WHERE id = ?", (self.match_id,))
+        cur.execute("UPDATE championship_matches SET status = 'confirmed' WHERE id = %s", (self.match_id,))
         conn.commit()
         conn.close()
 
@@ -6021,7 +6022,7 @@ class ResultConfirmView(discord.ui.View):
 
         conn = connect()
         cur = conn.cursor()
-        cur.execute("UPDATE championship_matches SET status = 'contested' WHERE id = ?", (self.match_id,))
+        cur.execute("UPDATE championship_matches SET status = 'contested' WHERE id = %s", (self.match_id,))
         conn.commit()
         conn.close()
 
@@ -7546,7 +7547,7 @@ class TradeOfferResponseView(discord.ui.View):
             cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (amount, proposer_id))
             cur.execute("UPDATE managers SET budget = budget + %s WHERE discord_id = %s", (amount, target_id))
 
-        cur.execute("UPDATE player_trade_offers SET status = 'accepted', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (self.offer_id,))
+        cur.execute("UPDATE player_trade_offers SET status = 'accepted', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (self.offer_id,))
         conn.commit()
         conn.close()
 
@@ -7570,7 +7571,7 @@ class TradeOfferResponseView(discord.ui.View):
 
         conn = connect()
         cur = conn.cursor()
-        cur.execute("UPDATE player_trade_offers SET status = 'rejected', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (self.offer_id,))
+        cur.execute("UPDATE player_trade_offers SET status = 'rejected', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (self.offer_id,))
         conn.commit()
         conn.close()
 
