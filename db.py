@@ -1,7 +1,8 @@
-import sqlite3
-from pathlib import Path
+import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
-DB_PATH = Path("fc26_auction.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 PLAYER_COLUMNS = {
     "id": "TEXT PRIMARY KEY",
@@ -26,15 +27,25 @@ PLAYER_COLUMNS = {
 }
 
 def connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=RealDictCursor
+    )
     return conn
 
 def ensure_column(cur, table, column, definition):
-    cur.execute(f"PRAGMA table_info({table})")
-    existing = {row[1] for row in cur.fetchall()}
+    cur.execute("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name=%s
+    """, (table,))
+    
+    existing = {row["column_name"] for row in cur.fetchall()}
+
     if column not in existing:
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        cur.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        )
 
 def init_db():
     conn = connect()
@@ -62,7 +73,7 @@ def init_db():
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS auctions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         player_id TEXT NOT NULL,
         status TEXT NOT NULL,
         highest_bid INTEGER DEFAULT 0,
@@ -73,11 +84,18 @@ def init_db():
     """)
 
     conn.commit()
+    cur.close()
     conn.close()
 
 def reset_auction_state():
     conn = connect()
     cur = conn.cursor()
-    cur.execute("DELETE FROM auctions WHERE status = 'open'")
+
+    cur.execute("""
+        DELETE FROM auctions
+        WHERE status = 'open'
+    """)
+
     conn.commit()
+    cur.close()
     conn.close()
