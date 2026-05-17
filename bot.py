@@ -479,26 +479,26 @@ def ensure_extra_tables():
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS bid_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         auction_id INTEGER NOT NULL,
         player_id TEXT NOT NULL,
         bidder_id TEXT NOT NULL,
         bidder_name TEXT,
         amount INTEGER NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS transfer_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         player_id TEXT NOT NULL,
         player_name TEXT,
         manager_id TEXT NOT NULL,
         manager_name TEXT,
         price INTEGER DEFAULT 0,
         source TEXT DEFAULT 'auction',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
@@ -507,13 +507,13 @@ def ensure_extra_tables():
         player_id TEXT PRIMARY KEY,
         reason TEXT,
         created_by TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trade_offers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         proposer_id TEXT NOT NULL,
         proposer_name TEXT,
         target_id TEXT NOT NULL,
@@ -523,7 +523,7 @@ def ensure_extra_tables():
         credits_to_target INTEGER DEFAULT 0,
         credits_to_proposer INTEGER DEFAULT 0,
         status TEXT DEFAULT 'pending',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
@@ -539,37 +539,39 @@ def ensure_extra_tables():
         discord_id TEXT PRIMARY KEY,
         manager_name TEXT,
         team_name TEXT,
-        avg_overall REAL,
+        avg_overall DOUBLE PRECISION,
         assigned_budget INTEGER,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
     cur.execute("""
-        INSERT OR IGNORE INTO league_settings (key, value)
+        INSERT INTO league_settings (key, value)
         VALUES ('mode', 'fantacalcio')
+        ON CONFLICT (key) DO NOTHING
     """)
 
     cur.execute("""
-        INSERT OR IGNORE INTO league_settings (key, value)
+        INSERT INTO league_settings (key, value)
         VALUES ('market_open', 'closed')
+        ON CONFLICT (key) DO NOTHING
     """)
 
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS championships (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
         status TEXT DEFAULT 'active',
         group_count INTEGER DEFAULT 1,
         teams_per_group INTEGER DEFAULT 0,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS championship_groups (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         championship_id INTEGER NOT NULL,
         name TEXT NOT NULL
     )
@@ -577,7 +579,7 @@ def ensure_extra_tables():
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS championship_players (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         championship_id INTEGER NOT NULL,
         group_id INTEGER NOT NULL,
         discord_id TEXT NOT NULL,
@@ -587,7 +589,7 @@ def ensure_extra_tables():
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS championship_matches (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         championship_id INTEGER NOT NULL,
         group_id INTEGER NOT NULL,
         round_number INTEGER NOT NULL,
@@ -600,13 +602,13 @@ def ensure_extra_tables():
         status TEXT DEFAULT 'pending',
         submitted_by TEXT,
         confirm_by TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS match_scorers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         match_id INTEGER NOT NULL,
         scorer_player_id TEXT,
         scorer_name TEXT NOT NULL,
@@ -618,7 +620,7 @@ def ensure_extra_tables():
     # Tabelle sistema iscrizioni FC26
     cur.execute("""
     CREATE TABLE IF NOT EXISTS signup_requests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         discord_id TEXT NOT NULL,
         discord_name TEXT,
         real_name TEXT,
@@ -629,13 +631,13 @@ def ensure_extra_tables():
         status TEXT DEFAULT 'pending',
         club_name TEXT,
         handled_by TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        handled_at DATETIME
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        handled_at TIMESTAMP
     )
     """)
 
     try:
-        cur.execute("ALTER TABLE signup_requests ADD COLUMN club_preferences TEXT")
+        cur.execute("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_preferences TEXT")
     except Exception:
         pass
 
@@ -644,7 +646,7 @@ def ensure_extra_tables():
         name TEXT PRIMARY KEY,
         league TEXT,
         assigned_to TEXT,
-        assigned_at DATETIME,
+        assigned_at TIMESTAMP,
         previous_owner_id TEXT,
         previous_owner_name TEXT
     )
@@ -652,22 +654,22 @@ def ensure_extra_tables():
 
     # Migrazione per chi aveva già la vecchia tabella senza colonna league.
     try:
-        cur.execute("ALTER TABLE fc26_clubs ADD COLUMN league TEXT")
+        cur.execute("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS league TEXT")
     except Exception:
         pass
     try:
-        cur.execute("ALTER TABLE fc26_clubs ADD COLUMN previous_owner_id TEXT")
+        cur.execute("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_id TEXT")
     except Exception:
         pass
     try:
-        cur.execute("ALTER TABLE fc26_clubs ADD COLUMN previous_owner_name TEXT")
+        cur.execute("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_name TEXT")
     except Exception:
         pass
 
     for league_name, clubs in LEAGUE_CLUBS.items():
         for club in clubs:
             cur.execute(
-                "INSERT OR IGNORE INTO fc26_clubs (name, league, assigned_to) VALUES (?, ?, NULL)",
+                "INSERT INTO fc26_clubs (name, league, assigned_to) VALUES (%s, %s, NULL) ON CONFLICT (name) DO NOTHING",
                 (club, league_name)
             )
             cur.execute(
@@ -678,18 +680,18 @@ def ensure_extra_tables():
     # Tabelle extra: coppe, premi, hall of fame, media e offerte/controfferte
     cur.execute("""
     CREATE TABLE IF NOT EXISTS national_cups (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         championship_id INTEGER NOT NULL,
         group_id INTEGER,
         name TEXT NOT NULL,
         status TEXT DEFAULT 'active',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS national_cup_matches (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         cup_id INTEGER NOT NULL,
         round_number INTEGER NOT NULL,
         home_id TEXT,
@@ -699,26 +701,26 @@ def ensure_extra_tables():
         home_goals INTEGER,
         away_goals INTEGER,
         status TEXT DEFAULT 'pending',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS european_cups (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         championship_id INTEGER NOT NULL,
         name TEXT NOT NULL,
         cup_type TEXT NOT NULL,
         season_number INTEGER DEFAULT 1,
         qualification_mode TEXT DEFAULT 'random',
         status TEXT DEFAULT 'active',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS european_cup_players (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         cup_id INTEGER NOT NULL,
         discord_id TEXT NOT NULL,
         display_name TEXT NOT NULL
@@ -727,30 +729,30 @@ def ensure_extra_tables():
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS hall_of_fame (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         season TEXT,
         competition TEXT,
         winner_id TEXT,
         winner_name TEXT,
         club_name TEXT,
         prize_budget INTEGER DEFAULT 0,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS media_news (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         title TEXT NOT NULL,
         body TEXT NOT NULL,
         created_by TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS player_trade_offers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         proposer_id TEXT NOT NULL,
         proposer_name TEXT,
         target_id TEXT NOT NULL,
@@ -760,8 +762,8 @@ def ensure_extra_tables():
         amount INTEGER DEFAULT 0,
         counter_amount INTEGER,
         status TEXT DEFAULT 'pending',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP
     )
     """)
 
@@ -860,7 +862,7 @@ def get_roster_role_count(discord_id, group):
     cur.execute("""
         SELECT position
         FROM players
-        WHERE owner_discord_id = ?
+        WHERE owner_discord_id = %s
     """, (str(discord_id),))
     rows = cur.fetchall()
     conn.close()
@@ -880,7 +882,7 @@ def record_bid(auction_id, player_id, bidder_id, bidder_name, amount):
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO bid_history (auction_id, player_id, bidder_id, bidder_name, amount)
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s)
     """, (auction_id, player_id, bidder_id, bidder_name, amount))
     conn.commit()
     conn.close()
@@ -891,7 +893,7 @@ def record_transfer(player_id, player_name, manager_id, manager_name, price, sou
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO transfer_history (player_id, player_name, manager_id, manager_name, price, source)
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s)
     """, (str(player_id), player_name, str(manager_id), manager_name, int(price or 0), source))
     conn.commit()
     conn.close()
@@ -900,7 +902,7 @@ def record_transfer(player_id, player_name, manager_id, manager_name, price, sou
 def is_blacklisted(player_id):
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT player_id FROM blacklist_players WHERE player_id = ?", (str(player_id),))
+    cur.execute("SELECT player_id FROM blacklist_players WHERE player_id = %s", (str(player_id),))
     row = cur.fetchone()
     conn.close()
     return row is not None
@@ -919,8 +921,7 @@ def set_league_mode(mode):
     conn = connect()
     cur = conn.cursor()
     cur.execute("""
-        INSERT OR REPLACE INTO league_settings (key, value)
-        VALUES ('mode', ?)
+        INSERT INTO league_settings (key, value) VALUES ('mode', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
     """, (mode,))
     conn.commit()
     conn.close()
@@ -939,8 +940,7 @@ def set_market_open(opened: bool):
     conn = connect()
     cur = conn.cursor()
     cur.execute("""
-        INSERT OR REPLACE INTO league_settings (key, value)
-        VALUES ('market_open', ?)
+        INSERT INTO league_settings (key, value) VALUES ('market_open', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
     """, ("open" if opened else "closed",))
     conn.commit()
     conn.close()
@@ -1126,27 +1126,28 @@ def sync_real_team_roster_to_manager(discord_id, club_name):
     cur.execute("""
         UPDATE players
         SET owner_discord_id = NULL, sold_price = NULL
-        WHERE owner_discord_id = ?
+        WHERE owner_discord_id = %s
     """, (str(discord_id),))
 
     # Assegna rosa reale
     for p in players:
         cur.execute("""
             UPDATE players
-            SET owner_discord_id = ?, sold_price = ?
-            WHERE id = ?
+            SET owner_discord_id = %s, sold_price = %s
+            WHERE id = %s
         """, (str(discord_id), 0, p["id"]))
 
     # Manager/budget
     cur.execute("""
-        INSERT OR IGNORE INTO managers (discord_id, name, budget)
-        VALUES (?, ?, ?)
+        INSERT INTO managers (discord_id, name, budget)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (discord_id) DO NOTHING
     """, (str(discord_id), str(discord_id), budget))
 
     cur.execute("""
         UPDATE managers
-        SET budget = ?
-        WHERE discord_id = ?
+        SET budget = %s
+        WHERE discord_id = %s
     """, (budget, str(discord_id)))
 
     # Club assegnato
@@ -1154,13 +1155,13 @@ def sync_real_team_roster_to_manager(discord_id, club_name):
         cur.execute("""
             UPDATE fc26_clubs
             SET assigned_to = NULL
-            WHERE assigned_to = ?
+            WHERE assigned_to = %s
         """, (str(discord_id),))
 
         cur.execute("""
             UPDATE fc26_clubs
-            SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP
-            WHERE LOWER(name) = LOWER(?)
+            SET assigned_to = %s, assigned_at = CURRENT_TIMESTAMP
+            WHERE LOWER(name) = LOWER(%s)
         """, (str(discord_id), str(club_name).strip()))
     except Exception:
         pass
@@ -1168,9 +1169,7 @@ def sync_real_team_roster_to_manager(discord_id, club_name):
     # real_team_assignments
     try:
         cur.execute("""
-            INSERT OR REPLACE INTO real_team_assignments
-            (discord_id, manager_name, team_name, avg_overall, assigned_budget)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO real_team_assignments (discord_id, manager_name, team_name, avg_overall, assigned_budget) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (discord_id) DO UPDATE SET manager_name = EXCLUDED.manager_name, team_name = EXCLUDED.team_name, avg_overall = EXCLUDED.avg_overall, assigned_budget = EXCLUDED.assigned_budget
         """, (str(discord_id), str(discord_id), real_team_name, avg_ovr, budget))
     except Exception:
         pass
@@ -1229,7 +1228,7 @@ def generate_roster_graphic(discord_id, display_name):
     cur.execute("""
         SELECT name, team, position, overall, sold_price
         FROM players
-        WHERE owner_discord_id = ?
+        WHERE owner_discord_id = %s
         ORDER BY overall DESC
     """, (str(discord_id),))
     rows = cur.fetchall()
@@ -1290,7 +1289,7 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
     conn = connect()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM managers WHERE discord_id = ?", (str(interaction.user.id),))
+    cur.execute("SELECT * FROM managers WHERE discord_id = %s", (str(interaction.user.id),))
     manager = cur.fetchone()
 
     if not manager:
@@ -1342,8 +1341,8 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
 
     cur.execute("""
         UPDATE auctions
-        SET highest_bid = ?, highest_bidder_id = ?
-        WHERE id = ?
+        SET highest_bid = %s, highest_bidder_id = %s
+        WHERE id = %s
     """, (new_bid, str(interaction.user.id), auction["id"]))
     conn.commit()
 
@@ -1351,7 +1350,7 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
         SELECT a.*, p.*
         FROM auctions a
         JOIN players p ON p.id = a.player_id
-        WHERE a.id = ?
+        WHERE a.id = %s
     """, (auction["id"],))
     updated = cur.fetchone()
     conn.close()
@@ -1859,16 +1858,13 @@ class RandomLeagueNamesModal(discord.ui.Modal, title="Nomi campionati random"):
         conn = connect()
         cur = conn.cursor()
         cur.execute("""
-            INSERT OR REPLACE INTO league_settings (key, value)
-            VALUES ('random_group_names', ?)
+            INSERT INTO league_settings (key, value) VALUES ('random_group_names', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         """, ("|".join(names),))
         cur.execute("""
-            INSERT OR REPLACE INTO league_settings (key, value)
-            VALUES ('random_group_count', ?)
+            INSERT INTO league_settings (key, value) VALUES ('random_group_count', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         """, (str(count),))
         cur.execute("""
-            INSERT OR REPLACE INTO league_settings (key, value)
-            VALUES ('group_generation_mode', 'random_custom')
+            INSERT INTO league_settings (key, value) VALUES ('group_generation_mode', 'random_custom') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         """)
         conn.commit()
         conn.close()
@@ -1908,8 +1904,7 @@ class GroupNamingModeView(discord.ui.View):
         conn = connect()
         cur = conn.cursor()
         cur.execute("""
-            INSERT OR REPLACE INTO league_settings (key, value)
-            VALUES ('group_generation_mode', 'real_leagues')
+            INSERT INTO league_settings (key, value) VALUES ('group_generation_mode', 'real_leagues') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         """)
         conn.commit()
         conn.close()
@@ -2022,13 +2017,13 @@ def ensure_activity_tables():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS player_activity (
         discord_id TEXT PRIMARY KEY,
-        last_discord_activity DATETIME,
-        last_match_played DATETIME,
-        last_response DATETIME,
+        last_discord_activity TIMESTAMP,
+        last_match_played TIMESTAMP,
+        last_response TIMESTAMP,
         warned_discord INTEGER DEFAULT 0,
         warned_match INTEGER DEFAULT 0,
         warned_response INTEGER DEFAULT 0,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
@@ -2036,9 +2031,9 @@ def ensure_activity_tables():
     for col in ["warned_discord", "warned_match", "warned_response", "created_at"]:
         try:
             if col == "created_at":
-                cur.execute("ALTER TABLE player_activity ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP")
+                cur.execute("ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
             else:
-                cur.execute(f"ALTER TABLE player_activity ADD COLUMN {col} INTEGER DEFAULT 0")
+                cur.execute(f"ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS {col} INTEGER DEFAULT 0")
         except Exception:
             pass
 
@@ -2101,9 +2096,9 @@ def ensure_registered_players_in_activity():
 
     for discord_id in ids:
         cur.execute("""
-            INSERT OR IGNORE INTO player_activity
+            INSERT INTO player_activity
             (discord_id, last_discord_activity, last_match_played, last_response, created_at)
-            VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            VALUES (%s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """, (discord_id,))
 
     conn.commit()
@@ -2221,7 +2216,7 @@ async def check_player_inactivity():
                         try:
                             conn = connect()
                             cur = conn.cursor()
-                            cur.execute("SELECT discord_id FROM managers WHERE discord_id = ?", (discord_id,))
+                            cur.execute("SELECT discord_id FROM managers WHERE discord_id = %s", (discord_id,))
                             is_registered = cur.fetchone() is not None
                             conn.close()
                         except Exception:
@@ -2364,22 +2359,22 @@ def ensure_season_tables():
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS seasons (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         name TEXT,
         status TEXT DEFAULT 'active',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        closed_at DATETIME
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        closed_at TIMESTAMP
     )
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS league_hierarchy (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         league_name TEXT NOT NULL,
         parent_league TEXT,
         hierarchy_type TEXT DEFAULT 'top',
         season_id INTEGER,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
@@ -2503,7 +2498,7 @@ def save_league_hierarchy(league_name, parent_league=None, hierarchy_type="top")
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO league_hierarchy (league_name, parent_league, hierarchy_type, season_id)
-        VALUES (?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s)
     """, (league_name, parent_league, hierarchy_type, season_id))
     conn.commit()
     conn.close()
@@ -2791,7 +2786,7 @@ async def assegna_club(interaction: discord.Interaction, utente: discord.Member,
     cur.execute("""
         SELECT *
         FROM signup_requests
-        WHERE discord_id = ? AND status = 'pending'
+        WHERE discord_id = %s AND status = 'pending'
         ORDER BY id DESC
         LIMIT 1
     """, (str(utente.id),))
@@ -2834,7 +2829,7 @@ async def libera_club(interaction: discord.Interaction, utente: discord.Member):
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT name, league FROM fc26_clubs WHERE assigned_to = ?", (str(utente.id),))
+    cur.execute("SELECT name, league FROM fc26_clubs WHERE assigned_to = %s", (str(utente.id),))
     club = cur.fetchone()
 
     if not club:
@@ -2849,15 +2844,15 @@ async def libera_club(interaction: discord.Interaction, utente: discord.Member):
         UPDATE fc26_clubs
         SET assigned_to = NULL,
             assigned_at = NULL,
-            previous_owner_id = ?,
-            previous_owner_name = ?
-        WHERE name = ?
+            previous_owner_id = %s,
+            previous_owner_name = %s
+        WHERE name = %s
     """, (str(utente.id), utente.display_name, club_name))
 
     cur.execute("""
         UPDATE signup_requests
         SET status = 'released'
-        WHERE discord_id = ? AND status = 'accepted'
+        WHERE discord_id = %s AND status = 'accepted'
     """, (str(utente.id),))
 
     conn.commit()
@@ -2926,7 +2921,7 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
         cur = conn.cursor()
 
         try:
-            cur.execute("ALTER TABLE signup_requests ADD COLUMN club_preferences TEXT")
+            cur.execute("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_preferences TEXT")
         except Exception:
             pass
 
@@ -2965,7 +2960,7 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
             cur.execute("""
                 SELECT name
                 FROM fc26_clubs
-                WHERE assigned_to = ?
+                WHERE assigned_to = %s
                 LIMIT 1
             """, (str(interaction.user.id),))
 
@@ -2998,7 +2993,7 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
         cur.execute("""
             INSERT INTO signup_requests
             (discord_id, discord_name, real_name, age, platform, game_id, club_preferences, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
         """, (
             str(interaction.user.id),
             interaction.user.display_name,
@@ -3068,7 +3063,7 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
 def get_signup_request(request_id):
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM signup_requests WHERE id = ?", (int(request_id),))
+    cur.execute("SELECT * FROM signup_requests WHERE id = %s", (int(request_id),))
     row = cur.fetchone()
     conn.close()
     return row
@@ -3080,7 +3075,7 @@ def get_free_signup_clubs(league=None):
     try:
         if league:
             cur.execute(
-                "SELECT name FROM fc26_clubs WHERE assigned_to IS NULL AND league = ? ORDER BY name ASC",
+                "SELECT name FROM fc26_clubs WHERE assigned_to IS NULL AND league = %s ORDER BY name ASC",
                 (str(league),)
             )
         else:
@@ -3128,11 +3123,11 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     cur = conn.cursor()
 
     try:
-        cur.execute("ALTER TABLE fc26_clubs ADD COLUMN previous_owner_id TEXT")
+        cur.execute("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_id TEXT")
     except Exception:
         pass
 
-    cur.execute("SELECT name, league, assigned_to, previous_owner_id FROM fc26_clubs WHERE LOWER(name) = LOWER(?)", (str(club).strip(),))
+    cur.execute("SELECT name, league, assigned_to, previous_owner_id FROM fc26_clubs WHERE LOWER(name) = LOWER(%s)", (str(club).strip(),))
     club_row = cur.fetchone()
     if not club_row:
         conn.close()
@@ -3158,17 +3153,17 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
 
         # Se il club era stato liberato, il nuovo manager eredita rosa/budget dal vecchio owner.
         if previous_owner_id:
-            cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (str(previous_owner_id),))
+            cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (str(previous_owner_id),))
             old_manager = cur.fetchone()
             if old_manager:
                 budget = safe_int(old_manager["budget"], DEFAULT_BUDGET)
 
-            cur.execute("UPDATE players SET owner_discord_id = ? WHERE owner_discord_id = ?", (str(member.id), str(previous_owner_id)))
-            cur.execute("UPDATE championship_players SET discord_id = ?, display_name = ? WHERE discord_id = ?", (str(member.id), member.display_name, str(previous_owner_id)))
-            cur.execute("UPDATE championship_matches SET home_id = ?, home_name = ? WHERE home_id = ?", (str(member.id), member.display_name, str(previous_owner_id)))
-            cur.execute("UPDATE championship_matches SET away_id = ?, away_name = ? WHERE away_id = ?", (str(member.id), member.display_name, str(previous_owner_id)))
-            cur.execute("UPDATE match_scorers SET team_owner_id = ? WHERE team_owner_id = ?", (str(member.id), str(previous_owner_id)))
-            cur.execute("UPDATE transfer_history SET manager_id = ?, manager_name = ? WHERE manager_id = ?", (str(member.id), member.display_name, str(previous_owner_id)))
+            cur.execute("UPDATE players SET owner_discord_id = %s WHERE owner_discord_id = %s", (str(member.id), str(previous_owner_id)))
+            cur.execute("UPDATE championship_players SET discord_id = %s, display_name = %s WHERE discord_id = %s", (str(member.id), member.display_name, str(previous_owner_id)))
+            cur.execute("UPDATE championship_matches SET home_id = %s, home_name = %s WHERE home_id = %s", (str(member.id), member.display_name, str(previous_owner_id)))
+            cur.execute("UPDATE championship_matches SET away_id = %s, away_name = %s WHERE away_id = %s", (str(member.id), member.display_name, str(previous_owner_id)))
+            cur.execute("UPDATE match_scorers SET team_owner_id = %s WHERE team_owner_id = %s", (str(member.id), str(previous_owner_id)))
+            cur.execute("UPDATE transfer_history SET manager_id = %s, manager_name = %s WHERE manager_id = %s", (str(member.id), member.display_name, str(previous_owner_id)))
         else:
             players, avg_ovr, budget_real = get_team_stats(club_name)
 
@@ -3184,25 +3179,25 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
             budget = budget_real
             for p in players:
                 cur.execute(
-                    "UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?",
+                    "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s",
                     (str(member.id), 0, p["id"])
                 )
 
     cur.execute(
-        "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
+        "INSERT INTO managers (discord_id, name, budget) VALUES (%s, %s, %s)",
         (str(member.id), member.display_name, budget)
     )
     cur.execute(
-        "UPDATE managers SET name = ?, budget = ? WHERE discord_id = ?",
+        "UPDATE managers SET name = %s, budget = %s WHERE discord_id = %s",
         (member.display_name, budget, str(member.id))
     )
 
-    cur.execute("UPDATE fc26_clubs SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP, previous_owner_id = NULL, previous_owner_name = NULL WHERE name = ?", (str(member.id), club_name))
+    cur.execute("UPDATE fc26_clubs SET assigned_to = %s, assigned_at = CURRENT_TIMESTAMP, previous_owner_id = NULL, previous_owner_name = NULL WHERE name = %s", (str(member.id), club_name))
 
     cur.execute("""
         UPDATE signup_requests
-        SET status = 'accepted', club_name = ?, handled_by = ?, handled_at = CURRENT_TIMESTAMP
-        WHERE id = ?
+        SET status = 'accepted', club_name = %s, handled_by = %s, handled_at = CURRENT_TIMESTAMP
+        WHERE id = %s
     """, (club_name, str(interaction.user.id), int(request_id)))
 
     conn.commit()
@@ -3305,8 +3300,8 @@ class StaffDecisionSelect(discord.ui.Select):
             cur = conn.cursor()
             cur.execute("""
                 UPDATE signup_requests
-                SET status = 'rejected', handled_by = ?, handled_at = CURRENT_TIMESTAMP
-                WHERE id = ?
+                SET status = 'rejected', handled_by = %s, handled_at = CURRENT_TIMESTAMP
+                WHERE id = %s
             """, (str(interaction.user.id), self.request_id))
             conn.commit()
             conn.close()
@@ -3488,31 +3483,29 @@ class SquadraRealeModal(discord.ui.Modal, title="Assegna squadra reale"):
         cur = conn.cursor()
 
         cur.execute(
-            "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
+            "INSERT INTO managers (discord_id, name, budget) VALUES (%s, %s, %s)",
             (str(member.id), member.display_name, budget)
         )
 
         # Se aveva già giocatori, li svincola prima.
         cur.execute(
-            "UPDATE players SET owner_discord_id = NULL, sold_price = NULL WHERE owner_discord_id = ?",
+            "UPDATE players SET owner_discord_id = NULL, sold_price = NULL WHERE owner_discord_id = %s",
             (str(member.id),)
         )
 
         for p in players:
             cur.execute(
-                "UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?",
+                "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s",
                 (str(member.id), 0, p["id"])
             )
 
         cur.execute(
-            "UPDATE managers SET budget = ?, name = ? WHERE discord_id = ?",
+            "UPDATE managers SET budget = %s, name = %s WHERE discord_id = %s",
             (budget, member.display_name, str(member.id))
         )
 
         cur.execute("""
-            INSERT OR REPLACE INTO real_team_assignments
-            (discord_id, manager_name, team_name, avg_overall, assigned_budget)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO real_team_assignments (discord_id, manager_name, team_name, avg_overall, assigned_budget) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (discord_id) DO UPDATE SET manager_name = EXCLUDED.manager_name, team_name = EXCLUDED.team_name, avg_overall = EXCLUDED.avg_overall, assigned_budget = EXCLUDED.assigned_budget
         """, (str(member.id), member.display_name, players[0]["team"], avg_ovr, budget))
 
         conn.commit()
@@ -3573,11 +3566,11 @@ class RegistraPreIscrittoSelect(discord.ui.Select):
         conn = connect()
         cur = conn.cursor()
         cur.execute(
-            "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
+            "INSERT INTO managers (discord_id, name, budget) VALUES (%s, %s, %s)",
             (str(member.id), member.display_name, DEFAULT_BUDGET)
         )
         cur.execute(
-            "UPDATE managers SET name = ?, budget = ? WHERE discord_id = ?",
+            "UPDATE managers SET name = %s, budget = %s WHERE discord_id = %s",
             (member.display_name, DEFAULT_BUDGET, str(member.id))
         )
         conn.commit()
@@ -3807,7 +3800,7 @@ async def budget(interaction: discord.Interaction):
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (str(interaction.user.id),))
+    cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (str(interaction.user.id),))
     row = cur.fetchone()
     conn.close()
 
@@ -3827,7 +3820,7 @@ async def reset_budget(interaction: discord.Interaction, importo: int = DEFAULT_
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("UPDATE managers SET budget = ?", (importo,))
+    cur.execute("UPDATE managers SET budget = %s", (importo,))
     conn.commit()
     conn.close()
 
@@ -3897,7 +3890,7 @@ async def card(interaction: discord.Interaction, player_id: str):
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM players WHERE id = ?", (player_id,))
+    cur.execute("SELECT * FROM players WHERE id = %s", (player_id,))
     player = cur.fetchone()
     conn.close()
 
@@ -3928,7 +3921,7 @@ async def asta(interaction: discord.Interaction, player_id: str):
     conn = connect()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM players WHERE id = ?", (player_id,))
+    cur.execute("SELECT * FROM players WHERE id = %s", (player_id,))
     player = cur.fetchone()
 
     if not player:
@@ -3953,7 +3946,7 @@ async def asta(interaction: discord.Interaction, player_id: str):
         await interaction.followup.send("C'è già un'asta aperta. Chiudila prima con `/reset_asta`.", ephemeral=True)
         return
 
-    cur.execute("SELECT * FROM managers WHERE discord_id = ?", (str(interaction.user.id),))
+    cur.execute("SELECT * FROM managers WHERE discord_id = %s", (str(interaction.user.id),))
     starter_manager = cur.fetchone()
 
     if not starter_manager:
@@ -3979,7 +3972,7 @@ async def asta(interaction: discord.Interaction, player_id: str):
 
     cur.execute("""
         INSERT INTO auctions (player_id, status, highest_bid, highest_bidder_id, channel_id)
-        VALUES (?, 'open', ?, ?, ?)
+        VALUES (%s, 'open', %s, %s, %s)
     """, (player_id, base, str(interaction.user.id), str(interaction.channel_id)))
     auction_id = cur.lastrowid
     conn.commit()
@@ -3991,7 +3984,7 @@ async def asta(interaction: discord.Interaction, player_id: str):
         SELECT a.*, p.*
         FROM auctions a
         JOIN players p ON p.id = a.player_id
-        WHERE a.id = ?
+        WHERE a.id = %s
     """, (auction_id,))
     auction_row = cur.fetchone()
     conn.close()
@@ -4016,7 +4009,7 @@ async def asta(interaction: discord.Interaction, player_id: str):
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("UPDATE auctions SET message_id = ? WHERE id = ?", (str(message.id), auction_id))
+    cur.execute("UPDATE auctions SET message_id = %s WHERE id = %s", (str(message.id), auction_id))
     conn.commit()
     conn.close()
 
@@ -4035,7 +4028,7 @@ async def run_auction_countdown(channel, auction_id: int, message):
             SELECT a.*, p.*
             FROM auctions a
             JOIN players p ON p.id = a.player_id
-            WHERE a.id = ? AND a.status = 'open'
+            WHERE a.id = %s AND a.status = 'open'
         """, (auction_id,))
         row = cur.fetchone()
         conn.close()
@@ -4065,7 +4058,7 @@ async def close_auction(channel, auction_id: int, message=None):
         SELECT a.*, p.name AS player_name, p.id AS player_id, p.position AS player_position
         FROM auctions a
         JOIN players p ON p.id = a.player_id
-        WHERE a.id = ? AND a.status = 'open'
+        WHERE a.id = %s AND a.status = 'open'
     """, (auction_id,))
     auction = cur.fetchone()
 
@@ -4074,7 +4067,7 @@ async def close_auction(channel, auction_id: int, message=None):
         return
 
     if auction["highest_bidder_id"]:
-        cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (auction["highest_bidder_id"],))
+        cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (auction["highest_bidder_id"],))
         manager = cur.fetchone()
 
         ok, group, current, limit = can_add_player_to_roster(auction["highest_bidder_id"], auction["player_position"])
@@ -4084,10 +4077,10 @@ async def close_auction(channel, auction_id: int, message=None):
             final_price = int(auction["highest_bid"]) + tax_amount
 
             cur.execute(
-                "UPDATE managers SET budget = budget - ? WHERE discord_id = ?",
+                "UPDATE managers SET budget = budget - %s WHERE discord_id = %s",
                 (final_price, auction["highest_bidder_id"])
             )
-            cur.execute("UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?", (auction["highest_bidder_id"], final_price, auction["player_id"]))
+            cur.execute("UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s", (auction["highest_bidder_id"], final_price, auction["player_id"]))
             cur.execute("UPDATE auctions SET status = 'closed' WHERE id = ?", (auction_id,))
             conn.commit()
             conn.close()
@@ -4164,14 +4157,14 @@ def build_roster_embed(discord_id, display_name):
     conn = connect()
     cur = conn.cursor()
 
-    cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (str(discord_id),))
+    cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (str(discord_id),))
     manager = cur.fetchone()
     budget = manager["budget"] if manager else 0
 
     cur.execute("""
         SELECT name, team, position, overall, sold_price
         FROM players
-        WHERE owner_discord_id = ?
+        WHERE owner_discord_id = %s
         ORDER BY overall DESC
     """, (str(discord_id),))
     rows = cur.fetchall()
@@ -4258,7 +4251,7 @@ class RosaSelect(discord.ui.Select):
 
         conn = connect()
         cur = conn.cursor()
-        cur.execute("SELECT name FROM managers WHERE discord_id = ?", (selected_id,))
+        cur.execute("SELECT name FROM managers WHERE discord_id = %s", (selected_id,))
         manager = cur.fetchone()
         conn.close()
 
@@ -4335,8 +4328,8 @@ async def mercato(interaction: discord.Interaction, ruolo: str = None, overall_m
             SELECT *
             FROM players
             WHERE owner_discord_id IS NULL
-              AND LOWER(position) = LOWER(?)
-              AND overall BETWEEN ? AND ?
+              AND LOWER(position) = LOWER(%s)
+              AND overall BETWEEN %s AND %s
             ORDER BY overall DESC
             LIMIT 15
         """, (ruolo, overall_min, overall_max))
@@ -4345,7 +4338,7 @@ async def mercato(interaction: discord.Interaction, ruolo: str = None, overall_m
             SELECT *
             FROM players
             WHERE owner_discord_id IS NULL
-              AND overall BETWEEN ? AND ?
+              AND overall BETWEEN %s AND %s
             ORDER BY overall DESC
             LIMIT 15
         """, (overall_min, overall_max))
@@ -4454,7 +4447,7 @@ async def team_rating(interaction: discord.Interaction, utente: discord.Member =
     cur.execute("""
         SELECT COUNT(*) AS total, AVG(overall) AS avg_ovr, MAX(overall) AS max_ovr
         FROM players
-        WHERE owner_discord_id = ?
+        WHERE owner_discord_id = %s
     """, (str(target.id),))
     row = cur.fetchone()
     conn.close()
@@ -4483,7 +4476,7 @@ async def svincola(interaction: discord.Interaction, player_id: str):
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT name, owner_discord_id, sold_price FROM players WHERE id = ?", (player_id,))
+    cur.execute("SELECT name, owner_discord_id, sold_price FROM players WHERE id = %s", (player_id,))
     player = cur.fetchone()
 
     if not player:
@@ -4493,11 +4486,11 @@ async def svincola(interaction: discord.Interaction, player_id: str):
 
     if player["owner_discord_id"] and player["sold_price"]:
         cur.execute(
-            "UPDATE managers SET budget = budget + ? WHERE discord_id = ?",
+            "UPDATE managers SET budget = budget + %s WHERE discord_id = %s",
             (player["sold_price"], player["owner_discord_id"])
         )
 
-    cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL WHERE id = ?", (player_id,))
+    cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL WHERE id = %s", (player_id,))
     conn.commit()
     conn.close()
 
@@ -4514,7 +4507,7 @@ async def assegna(interaction: discord.Interaction, player_id: str, utente: disc
     conn = connect()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM players WHERE id = ?", (player_id,))
+    cur.execute("SELECT * FROM players WHERE id = %s", (player_id,))
     player = cur.fetchone()
 
     if not player:
@@ -4522,7 +4515,7 @@ async def assegna(interaction: discord.Interaction, player_id: str, utente: disc
         await interaction.response.send_message("Giocatore non trovato.", ephemeral=True)
         return
 
-    cur.execute("SELECT * FROM managers WHERE discord_id = ?", (str(utente.id),))
+    cur.execute("SELECT * FROM managers WHERE discord_id = %s", (str(utente.id),))
     manager = cur.fetchone()
 
     if not manager:
@@ -4535,8 +4528,8 @@ async def assegna(interaction: discord.Interaction, player_id: str, utente: disc
         await interaction.response.send_message("Budget insufficiente per questo utente.", ephemeral=True)
         return
 
-    cur.execute("UPDATE managers SET budget = budget - ? WHERE discord_id = ?", (prezzo, str(utente.id)))
-    cur.execute("UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?", (str(utente.id), prezzo, player_id))
+    cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (prezzo, str(utente.id)))
+    cur.execute("UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s", (str(utente.id), prezzo, player_id))
     conn.commit()
     conn.close()
 
@@ -4555,7 +4548,7 @@ async def pack_gold(interaction: discord.Interaction, utente: discord.Member, nu
     conn = connect()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM managers WHERE discord_id = ?", (str(utente.id),))
+    cur.execute("SELECT * FROM managers WHERE discord_id = %s", (str(utente.id),))
     manager = cur.fetchone()
 
     if not manager:
@@ -4569,7 +4562,7 @@ async def pack_gold(interaction: discord.Interaction, utente: discord.Member, nu
         WHERE owner_discord_id IS NULL
           AND overall BETWEEN 75 AND 84
         ORDER BY RANDOM()
-        LIMIT ?
+        LIMIT %s
     """, (numero,))
     players = cur.fetchall()
 
@@ -4580,7 +4573,7 @@ async def pack_gold(interaction: discord.Interaction, utente: discord.Member, nu
 
     for p in players:
         cur.execute(
-            "UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?",
+            "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s",
             (str(utente.id), 0, p["id"])
         )
 
@@ -4772,13 +4765,13 @@ class StoricoSelect(discord.ui.Select):
 
         conn = connect()
         cur = conn.cursor()
-        cur.execute("SELECT name, budget FROM managers WHERE discord_id = ?", (manager_id,))
+        cur.execute("SELECT name, budget FROM managers WHERE discord_id = %s", (manager_id,))
         manager = cur.fetchone()
 
         cur.execute("""
             SELECT player_name, price, source, created_at
             FROM transfer_history
-            WHERE manager_id = ?
+            WHERE manager_id = %s
             ORDER BY id DESC
             LIMIT 15
         """, (manager_id,))
@@ -4787,7 +4780,7 @@ class StoricoSelect(discord.ui.Select):
         cur.execute("""
             SELECT COUNT(*) AS total, AVG(overall) AS avg_ovr, SUM(sold_price) AS spent
             FROM players
-            WHERE owner_discord_id = ?
+            WHERE owner_discord_id = %s
         """, (manager_id,))
         summary = cur.fetchone()
         conn.close()
@@ -4883,7 +4876,7 @@ class TradeView(discord.ui.View):
 
         # Validate players ownership.
         if offer_player_id:
-            cur.execute("SELECT name, owner_discord_id FROM players WHERE id = ?", (offer_player_id,))
+            cur.execute("SELECT name, owner_discord_id FROM players WHERE id = %s", (offer_player_id,))
             p = cur.fetchone()
             if not p or str(p["owner_discord_id"]) != proposer_id:
                 conn.close()
@@ -4891,7 +4884,7 @@ class TradeView(discord.ui.View):
                 return
 
         if request_player_id:
-            cur.execute("SELECT name, owner_discord_id FROM players WHERE id = ?", (request_player_id,))
+            cur.execute("SELECT name, owner_discord_id FROM players WHERE id = %s", (request_player_id,))
             p = cur.fetchone()
             if not p or str(p["owner_discord_id"]) != target_id:
                 conn.close()
@@ -4899,9 +4892,9 @@ class TradeView(discord.ui.View):
                 return
 
         # Validate budgets.
-        cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (proposer_id,))
+        cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (proposer_id,))
         proposer = cur.fetchone()
-        cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (target_id,))
+        cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (target_id,))
         target = cur.fetchone()
 
         if not proposer or not target:
@@ -4924,19 +4917,19 @@ class TradeView(discord.ui.View):
         tax_proposer = int((credits_to_proposer * MARKET_TAX) / 100)
 
         if credits_to_target:
-            cur.execute("UPDATE managers SET budget = budget - ? WHERE discord_id = ?", (credits_to_target + tax_target, proposer_id))
-            cur.execute("UPDATE managers SET budget = budget + ? WHERE discord_id = ?", (credits_to_target, target_id))
+            cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (credits_to_target + tax_target, proposer_id))
+            cur.execute("UPDATE managers SET budget = budget + %s WHERE discord_id = %s", (credits_to_target, target_id))
 
         if credits_to_proposer:
-            cur.execute("UPDATE managers SET budget = budget - ? WHERE discord_id = ?", (credits_to_proposer + tax_proposer, target_id))
-            cur.execute("UPDATE managers SET budget = budget + ? WHERE discord_id = ?", (credits_to_proposer, proposer_id))
+            cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (credits_to_proposer + tax_proposer, target_id))
+            cur.execute("UPDATE managers SET budget = budget + %s WHERE discord_id = %s", (credits_to_proposer, proposer_id))
 
         # Player movements.
         if offer_player_id:
-            cur.execute("UPDATE players SET owner_discord_id = ? WHERE id = ?", (target_id, offer_player_id))
+            cur.execute("UPDATE players SET owner_discord_id = %s WHERE id = %s", (target_id, offer_player_id))
 
         if request_player_id:
-            cur.execute("UPDATE players SET owner_discord_id = ? WHERE id = ?", (proposer_id, request_player_id))
+            cur.execute("UPDATE players SET owner_discord_id = %s WHERE id = %s", (proposer_id, request_player_id))
 
         cur.execute("UPDATE trade_offers SET status = 'accepted' WHERE id = ?", (self.trade_id,))
         conn.commit()
@@ -4979,7 +4972,7 @@ async def blacklist_add(interaction: discord.Interaction, player_id: str, motivo
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT name FROM players WHERE id = ?", (player_id,))
+    cur.execute("SELECT name FROM players WHERE id = %s", (player_id,))
     player = cur.fetchone()
 
     if not player:
@@ -4988,8 +4981,11 @@ async def blacklist_add(interaction: discord.Interaction, player_id: str, motivo
         return
 
     cur.execute("""
-        INSERT OR REPLACE INTO blacklist_players (player_id, reason, created_by)
-        VALUES (?, ?, ?)
+        INSERT INTO blacklist_players (player_id, reason, created_by)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (player_id) DO UPDATE SET
+            reason = EXCLUDED.reason,
+            created_by = EXCLUDED.created_by
     """, (player_id, motivo, str(interaction.user.id)))
     conn.commit()
     conn.close()
@@ -5006,7 +5002,7 @@ async def blacklist_remove(interaction: discord.Interaction, player_id: str):
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("DELETE FROM blacklist_players WHERE player_id = ?", (player_id,))
+    cur.execute("DELETE FROM blacklist_players WHERE player_id = %s", (player_id,))
     conn.commit()
     conn.close()
 
@@ -5269,25 +5265,23 @@ async def assegna_squadra(interaction: discord.Interaction, utente: discord.Memb
     cur = conn.cursor()
 
     cur.execute(
-        "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
+        "INSERT INTO managers (discord_id, name, budget) VALUES (%s, %s, %s)",
         (str(utente.id), utente.display_name, budget)
     )
 
     # Se l'utente aveva già una rosa, la svincoliamo prima di assegnare la squadra.
-    cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL WHERE owner_discord_id = ?", (str(utente.id),))
+    cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL WHERE owner_discord_id = %s", (str(utente.id),))
 
     for p in players:
         cur.execute(
-            "UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?",
+            "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s",
             (str(utente.id), 0, p["id"])
         )
 
-    cur.execute("UPDATE managers SET budget = ?, name = ? WHERE discord_id = ?", (budget, utente.display_name, str(utente.id)))
+    cur.execute("UPDATE managers SET budget = %s, name = %s WHERE discord_id = %s", (budget, utente.display_name, str(utente.id)))
 
     cur.execute("""
-        INSERT OR REPLACE INTO real_team_assignments
-        (discord_id, manager_name, team_name, avg_overall, assigned_budget)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO real_team_assignments (discord_id, manager_name, team_name, avg_overall, assigned_budget) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (discord_id) DO UPDATE SET manager_name = EXCLUDED.manager_name, team_name = EXCLUDED.team_name, avg_overall = EXCLUDED.avg_overall, assigned_budget = EXCLUDED.assigned_budget
     """, (str(utente.id), utente.display_name, players[0]["team"], avg_ovr, budget))
 
     conn.commit()
@@ -5345,7 +5339,7 @@ async def reset_modalita(interaction: discord.Interaction):
         conn = connect()
         cur = conn.cursor()
         cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL")
-        cur.execute("UPDATE managers SET budget = ?", (DEFAULT_BUDGET,))
+        cur.execute("UPDATE managers SET budget = %s", (DEFAULT_BUDGET,))
         cur.execute("DELETE FROM real_team_assignments")
         cur.execute("UPDATE auctions SET status = 'closed' WHERE status = 'open'")
         try:
@@ -5498,7 +5492,7 @@ def calculate_group_standings(championship_id, group_id):
     cur.execute("""
         SELECT discord_id, display_name
         FROM championship_players
-        WHERE championship_id = ? AND group_id = ?
+        WHERE championship_id = %s AND group_id = %s
     """, (championship_id, group_id))
     players = cur.fetchall()
 
@@ -5519,7 +5513,7 @@ def calculate_group_standings(championship_id, group_id):
     cur.execute("""
         SELECT *
         FROM championship_matches
-        WHERE championship_id = ? AND group_id = ? AND status = 'confirmed'
+        WHERE championship_id = %s AND group_id = %s AND status = 'confirmed'
     """, (championship_id, group_id))
     matches = cur.fetchall()
     conn.close()
@@ -5563,7 +5557,7 @@ def calculate_group_standings(championship_id, group_id):
 def get_member_club_league(discord_id):
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT name, league FROM fc26_clubs WHERE assigned_to = ?", (str(discord_id),))
+    cur.execute("SELECT name, league FROM fc26_clubs WHERE assigned_to = %s", (str(discord_id),))
     row = cur.fetchone()
     conn.close()
     if row:
@@ -5597,20 +5591,20 @@ def generate_single_elimination_pairs(players):
 def create_national_cups_for_groups(cur, championship_id, groups):
     created = 0
     for group_id, players in groups.items():
-        cur.execute("SELECT name FROM championship_groups WHERE id = ?", (group_id,))
+        cur.execute("SELECT name FROM championship_groups WHERE id = %s", (group_id,))
         g = cur.fetchone()
         group_name = g["name"] if g else f"Girone {group_id}"
         cup_name = f"Coppa Nazionale {group_name}"
         cur.execute("""
             INSERT INTO national_cups (championship_id, group_id, name, status)
-            VALUES (?, ?, ?, 'active')
+            VALUES (%s, %s, %s, 'active')
         """, (championship_id, group_id, cup_name))
         cup_id = cur.lastrowid
         for home, away in generate_single_elimination_pairs(players):
             cur.execute("""
                 INSERT INTO national_cup_matches
                 (cup_id, round_number, home_id, away_id, home_name, away_name)
-                VALUES (?, 1, ?, ?, ?, ?)
+                VALUES (%s, 1, %s, %s, %s, %s)
             """, (cup_id, home[0], away[0], home[1], away[1]))
         created += 1
     return created
@@ -5694,13 +5688,13 @@ class CreaCampionatoModal(discord.ui.Modal, title="Crea campionato"):
         cur.execute("UPDATE championships SET status = 'archived' WHERE status = 'active'")
         cur.execute("""
             INSERT INTO championships (name, status, group_count, teams_per_group)
-            VALUES (?, 'active', ?, ?)
+            VALUES (%s, 'active', %s, %s)
         """, (str(self.nome.value), group_count, teams_per_group))
         championship_id = cur.lastrowid
 
         group_ids = []
         for gname in group_names:
-            cur.execute("INSERT INTO championship_groups (championship_id, name) VALUES (?, ?)", (championship_id, gname))
+            cur.execute("INSERT INTO championship_groups (championship_id, name) VALUES (%s, %s)", (championship_id, gname))
             group_ids.append(cur.lastrowid)
 
         idx = 0
@@ -5713,7 +5707,7 @@ class CreaCampionatoModal(discord.ui.Modal, title="Crea campionato"):
                 groups[group_id].append((str(member.id), member.display_name))
                 cur.execute("""
                     INSERT INTO championship_players (championship_id, group_id, discord_id, display_name)
-                    VALUES (?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s)
                 """, (championship_id, group_id, str(member.id), member.display_name))
 
         for group_id, players in groups.items():
@@ -5723,7 +5717,7 @@ class CreaCampionatoModal(discord.ui.Modal, title="Crea campionato"):
                     cur.execute("""
                         INSERT INTO championship_matches
                         (championship_id, group_id, round_number, home_id, away_id, home_name, away_name)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """, (
                         championship_id, group_id, round_idx,
                         home[0], away[0], home[1], away[1]
@@ -5910,11 +5904,11 @@ class ResultModal(discord.ui.Modal, title="Inserisci risultato"):
 
         cur.execute("""
             UPDATE championship_matches
-            SET home_goals = ?, away_goals = ?, status = 'awaiting_confirmation', submitted_by = ?, confirm_by = ?
-            WHERE id = ?
+            SET home_goals = %s, away_goals = %s, status = 'awaiting_confirmation', submitted_by = %s, confirm_by = %s
+            WHERE id = %s
         """, (home_goals, away_goals, user_id, str(confirm_by), self.match_id))
 
-        cur.execute("DELETE FROM match_scorers WHERE match_id = ?", (self.match_id,))
+        cur.execute("DELETE FROM match_scorers WHERE match_id = %s", (self.match_id,))
 
         home_owner = str(match["home_id"])
         away_owner = str(match["away_id"])
@@ -5933,7 +5927,7 @@ class ResultModal(discord.ui.Modal, title="Inserisci risultato"):
             for name, goals in counts.items():
                 cur.execute("""
                     INSERT INTO match_scorers (match_id, scorer_name, team_owner_id, goals)
-                    VALUES (?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s)
                 """, (self.match_id, name, owner_id, goals))
 
         insert_scorers(home_scorers, home_owner)
@@ -5953,9 +5947,9 @@ class ResultModal(discord.ui.Modal, title="Inserisci risultato"):
 def build_result_embed(match_id):
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM championship_matches WHERE id = ?", (match_id,))
+    cur.execute("SELECT * FROM championship_matches WHERE id = %s", (match_id,))
     m = cur.fetchone()
-    cur.execute("SELECT scorer_name, team_owner_id, goals FROM match_scorers WHERE match_id = ?", (match_id,))
+    cur.execute("SELECT scorer_name, team_owner_id, goals FROM match_scorers WHERE match_id = %s", (match_id,))
     scorers = cur.fetchall()
     conn.close()
 
@@ -6037,11 +6031,11 @@ async def risultato(interaction: discord.Interaction):
     conn = connect()
     cur = conn.cursor()
     cur.execute("""
-        SELECT *, ? AS requester_id
+        SELECT *, %s AS requester_id
         FROM championship_matches
-        WHERE championship_id = ?
+        WHERE championship_id = %s
           AND status = 'pending'
-          AND (home_id = ? OR away_id = ?)
+          AND (home_id = %s OR away_id = %s)
         ORDER BY round_number ASC
         LIMIT 25
     """, (str(interaction.user.id), champ["id"], str(interaction.user.id), str(interaction.user.id)))
@@ -6074,7 +6068,7 @@ async def classifica(interaction: discord.Interaction):
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM championship_groups WHERE championship_id = ? ORDER BY id ASC", (champ["id"],))
+    cur.execute("SELECT * FROM championship_groups WHERE championship_id = %s ORDER BY id ASC", (champ["id"],))
     groups = cur.fetchall()
     conn.close()
 
@@ -6117,7 +6111,7 @@ async def calendario(interaction: discord.Interaction):
     cur.execute("""
         SELECT MAX(round_number) AS max_round
         FROM championship_matches
-        WHERE championship_id = ?
+        WHERE championship_id = %s
     """, (champ["id"],))
     max_round_row = cur.fetchone()
     max_round = int(max_round_row["max_round"] or 0)
@@ -6127,9 +6121,9 @@ async def calendario(interaction: discord.Interaction):
     cur.execute("""
         SELECT COUNT(*) AS pending_first_leg
         FROM championship_matches
-        WHERE championship_id = ?
+        WHERE championship_id = %s
           AND status = 'pending'
-          AND round_number <= ?
+          AND round_number <= %s
     """, (champ["id"], first_leg_last_round))
     pending_first_leg = int(cur.fetchone()["pending_first_leg"] or 0)
 
@@ -6147,9 +6141,9 @@ async def calendario(interaction: discord.Interaction):
         SELECT m.*, g.name AS group_name
         FROM championship_matches m
         JOIN championship_groups g ON g.id = m.group_id
-        WHERE m.championship_id = ?
+        WHERE m.championship_id = %s
           AND m.status = 'pending'
-          AND m.round_number BETWEEN ? AND ?
+          AND m.round_number BETWEEN %s AND %s
         ORDER BY m.round_number ASC, g.id ASC, m.id ASC
         LIMIT 30
     """, (champ["id"], round_filter_min, round_filter_max))
@@ -6195,9 +6189,9 @@ async def prossima_partita(interaction: discord.Interaction):
         SELECT m.*, g.name AS group_name
         FROM championship_matches m
         JOIN championship_groups g ON g.id = m.group_id
-        WHERE m.championship_id = ?
+        WHERE m.championship_id = %s
           AND m.status = 'pending'
-          AND (m.home_id = ? OR m.away_id = ?)
+          AND (m.home_id = %s OR m.away_id = %s)
         ORDER BY m.round_number ASC
         LIMIT 1
     """, (champ["id"], str(interaction.user.id), str(interaction.user.id)))
@@ -6233,7 +6227,7 @@ async def capocannonieri(interaction: discord.Interaction):
         SELECT s.scorer_name, SUM(s.goals) AS goals
         FROM match_scorers s
         JOIN championship_matches m ON m.id = s.match_id
-        WHERE m.championship_id = ? AND m.status = 'confirmed'
+        WHERE m.championship_id = %s AND m.status = 'confirmed'
         GROUP BY s.scorer_name
         ORDER BY goals DESC
         LIMIT 20
@@ -6265,7 +6259,7 @@ async def miglior_difesa(interaction: discord.Interaction):
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM championship_groups WHERE championship_id = ?", (champ["id"],))
+    cur.execute("SELECT * FROM championship_groups WHERE championship_id = %s", (champ["id"],))
     groups = cur.fetchall()
     conn.close()
 
@@ -6293,8 +6287,8 @@ async def forza_risultato(interaction: discord.Interaction, match_id: int, home_
     cur = conn.cursor()
     cur.execute("""
         UPDATE championship_matches
-        SET home_goals = ?, away_goals = ?, status = 'confirmed', submitted_by = ?, confirm_by = NULL
-        WHERE id = ?
+        SET home_goals = %s, away_goals = %s, status = 'confirmed', submitted_by = %s, confirm_by = NULL
+        WHERE id = %s
     """, (home_goals, away_goals, str(interaction.user.id), match_id))
     conn.commit()
     conn.close()
@@ -6376,53 +6370,53 @@ class ReplaceNewPlayerSelect(discord.ui.Select):
         cur = conn.cursor()
 
         # Managers
-        cur.execute("SELECT * FROM managers WHERE discord_id = ?", (old_id,))
+        cur.execute("SELECT * FROM managers WHERE discord_id = %s", (old_id,))
         old_manager = cur.fetchone()
 
         if old_manager:
             cur.execute("""
-                INSERT OR REPLACE INTO managers (discord_id, name, budget)
-                VALUES (?, ?, ?)
+                INSERT INTO managers (discord_id, name, budget)
+                VALUES (%s, %s, %s)
             """, (
                 new_id,
                 new_member.display_name,
                 old_manager["budget"]
             ))
 
-            cur.execute("DELETE FROM managers WHERE discord_id = ?", (old_id,))
+            cur.execute("DELETE FROM managers WHERE discord_id = %s", (old_id,))
 
         # Rosa
         cur.execute("""
             UPDATE players
-            SET owner_discord_id = ?
-            WHERE owner_discord_id = ?
+            SET owner_discord_id = %s
+            WHERE owner_discord_id = %s
         """, (new_id, old_id))
 
         # Championship players
         cur.execute("""
             UPDATE championship_players
-            SET discord_id = ?, display_name = ?
-            WHERE discord_id = ?
+            SET discord_id = %s, display_name = %s
+            WHERE discord_id = %s
         """, (new_id, new_member.display_name, old_id))
 
         # Matches
         cur.execute("""
             UPDATE championship_matches
-            SET home_id = ?, home_name = ?
-            WHERE home_id = ?
+            SET home_id = %s, home_name = %s
+            WHERE home_id = %s
         """, (new_id, new_member.display_name, old_id))
 
         cur.execute("""
             UPDATE championship_matches
-            SET away_id = ?, away_name = ?
-            WHERE away_id = ?
+            SET away_id = %s, away_name = %s
+            WHERE away_id = %s
         """, (new_id, new_member.display_name, old_id))
 
         # Real team assignments
         cur.execute("""
             UPDATE real_team_assignments
-            SET discord_id = ?, manager_name = ?
-            WHERE discord_id = ?
+            SET discord_id = %s, manager_name = %s
+            WHERE discord_id = %s
         """, (new_id, new_member.display_name, old_id))
 
         conn.commit()
@@ -6824,27 +6818,28 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
     cur.execute("""
         UPDATE players
         SET owner_discord_id = NULL, sold_price = NULL
-        WHERE owner_discord_id = ?
+        WHERE owner_discord_id = %s
     """, (str(utente.id),))
 
     # Assegna la rosa reale
     for p in players:
         cur.execute("""
             UPDATE players
-            SET owner_discord_id = ?, sold_price = ?
-            WHERE id = ?
+            SET owner_discord_id = %s, sold_price = %s
+            WHERE id = %s
         """, (str(utente.id), 0, p["id"]))
 
     # Manager con budget corretto
     cur.execute("""
-        INSERT OR IGNORE INTO managers (discord_id, name, budget)
-        VALUES (?, ?, ?)
+        INSERT INTO managers (discord_id, name, budget)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (discord_id) DO NOTHING
     """, (str(utente.id), utente.display_name, budget))
 
     cur.execute("""
         UPDATE managers
-        SET name = ?, budget = ?
-        WHERE discord_id = ?
+        SET name = %s, budget = %s
+        WHERE discord_id = %s
     """, (utente.display_name, budget, str(utente.id)))
 
     # Aggiorna club
@@ -6852,29 +6847,27 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
         cur.execute("""
             UPDATE fc26_clubs
             SET assigned_to = NULL
-            WHERE assigned_to = ?
+            WHERE assigned_to = %s
         """, (str(utente.id),))
 
         cur.execute("""
             UPDATE fc26_clubs
-            SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP
-            WHERE LOWER(name) = LOWER(?)
+            SET assigned_to = %s, assigned_at = CURRENT_TIMESTAMP
+            WHERE LOWER(name) = LOWER(%s)
         """, (str(utente.id), club_name.lower()))
 
         if cur.rowcount == 0:
             cur.execute("""
                 UPDATE fc26_clubs
-                SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP
-                WHERE LOWER(name) = LOWER(?)
+                SET assigned_to = %s, assigned_at = CURRENT_TIMESTAMP
+                WHERE LOWER(name) = LOWER(%s)
             """, (str(utente.id), real_team_name.lower()))
     except Exception:
         pass
 
     try:
         cur.execute("""
-            INSERT OR REPLACE INTO real_team_assignments
-            (discord_id, manager_name, team_name, avg_overall, assigned_budget)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO real_team_assignments (discord_id, manager_name, team_name, avg_overall, assigned_budget) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (discord_id) DO UPDATE SET manager_name = EXCLUDED.manager_name, team_name = EXCLUDED.team_name, avg_overall = EXCLUDED.avg_overall, assigned_budget = EXCLUDED.assigned_budget
         """, (str(utente.id), utente.display_name, real_team_name, avg_ovr, budget))
     except Exception:
         pass
@@ -6882,8 +6875,8 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
     try:
         cur.execute("""
             UPDATE signup_requests
-            SET club_name = ?
-            WHERE discord_id = ? AND status = 'accepted'
+            SET club_name = %s
+            WHERE discord_id = %s AND status = 'accepted'
         """, (real_team_name, str(utente.id)))
     except Exception:
         pass
@@ -6954,7 +6947,7 @@ async def mia_squadra(interaction: discord.Interaction):
     conn = connect()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM managers WHERE discord_id = ?", (str(interaction.user.id),))
+    cur.execute("SELECT * FROM managers WHERE discord_id = %s", (str(interaction.user.id),))
     manager = cur.fetchone()
 
     if not manager:
@@ -6973,7 +6966,7 @@ async def mia_squadra(interaction: discord.Interaction):
         cur.execute("""
             SELECT name, league
             FROM fc26_clubs
-            WHERE assigned_to = ?
+            WHERE assigned_to = %s
             LIMIT 1
         """, (str(interaction.user.id),))
         club = cur.fetchone()
@@ -6987,7 +6980,7 @@ async def mia_squadra(interaction: discord.Interaction):
     cur.execute("""
         SELECT name, team, position, overall, sold_price
         FROM players
-        WHERE owner_discord_id = ?
+        WHERE owner_discord_id = %s
         ORDER BY 
             CASE 
                 WHEN position IN ('GK', 'POR') THEN 1
@@ -7055,7 +7048,7 @@ async def mio_budget(interaction: discord.Interaction):
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (str(interaction.user.id),))
+    cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (str(interaction.user.id),))
     row = cur.fetchone()
     conn.close()
 
@@ -7126,7 +7119,7 @@ def get_club_owner_id(club_name):
     cur.execute("""
         SELECT assigned_to
         FROM fc26_clubs
-        WHERE LOWER(name) = LOWER(?)
+        WHERE LOWER(name) = LOWER(%s)
         LIMIT 1
     """, (str(club_name).strip(),))
     row = cur.fetchone()
@@ -7140,8 +7133,8 @@ def get_player_by_name_from_owner(owner_id, player_name):
     cur.execute("""
         SELECT *
         FROM players
-        WHERE owner_discord_id = ?
-          AND LOWER(name) = LOWER(?)
+        WHERE owner_discord_id = %s
+          AND LOWER(name) = LOWER(%s)
         LIMIT 1
     """, (str(owner_id), str(player_name).strip()))
     row = cur.fetchone()
@@ -7155,7 +7148,7 @@ def get_roster_players_for_owner(owner_id, current=""):
     cur.execute("""
         SELECT id, name, position, overall
         FROM players
-        WHERE owner_discord_id = ?
+        WHERE owner_discord_id = %s
         ORDER BY overall DESC, name ASC
     """, (str(owner_id),))
     rows = cur.fetchall()
@@ -7285,7 +7278,7 @@ async def scambio(
     conn = connect()
     cur = conn.cursor()
 
-    cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (str(interaction.user.id),))
+    cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (str(interaction.user.id),))
     proposer_manager = cur.fetchone()
 
     if crediti > 0 and (not proposer_manager or safe_int(proposer_manager["budget"]) < crediti):
@@ -7302,7 +7295,7 @@ async def scambio(
     try:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS player_trade_offers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 proposer_id TEXT NOT NULL,
                 proposer_name TEXT,
                 target_id TEXT NOT NULL,
@@ -7314,8 +7307,8 @@ async def scambio(
                 amount INTEGER DEFAULT 0,
                 counter_amount INTEGER,
                 status TEXT DEFAULT 'pending',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP
             )
         """)
 
@@ -7325,7 +7318,7 @@ async def scambio(
             "offered_player_name TEXT"
         ]:
             try:
-                cur.execute(f"ALTER TABLE player_trade_offers ADD COLUMN {col_def}")
+                cur.execute(f"ALTER TABLE player_trade_offers ADD COLUMN IF NOT EXISTS {col_def}")
             except Exception:
                 pass
 
@@ -7333,7 +7326,7 @@ async def scambio(
             INSERT INTO player_trade_offers
             (proposer_id, proposer_name, target_id, target_name, player_id, player_name,
              offered_player_id, offered_player_name, amount, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')
         """, (
             str(interaction.user.id),
             interaction.user.display_name,
@@ -7434,12 +7427,12 @@ class CounterOfferModal(discord.ui.Modal, title="Controfferta"):
         cur = conn.cursor()
         cur.execute("""
             UPDATE player_trade_offers
-            SET status = 'countered', counter_amount = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
+            SET status = 'countered', counter_amount = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
         """, (amount, self.offer_id))
         conn.commit()
 
-        cur.execute("SELECT * FROM player_trade_offers WHERE id = ?", (self.offer_id,))
+        cur.execute("SELECT * FROM player_trade_offers WHERE id = %s", (self.offer_id,))
         offer = cur.fetchone()
         conn.close()
 
@@ -7472,7 +7465,7 @@ class TradeOfferResponseView(discord.ui.View):
     async def _get_offer(self):
         conn = connect()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM player_trade_offers WHERE id = ?", (self.offer_id,))
+        cur.execute("SELECT * FROM player_trade_offers WHERE id = %s", (self.offer_id,))
         offer = cur.fetchone()
         conn.close()
         return offer
@@ -7502,7 +7495,7 @@ class TradeOfferResponseView(discord.ui.View):
         amount = safe_int(offer["amount"])
 
         # Controlli proprietà attuali
-        cur.execute("SELECT owner_discord_id FROM players WHERE id = ?", (requested_player_id,))
+        cur.execute("SELECT owner_discord_id FROM players WHERE id = %s", (requested_player_id,))
         req = cur.fetchone()
         if not req or str(req["owner_discord_id"]) != target_id:
             conn.close()
@@ -7510,7 +7503,7 @@ class TradeOfferResponseView(discord.ui.View):
             return
 
         if offered_player_id:
-            cur.execute("SELECT owner_discord_id FROM players WHERE id = ?", (str(offered_player_id),))
+            cur.execute("SELECT owner_discord_id FROM players WHERE id = %s", (str(offered_player_id),))
             off = cur.fetchone()
             if not off or str(off["owner_discord_id"]) != proposer_id:
                 conn.close()
@@ -7518,7 +7511,7 @@ class TradeOfferResponseView(discord.ui.View):
                 return
 
         if amount > 0:
-            cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (proposer_id,))
+            cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (proposer_id,))
             proposer = cur.fetchone()
             if not proposer or safe_int(proposer["budget"]) < amount:
                 conn.close()
@@ -7526,16 +7519,16 @@ class TradeOfferResponseView(discord.ui.View):
                 return
 
         # Trasferimento giocatore richiesto al proponente
-        cur.execute("UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?", (proposer_id, amount, requested_player_id))
+        cur.execute("UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s", (proposer_id, amount, requested_player_id))
 
         # Trasferimento eventuale giocatore offerto al destinatario
         if offered_player_id:
-            cur.execute("UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?", (target_id, 0, str(offered_player_id)))
+            cur.execute("UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s", (target_id, 0, str(offered_player_id)))
 
         # Crediti dal proponente al destinatario
         if amount > 0:
-            cur.execute("UPDATE managers SET budget = budget - ? WHERE discord_id = ?", (amount, proposer_id))
-            cur.execute("UPDATE managers SET budget = budget + ? WHERE discord_id = ?", (amount, target_id))
+            cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (amount, proposer_id))
+            cur.execute("UPDATE managers SET budget = budget + %s WHERE discord_id = %s", (amount, target_id))
 
         cur.execute("UPDATE player_trade_offers SET status = 'accepted', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (self.offer_id,))
         conn.commit()
@@ -7625,7 +7618,7 @@ async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str]
         cur.execute("""
             SELECT *
             FROM players
-            WHERE LOWER(name) LIKE ?
+            WHERE LOWER(name) LIKE %s
             ORDER BY overall DESC
             LIMIT 10
         """, (f"%{testo.lower()}%",))
@@ -7764,15 +7757,13 @@ async def aggiorna_budget_reali(interaction: discord.Interaction):
 
         cur.execute("""
             UPDATE managers
-            SET budget = ?
-            WHERE discord_id = ?
+            SET budget = %s
+            WHERE discord_id = %s
         """, (new_budget, str(discord_id)))
 
         try:
             cur.execute("""
-                INSERT OR REPLACE INTO real_team_assignments
-                (discord_id, manager_name, team_name, avg_overall, assigned_budget)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO real_team_assignments (discord_id, manager_name, team_name, avg_overall, assigned_budget) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (discord_id) DO UPDATE SET manager_name = EXCLUDED.manager_name, team_name = EXCLUDED.team_name, avg_overall = EXCLUDED.avg_overall, assigned_budget = EXCLUDED.assigned_budget
             """, (
                 str(discord_id),
                 row["manager_name"] or str(discord_id),
