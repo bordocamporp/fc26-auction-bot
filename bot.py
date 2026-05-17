@@ -1845,11 +1845,13 @@ async def nomi_gironi_random(interaction: discord.Interaction):
 # ======================================================================
 
 
-# ================= SISTEMA ATTIVITÀ PLAYER =================
+
+# ================= SISTEMA ATTIVITÀ PLAYER CORRETTO =================
 
 INACTIVITY_CHANNEL_ID = 1505325803683184743
 INACTIVITY_HOURS_LIMIT = 22
 INACTIVITY_CHECK_INTERVAL = 79200  # 22 ore
+
 
 def ensure_activity_tables():
     conn = connect()
@@ -1861,15 +1863,30 @@ def ensure_activity_tables():
         last_discord_activity DATETIME,
         last_match_played DATETIME,
         last_response DATETIME,
-        warned INTEGER DEFAULT 0
+        warned_discord INTEGER DEFAULT 0,
+        warned_match INTEGER DEFAULT 0,
+        warned_response INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
     """)
+
+    # Migrazioni per versioni precedenti
+    for col in ["warned_discord", "warned_match", "warned_response", "created_at"]:
+        try:
+            if col == "created_at":
+                cur.execute("ALTER TABLE player_activity ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP")
+            else:
+                cur.execute(f"ALTER TABLE player_activity ADD COLUMN {col} INTEGER DEFAULT 0")
+        except Exception:
+            pass
 
     conn.commit()
     conn.close()
 
 
 def update_player_activity(discord_id, activity_type="discord"):
+    ensure_activity_tables()
+
     conn = connect()
     cur = conn.cursor()
 
@@ -1879,31 +1896,87 @@ def update_player_activity(discord_id, activity_type="discord"):
         "response": "last_response"
     }.get(activity_type, "last_discord_activity")
 
+    warned_field = {
+        "discord": "warned_discord",
+        "match": "warned_match",
+        "response": "warned_response"
+    }.get(activity_type, "warned_discord")
+
     cur.execute(f"""
-        INSERT INTO player_activity (discord_id, {field})
-        VALUES (?, CURRENT_TIMESTAMP)
+        INSERT INTO player_activity (discord_id, {field}, {warned_field})
+        VALUES (?, CURRENT_TIMESTAMP, 0)
         ON CONFLICT(discord_id)
-        DO UPDATE SET {field} = CURRENT_TIMESTAMP
+        DO UPDATE SET {field} = CURRENT_TIMESTAMP, {warned_field} = 0
     """, (str(discord_id),))
 
     conn.commit()
     conn.close()
 
 
-async def send_inactivity_warning(guild, member, reason):
+def ensure_registered_players_in_activity():
+    """
+    Inserisce automaticamente nella tabella attività tutti i manager/iscritti,
+    così vengono controllati anche se non hanno mai scritto o giocato.
+    """
+    ensure_activity_tables()
+
+    conn = connect()
+    cur = conn.cursor()
+
+    ids = set()
+
+    try:
+        cur.execute("SELECT discord_id FROM managers")
+        ids.update(str(r["discord_id"]) for r in cur.fetchall() if r["discord_id"])
+    except Exception:
+        pass
+
+    try:
+        cur.execute("SELECT discord_id FROM signup_requests WHERE status = 'accepted'")
+        ids.update(str(r["discord_id"]) for r in cur.fetchall() if r["discord_id"])
+    except Exception:
+        pass
+
+    for discord_id in ids:
+        cur.execute("""
+            INSERT OR IGNORE INTO player_activity
+            (discord_id, last_discord_activity, last_match_played, last_response, created_at)
+            VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """, (discord_id,))
+
+    conn.commit()
+    conn.close()
+
+
+def mark_match_played(discord_id):
+    update_player_activity(discord_id, "match")
+
+
+def mark_player_response(discord_id):
+    update_player_activity(discord_id, "response")
+
+
+async def send_inactivity_warning(guild, member, reason, field):
     channel = guild.get_channel(INACTIVITY_CHANNEL_ID)
 
     if not channel:
-        return
+        try:
+            channel = await bot.fetch_channel(INACTIVITY_CHANNEL_ID)
+        except Exception:
+            channel = None
+
+    if not channel:
+        return False
 
     embed = discord.Embed(
         title="⚠️ Segnalazione inattività",
         description=(
             f"👤 Player: {member.mention}\n"
             f"📌 Motivo: **{reason}**\n\n"
+            f"Controllo automatico ogni **22 ore**.\n\n"
             f"Lo staff può valutare:\n"
             f"• richiamo\n"
-            f"• sostituzione\n"
+            f"• sostituzione manager\n"
             f"• liberazione club"
         ),
         color=discord.Color.orange()
@@ -1911,23 +1984,56 @@ async def send_inactivity_warning(guild, member, reason):
 
     await channel.send(embed=embed)
 
+    conn = connect()
+    cur = conn.cursor()
+    warned_field = {
+        "last_discord_activity": "warned_discord",
+        "last_match_played": "warned_match",
+        "last_response": "warned_response"
+    }.get(field)
+
+    if warned_field:
+        cur.execute(f"""
+            UPDATE player_activity
+            SET {warned_field} = 1
+            WHERE discord_id = ?
+        """, (str(member.id),))
+        conn.commit()
+
+    conn.close()
+    return True
+
+
+def _parse_sqlite_datetime(value):
+    if not value:
+        return None
+
+    raw = str(value).replace("Z", "").strip()
+
+    try:
+        return datetime.fromisoformat(raw)
+    except Exception:
+        pass
+
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
 
 async def check_player_inactivity():
     await bot.wait_until_ready()
 
     while not bot.is_closed():
         try:
-            ensure_activity_tables()
+            ensure_registered_players_in_activity()
 
             conn = connect()
             cur = conn.cursor()
 
-            cur.execute("""
-                SELECT *
-                FROM player_activity
-            """)
-
+            cur.execute("SELECT * FROM player_activity")
             rows = cur.fetchall()
+            conn.close()
 
             now = datetime.utcnow()
 
@@ -1935,52 +2041,156 @@ async def check_player_inactivity():
                 discord_id = str(row["discord_id"])
 
                 for guild in bot.guilds:
-                    member = guild.get_member(int(discord_id))
+                    member = await get_member_safe(guild, discord_id)
 
-                    if not member:
+                    if not member or member.bot:
+                        continue
+
+                    # Controlla solo iscritti/manager effettivi, non tutti gli utenti casuali.
+                    is_registered = False
+                    try:
+                        registered_role = guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
+                        if registered_role and registered_role in member.roles:
+                            is_registered = True
+                    except Exception:
+                        pass
+
+                    if not is_registered:
+                        try:
+                            conn = connect()
+                            cur = conn.cursor()
+                            cur.execute("SELECT discord_id FROM managers WHERE discord_id = ?", (discord_id,))
+                            is_registered = cur.fetchone() is not None
+                            conn.close()
+                        except Exception:
+                            pass
+
+                    if not is_registered:
                         continue
 
                     checks = [
-                        ("last_discord_activity", "Inattività Discord nelle ultime 22 ore"),
-                        ("last_match_played", "Partite non giocate nelle ultime 22 ore"),
-                        ("last_response", "Mancata risposta nelle ultime 22 ore")
+                        ("last_discord_activity", "warned_discord", "Inattività Discord nelle ultime 22 ore"),
+                        ("last_match_played", "warned_match", "Nessuna partita giocata/registrata nelle ultime 22 ore"),
+                        ("last_response", "warned_response", "Mancata risposta/interazione nelle ultime 22 ore")
                     ]
 
-                    for field, reason in checks:
-                        value = row[field]
-
-                        if not value:
+                    for field, warned_field, reason in checks:
+                        if safe_int(row[warned_field]) == 1:
                             continue
 
-                        try:
-                            dt = datetime.fromisoformat(str(value))
-                        except Exception:
+                        dt = _parse_sqlite_datetime(row[field])
+
+                        # Se il dato non esiste, usa created_at. Così chi non ha mai giocato/risposto viene segnalato.
+                        if dt is None:
+                            dt = _parse_sqlite_datetime(row["created_at"])
+
+                        if dt is None:
                             continue
 
                         delta_hours = (now - dt).total_seconds() / 3600
 
                         if delta_hours >= INACTIVITY_HOURS_LIMIT:
-                            await send_inactivity_warning(guild, member, reason)
-
-            conn.close()
+                            await send_inactivity_warning(guild, member, reason, field)
 
         except Exception as e:
             print(f"[ATTIVITA] Errore controllo inattività: {e}")
 
-        await asyncio.sleep(INACTIVITY_CHECK_INTERVAL)  # controllo ogni 22 ore
+        await asyncio.sleep(INACTIVITY_CHECK_INTERVAL)
 
 
-@bot.event
-async def on_message(message):
-    if message.author.bot:
+@tree.command(name="attivita_player", description="Staff: aggiorna o controlla manualmente attività player")
+@app_commands.describe(
+    utente="Player da aggiornare",
+    tipo="Tipo attività da registrare"
+)
+@app_commands.choices(tipo=[
+    app_commands.Choice(name="Discord/interazione", value="discord"),
+    app_commands.Choice(name="Partita giocata", value="match"),
+    app_commands.Choice(name="Risposta ricevuta", value="response"),
+])
+async def attivita_player(interaction: discord.Interaction, utente: discord.Member, tipo: app_commands.Choice[str]):
+    if not can_use_normal_staff(interaction.user):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
+    update_player_activity(utente.id, tipo.value)
+
+    await interaction.response.send_message(
+        f"✅ Attività aggiornata per {utente.mention}: **{tipo.name}**.",
+        ephemeral=True
+    )
+
     try:
-        update_player_activity(message.author.id, "discord")
+        await send_staff_log(
+            interaction.guild,
+            "✅ Attività player aggiornata",
+            f"Player: {utente.mention}\nTipo attività: **{tipo.name}**",
+            user=interaction.user,
+            color=discord.Color.green()
+        )
     except Exception:
         pass
 
-    await bot.process_commands(message)
+
+@tree.command(name="controllo_inattivi", description="Staff: esegue subito il controllo inattività")
+async def controllo_inattivi(interaction: discord.Interaction):
+    if not can_use_normal_staff(interaction.user):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Esegue un controllo singolo senza aspettare il loop.
+    try:
+        ensure_registered_players_in_activity()
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM player_activity")
+        rows = cur.fetchall()
+        conn.close()
+
+        now = datetime.utcnow()
+        sent = 0
+
+        for row in rows:
+            discord_id = str(row["discord_id"])
+            member = await get_member_safe(interaction.guild, discord_id)
+
+            if not member or member.bot:
+                continue
+
+            registered_role = interaction.guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
+            if registered_role and registered_role not in member.roles:
+                continue
+
+            checks = [
+                ("last_discord_activity", "warned_discord", "Inattività Discord nelle ultime 22 ore"),
+                ("last_match_played", "warned_match", "Nessuna partita giocata/registrata nelle ultime 22 ore"),
+                ("last_response", "warned_response", "Mancata risposta/interazione nelle ultime 22 ore")
+            ]
+
+            for field, warned_field, reason in checks:
+                if safe_int(row[warned_field]) == 1:
+                    continue
+
+                dt = _parse_sqlite_datetime(row[field]) or _parse_sqlite_datetime(row["created_at"])
+                if not dt:
+                    continue
+
+                delta_hours = (now - dt).total_seconds() / 3600
+                if delta_hours >= INACTIVITY_HOURS_LIMIT:
+                    ok = await send_inactivity_warning(interaction.guild, member, reason, field)
+                    if ok:
+                        sent += 1
+
+        await interaction.followup.send(
+            f"✅ Controllo inattività completato. Segnalazioni inviate: **{sent}**.",
+            ephemeral=True
+        )
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Errore controllo inattività: `{e}`", ephemeral=True)
 
 # ===========================================================
 
@@ -3020,6 +3230,7 @@ async def on_ready():
         synced = await tree.sync()
         print(f"Comandi globali sincronizzati: {len(synced)}")
 
+    bot.loop.create_task(check_player_inactivity())
     print(f"Bot online come {bot.user}")
 
 
@@ -3181,6 +3392,12 @@ def can_bypass_bot_only(member):
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
+    try:
+        update_player_activity(message.author.id, "discord")
+    except Exception:
+        pass
+
 
     # Gli admin/staff con questi ruoli possono scrivere liberamente nei canali bot-only.
     if can_bypass_bot_only(message.author):
