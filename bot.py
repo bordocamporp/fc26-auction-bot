@@ -1022,6 +1022,167 @@ def get_team_stats(team_name):
     return matched, avg_ovr, budget
 
 
+
+# ================= FIX MODALITÀ REALE: ROSA + BUDGET =================
+
+TEAM_ALIASES = {
+    "inter": ["inter", "internazionale", "inter milan", "fc internazionale"],
+    "arsenal": ["arsenal", "arsenal fc"],
+    "milan": ["milan", "ac milan"],
+    "juventus": ["juventus", "juve", "juventus fc"],
+    "manchester city": ["manchester city", "man city", "manchester city fc"],
+    "manchester united": ["manchester united", "man united", "man utd"],
+    "real madrid": ["real madrid", "real madrid cf"],
+    "barcellona": ["barcellona", "barcelona", "fc barcelona"],
+    "psg": ["psg", "paris saint germain", "paris saint-germain"],
+    "bayern monaco": ["bayern monaco", "bayern munich", "fc bayern munich"],
+}
+
+
+def get_team_aliases(team_name):
+    base = normalize_team_name(team_name)
+    aliases = {base}
+    for key, values in TEAM_ALIASES.items():
+        if base == normalize_team_name(key) or base in [normalize_team_name(v) for v in values]:
+            aliases.update(normalize_team_name(v) for v in values)
+    return aliases
+
+
+def get_team_stats_reale(team_name, include_owned_by=None):
+    """
+    Trova i giocatori reali del club anche con alias.
+    Se include_owned_by è valorizzato, considera anche giocatori già assegnati a quel manager.
+    """
+    aliases = get_team_aliases(team_name)
+
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT *
+        FROM players
+        ORDER BY overall DESC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    matched = []
+    for r in rows:
+        team_norm = normalize_team_name(r["team"])
+        owner = r["owner_discord_id"]
+
+        if team_norm in aliases:
+            if owner is None or str(owner) == "" or (include_owned_by and str(owner) == str(include_owned_by)):
+                matched.append(r)
+
+    if not matched:
+        return [], 0, 0
+
+    avg_ovr = sum(safe_int(r["overall"]) for r in matched) / len(matched)
+    budget = budget_from_team_overall(avg_ovr)
+    return matched, avg_ovr, budget
+
+
+def get_exact_team_names_like(team_name):
+    aliases = get_team_aliases(team_name)
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT team FROM players ORDER BY team ASC")
+    rows = cur.fetchall()
+    conn.close()
+
+    results = []
+    search = normalize_team_name(team_name)
+    for r in rows:
+        team = r["team"]
+        norm = normalize_team_name(team)
+        if norm in aliases or search in norm or norm in search:
+            results.append(team)
+
+    return results[:20]
+
+# =====================================================================
+
+
+# ================= SYNC ROSA REALE PLAYER =================
+
+def sync_real_team_roster_to_manager(discord_id, club_name):
+    """
+    Assegna tutti i giocatori reali del club al manager e ricalcola budget.
+    Ritorna: players_count, avg_ovr, budget, real_team_name.
+    """
+    players, avg_ovr, budget = get_team_stats_reale(club_name, include_owned_by=str(discord_id))
+
+    if not players:
+        return 0, 0, 0, None
+
+    real_team_name = players[0]["team"]
+
+    conn = connect()
+    cur = conn.cursor()
+
+    # Libera rosa precedente del manager per evitare doppie rose
+    cur.execute("""
+        UPDATE players
+        SET owner_discord_id = NULL, sold_price = NULL
+        WHERE owner_discord_id = ?
+    """, (str(discord_id),))
+
+    # Assegna rosa reale
+    for p in players:
+        cur.execute("""
+            UPDATE players
+            SET owner_discord_id = ?, sold_price = ?
+            WHERE id = ?
+        """, (str(discord_id), 0, p["id"]))
+
+    # Manager/budget
+    cur.execute("""
+        INSERT OR IGNORE INTO managers (discord_id, name, budget)
+        VALUES (?, ?, ?)
+    """, (str(discord_id), str(discord_id), budget))
+
+    cur.execute("""
+        UPDATE managers
+        SET budget = ?
+        WHERE discord_id = ?
+    """, (budget, str(discord_id)))
+
+    # Club assegnato
+    try:
+        cur.execute("""
+            UPDATE fc26_clubs
+            SET assigned_to = NULL
+            WHERE assigned_to = ?
+        """, (str(discord_id),))
+
+        cur.execute("""
+            UPDATE fc26_clubs
+            SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP
+            WHERE LOWER(name) = LOWER(?)
+        """, (str(discord_id), str(club_name).strip()))
+    except Exception:
+        pass
+
+    # real_team_assignments
+    try:
+        cur.execute("""
+            INSERT OR REPLACE INTO real_team_assignments
+            (discord_id, manager_name, team_name, avg_overall, assigned_budget)
+            VALUES (?, ?, ?, ?, ?)
+        """, (str(discord_id), str(discord_id), real_team_name, avg_ovr, budget))
+    except Exception:
+        pass
+
+    conn.commit()
+    conn.close()
+
+    return len(players), avg_ovr, budget, real_team_name
+
+# ===========================================================
+
+
+
 async def safe_dm(user_id, message=None, embed=None):
     try:
         user = await bot.fetch_user(int(user_id))
@@ -3262,7 +3423,7 @@ class SquadraRealeModal(discord.ui.Modal, title="Assegna squadra reale"):
             await interaction.followup.send("Utente non trovato nel server.", ephemeral=True)
             return
 
-        players, avg_ovr, budget = get_team_stats(str(self.squadra.value))
+        players, avg_ovr, budget = get_team_stats_reale(str(self.squadra.value), include_owned_by=str(member.id))
 
         if not players:
             await interaction.followup.send("Squadra non trovata o senza giocatori liberi disponibili.", ephemeral=True)
@@ -6730,8 +6891,9 @@ async def ripubblica_richieste(interaction: discord.Interaction):
 
 # ================= FORZA ASSEGNAZIONE SQUADRA REALE =================
 
+
 @tree.command(name="forza_squadra_reale", description="Staff: assegna/ricorregge rosa reale e budget a un player già iscritto")
-@app_commands.describe(utente="Player già iscritto", squadra="Nome squadra reale da assegnare, es. Inter")
+@app_commands.describe(utente="Player già iscritto", squadra="Nome squadra reale da assegnare, es. Arsenal")
 async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.Member, squadra: str):
     if not can_use_normal_staff(interaction.user):
         await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
@@ -6740,14 +6902,15 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
     await interaction.response.defer(ephemeral=True)
 
     club_name = str(squadra).strip()
-
-    # Controlla rosa reale nel database
-    players, avg_ovr, budget = get_team_stats(club_name)
+    players, avg_ovr, budget = get_team_stats_reale(club_name, include_owned_by=str(utente.id))
 
     if not players:
+        suggestions = get_exact_team_names_like(club_name)
+        suggestion_text = "\n".join(f"• {s}" for s in suggestions) if suggestions else "Nessun nome simile trovato."
         await interaction.followup.send(
-            f"❌ Non ho trovato giocatori liberi per **{club_name}** nel database.\n"
-            f"Usa `/diagnostica_squadra {club_name}` per vedere il nome corretto della squadra nel database.",
+            f"❌ Non ho trovato giocatori liberi per **{club_name}** nel database.\n\n"
+            f"Possibili nomi trovati:\n{suggestion_text}\n\n"
+            f"Usa `/diagnostica_squadra {club_name}`.",
             ephemeral=True
         )
         return
@@ -6757,14 +6920,14 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
     conn = connect()
     cur = conn.cursor()
 
-    # Libera eventuali giocatori attuali del player, così non resta con doppia rosa.
+    # Libera eventuale rosa precedente
     cur.execute("""
         UPDATE players
         SET owner_discord_id = NULL, sold_price = NULL
         WHERE owner_discord_id = ?
     """, (str(utente.id),))
 
-    # Assegna tutti i giocatori reali trovati
+    # Assegna la rosa reale
     for p in players:
         cur.execute("""
             UPDATE players
@@ -6772,7 +6935,7 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
             WHERE id = ?
         """, (str(utente.id), 0, p["id"]))
 
-    # Aggiorna/crea manager con budget corretto
+    # Manager con budget corretto
     cur.execute("""
         INSERT OR IGNORE INTO managers (discord_id, name, budget)
         VALUES (?, ?, ?)
@@ -6784,7 +6947,7 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
         WHERE discord_id = ?
     """, (utente.display_name, budget, str(utente.id)))
 
-    # Aggiorna club assegnato, se presente nella tabella club
+    # Aggiorna club
     try:
         cur.execute("""
             UPDATE fc26_clubs
@@ -6796,25 +6959,26 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
             UPDATE fc26_clubs
             SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP
             WHERE LOWER(name) = LOWER(?)
-        """, (str(utente.id), real_team_name))
+        """, (str(utente.id), club_name.lower()))
 
         if cur.rowcount == 0:
             cur.execute("""
                 UPDATE fc26_clubs
                 SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP
                 WHERE LOWER(name) = LOWER(?)
-            """, (str(utente.id), club_name))
+            """, (str(utente.id), real_team_name.lower()))
     except Exception:
         pass
 
-    # Aggiorna real_team_assignments
-    cur.execute("""
-        INSERT OR REPLACE INTO real_team_assignments
-        (discord_id, manager_name, team_name, avg_overall, assigned_budget)
-        VALUES (?, ?, ?, ?, ?)
-    """, (str(utente.id), utente.display_name, real_team_name, avg_ovr, budget))
+    try:
+        cur.execute("""
+            INSERT OR REPLACE INTO real_team_assignments
+            (discord_id, manager_name, team_name, avg_overall, assigned_budget)
+            VALUES (?, ?, ?, ?, ?)
+        """, (str(utente.id), utente.display_name, real_team_name, avg_ovr, budget))
+    except Exception:
+        pass
 
-    # Aggiorna ultima richiesta accettata se esiste
     try:
         cur.execute("""
             UPDATE signup_requests
@@ -6827,7 +6991,6 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
     conn.commit()
     conn.close()
 
-    # Ruoli
     registered_role = interaction.guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
     pending_role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
 
@@ -6855,16 +7018,6 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
     await interaction.followup.send(embed=embed, ephemeral=True)
 
     try:
-        await utente.send(
-            f"✅ La tua squadra reale è stata aggiornata.\n\n"
-            f"🏟️ Club: **{real_team_name}**\n"
-            f"👥 Giocatori assegnati: **{len(players)}**\n"
-            f"💰 Budget: **{budget} crediti**"
-        )
-    except Exception:
-        pass
-
-    try:
         await send_staff_log(
             interaction.guild,
             "✅ Squadra reale forzata/aggiornata",
@@ -6881,6 +7034,7 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
     except Exception:
         pass
 
+# ================================================================
 # ================================================================
 
 
