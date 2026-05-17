@@ -970,8 +970,35 @@ def normalize_team_name(team):
     return normalize_text(team).strip()
 
 
+
+CLUB_NAME_ALIASES = {
+    "inter": ["inter", "inter milan", "internazionale"],
+    "milan": ["milan", "ac milan"],
+    "juventus": ["juventus", "juve"],
+    "roma": ["roma", "as roma"],
+    "lazio": ["lazio", "ss lazio"],
+    "napoli": ["napoli", "ssc napoli"],
+    "bayern monaco": ["bayern monaco", "bayern munich", "fc bayern"],
+    "barcellona": ["barcellona", "barcelona", "fc barcelona"],
+    "psg": ["psg", "paris saint-germain", "paris sg"],
+    "manchester united": ["manchester united", "man united", "man utd"],
+    "manchester city": ["manchester city", "man city"],
+    "atletico madrid": ["atletico madrid", "atlético madrid"],
+    "athletic club": ["athletic club", "athletic bilbao"],
+    "rb lipsia": ["rb lipsia", "rb leipzig"],
+    "borussia m'gladbach": ["borussia m'gladbach", "borussia monchengladbach", "monchengladbach", "mönchengladbach"],
+    "sporting cp": ["sporting cp", "sporting lisbon", "sporting"],
+}
+
+
+def possible_team_names(team_name):
+    base = normalize_team_name(team_name)
+    aliases = CLUB_NAME_ALIASES.get(base, [base])
+    return {normalize_team_name(x) for x in aliases}
+
+
 def get_team_stats(team_name):
-    search = normalize_team_name(team_name)
+    searches = possible_team_names(team_name)
 
     conn = connect()
     cur = conn.cursor()
@@ -984,7 +1011,7 @@ def get_team_stats(team_name):
     rows = cur.fetchall()
     conn.close()
 
-    matched = [r for r in rows if normalize_team_name(r["team"]) == search]
+    matched = [r for r in rows if normalize_team_name(r["team"]) in searches]
 
     if not matched:
         return [], 0, 0
@@ -2679,7 +2706,7 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     except Exception:
         pass
 
-    cur.execute("SELECT name, league, assigned_to FROM fc26_clubs WHERE LOWER(name) = LOWER(?)", (str(club).strip(),))
+    cur.execute("SELECT name, league, assigned_to, previous_owner_id FROM fc26_clubs WHERE LOWER(name) = LOWER(?)", (str(club).strip(),))
     club_row = cur.fetchone()
     if not club_row:
         conn.close()
@@ -2697,17 +2724,43 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     budget = DEFAULT_BUDGET
 
     if mode == "squadre_reali":
+        previous_owner_id = None
         try:
-            players, avg_ovr, budget_real = get_team_stats(club_name)
-            if players:
-                budget = budget_real
-                for p in players:
-                    cur.execute(
-                        "UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?",
-                        (str(member.id), 0, p["id"])
-                    )
+            previous_owner_id = club_row["previous_owner_id"]
         except Exception:
-            pass
+            previous_owner_id = None
+
+        # Se il club era stato liberato, il nuovo manager eredita rosa/budget dal vecchio owner.
+        if previous_owner_id:
+            cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (str(previous_owner_id),))
+            old_manager = cur.fetchone()
+            if old_manager:
+                budget = safe_int(old_manager["budget"], DEFAULT_BUDGET)
+
+            cur.execute("UPDATE players SET owner_discord_id = ? WHERE owner_discord_id = ?", (str(member.id), str(previous_owner_id)))
+            cur.execute("UPDATE championship_players SET discord_id = ?, display_name = ? WHERE discord_id = ?", (str(member.id), member.display_name, str(previous_owner_id)))
+            cur.execute("UPDATE championship_matches SET home_id = ?, home_name = ? WHERE home_id = ?", (str(member.id), member.display_name, str(previous_owner_id)))
+            cur.execute("UPDATE championship_matches SET away_id = ?, away_name = ? WHERE away_id = ?", (str(member.id), member.display_name, str(previous_owner_id)))
+            cur.execute("UPDATE match_scorers SET team_owner_id = ? WHERE team_owner_id = ?", (str(member.id), str(previous_owner_id)))
+            cur.execute("UPDATE transfer_history SET manager_id = ?, manager_name = ? WHERE manager_id = ?", (str(member.id), member.display_name, str(previous_owner_id)))
+        else:
+            players, avg_ovr, budget_real = get_team_stats(club_name)
+
+            if not players:
+                conn.close()
+                await interaction.response.send_message(
+                    "❌ Modalità Squadre Reali attiva, ma non ho trovato giocatori liberi per questo club nel database. "
+                    "Usa `/diagnostica_squadra nome:` per verificare il nome esatto della squadra nel database.",
+                    ephemeral=True
+                )
+                return
+
+            budget = budget_real
+            for p in players:
+                cur.execute(
+                    "UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?",
+                    (str(member.id), 0, p["id"])
+                )
 
     cur.execute(
         "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
@@ -2718,7 +2771,7 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
         (member.display_name, budget, str(member.id))
     )
 
-    cur.execute("UPDATE fc26_clubs SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP WHERE name = ?", (str(member.id), club_name))
+    cur.execute("UPDATE fc26_clubs SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP, previous_owner_id = NULL, previous_owner_name = NULL WHERE name = ?", (str(member.id), club_name))
 
     cur.execute("""
         UPDATE signup_requests
@@ -4807,6 +4860,63 @@ async def modalita_attuale(interaction: discord.Interaction):
     pretty = "Fantacalcio" if current_mode == "fantacalcio" else "Squadre reali"
 
     await interaction.response.send_message(f"⚙️ Modalità attuale: **{pretty}**.", ephemeral=True)
+
+
+
+@tree.command(name="diagnostica_squadra", description="Staff: controlla se una squadra reale ha giocatori nel database")
+@app_commands.describe(nome="Nome squadra da controllare")
+async def diagnostica_squadra(interaction: discord.Interaction, nome: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+
+    searches = possible_team_names(nome)
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT team, COUNT(*) AS total, AVG(overall) AS avg_ovr,
+               SUM(CASE WHEN owner_discord_id IS NULL THEN 1 ELSE 0 END) AS liberi
+        FROM players
+        WHERE team IS NOT NULL AND team != ''
+        GROUP BY team
+        ORDER BY total DESC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    exact = [r for r in rows if normalize_team_name(r["team"]) in searches]
+    similar = [r for r in rows if normalize_text(nome) in normalize_text(r["team"]) or normalize_text(r["team"]) in normalize_text(nome)]
+
+    embed = discord.Embed(
+        title="Diagnostica squadra reale",
+        description=f"Ricerca: **{nome}**",
+        color=discord.Color.blue()
+    )
+
+    if exact:
+        for r in exact[:10]:
+            budget = budget_from_team_overall(r["avg_ovr"] or 0)
+            embed.add_field(
+                name=str(r["team"]),
+                value=f"Giocatori totali: **{r['total']}** | Liberi: **{r['liberi']}** | OVR medio: **{(r['avg_ovr'] or 0):.1f}** | Budget: **{budget}**",
+                inline=False
+            )
+    elif similar:
+        embed.add_field(name="Nessuna corrispondenza esatta", value="Possibili nomi nel database:", inline=False)
+        for r in similar[:15]:
+            embed.add_field(
+                name=str(r["team"]),
+                value=f"Giocatori: **{r['total']}** | Liberi: **{r['liberi']}**",
+                inline=False
+            )
+    else:
+        embed.add_field(
+            name="Nessuna squadra trovata",
+            value="Il nome non sembra presente nella tabella players. Controlla `/lista_squadre`.",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @tree.command(name="lista_squadre", description="Mostra le squadre reali disponibili")
