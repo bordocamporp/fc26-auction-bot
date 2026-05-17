@@ -2,7 +2,9 @@ import os
 import asyncio
 import random
 import unicodedata
+import shutil
 from pathlib import Path
+from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 import discord
 from discord.ext import commands
@@ -37,6 +39,7 @@ SIGNUP_REQUEST_CHANNEL_ID = "1505146998779674765"   # RICHIESTA ISCRIZIONE
 SIGNUP_STAFF_CHANNEL_ID = "1505227395882422535"     # Canale staff richieste
 SIGNUP_REJECT_CHANNEL_ID = "1505229160057143366"    # Canale richieste rifiutate
 SIGNUP_ACCEPT_CHANNEL_ID = "1505228998668456057"    # Canale richieste accettate
+MEDIA_CHANNEL_ID = "1505314325001273415"              # Canale news/media FC26
 SIGNUP_PENDING_ROLE_ID = PRE_ISCRITTO_ROLE_ID        # 1505180973208440954
 SIGNUP_REGISTERED_ROLE_ID = LEAGUE_PLAYER_ROLE_ID    # 1505181066695016619
 
@@ -84,6 +87,207 @@ LEAGUE_CLUBS = {
 }
 
 FANTACALCIO_CLUBS = [club for clubs in LEAGUE_CLUBS.values() for club in clubs]
+
+
+# ================= MEDIA SYSTEM - SOLO NEWS IMPORTANTI =================
+
+MEDIA_CHANNEL_ID = "1505314325001273415"
+MEDIA_TRANSFER_MIN_OVERALL = 85
+MEDIA_TRANSFER_MIN_PRICE = 150
+MEDIA_SPECIAL_MATCH_MIN_GOALS = 5
+
+TOP_CLUBS_FOR_MEDIA = {
+    "Real Madrid", "Barcellona", "Atletico Madrid", "Manchester City",
+    "Manchester United", "Liverpool", "Arsenal", "Chelsea", "Tottenham",
+    "PSG", "Bayern Monaco", "Borussia Dortmund", "Inter", "Milan",
+    "Juventus", "Napoli", "Roma", "Benfica", "Porto", "Ajax"
+}
+
+TROPHY_KEYWORDS_FOR_MEDIA = {
+    "campionato", "coppa nazionale", "champions", "europa league",
+    "conference league", "finale", "semifinale", "trofeo", "titolo"
+}
+
+
+def is_important_transfer(overall=None, price=None):
+    return safe_int(overall) >= MEDIA_TRANSFER_MIN_OVERALL or safe_int(price) >= MEDIA_TRANSFER_MIN_PRICE
+
+
+def is_important_match(total_goals=0, is_final=False, is_semifinal=False, is_derby=False, is_big_match=False):
+    return (
+        bool(is_final)
+        or bool(is_semifinal)
+        or bool(is_derby)
+        or bool(is_big_match)
+        or safe_int(total_goals) >= MEDIA_SPECIAL_MATCH_MIN_GOALS
+    )
+
+
+def is_important_trophy(title="", competition=""):
+    check = normalize_text(f"{title} {competition}")
+    return any(normalize_text(word) in check for word in TROPHY_KEYWORDS_FOR_MEDIA)
+
+
+def is_important_manager_change(club_name="", inherited=False, has_trophies=False):
+    return bool(inherited) or bool(has_trophies) or str(club_name).strip() in TOP_CLUBS_FOR_MEDIA
+
+
+async def publish_media_news(
+    guild,
+    title,
+    description,
+    *,
+    category="generic",
+    club_name=None,
+    player_overall=None,
+    price=None,
+    total_goals=None,
+    is_final=False,
+    is_semifinal=False,
+    is_derby=False,
+    is_big_match=False,
+    inherited=False,
+    has_trophies=False,
+    force=False
+):
+    """
+    Pubblica nel canale media SOLO notizie importanti.
+
+    Pubblica se:
+    - force=True
+    - trasferimento con OVR >= 85 o prezzo >= 150
+    - trofeo/finale/competizione importante
+    - partita speciale: finale, semifinale, derby, big match o 5+ gol
+    - cambio manager importante: top club, club ereditato o club con trofei
+    """
+
+    important = bool(force)
+
+    if category == "transfer":
+        important = important or is_important_transfer(player_overall, price)
+
+    elif category == "match":
+        important = important or is_important_match(
+            total_goals=total_goals or 0,
+            is_final=is_final,
+            is_semifinal=is_semifinal,
+            is_derby=is_derby,
+            is_big_match=is_big_match
+        )
+
+    elif category == "trophy":
+        important = True
+
+    elif category == "manager_change":
+        important = important or is_important_manager_change(
+            club_name=club_name or "",
+            inherited=inherited,
+            has_trophies=has_trophies
+        )
+
+    else:
+        important = important or is_important_trophy(title, description)
+
+    if not important:
+        return False
+
+    channel = None
+    if guild:
+        channel = guild.get_channel(int(MEDIA_CHANNEL_ID))
+
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(int(MEDIA_CHANNEL_ID))
+        except Exception:
+            channel = None
+
+    if not channel:
+        return False
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text="BordoCampo FC26 Media • News importanti")
+    await channel.send(embed=embed)
+    return True
+
+
+async def publish_transfer_news_if_important(guild, club_name, player_name, price=0, overall=0):
+    return await publish_media_news(
+        guild,
+        "📰 BREAKING NEWS DI MERCATO",
+        (
+            f"Il club **{club_name}** piazza un colpo importante:\n"
+            f"⚽ **{player_name}**\n"
+            f"⭐ Overall: **{overall}**\n"
+            f"💰 Operazione: **{price} crediti**"
+        ),
+        category="transfer",
+        club_name=club_name,
+        player_overall=overall,
+        price=price
+    )
+
+
+async def publish_trophy_news(guild, club_name, trophy_name, manager_name=None, bonus_budget=None):
+    extra = ""
+    if manager_name:
+        extra += f"\n👤 Manager: **{manager_name}**"
+    if bonus_budget is not None:
+        extra += f"\n💰 Bonus budget: **+{bonus_budget} crediti**"
+
+    return await publish_media_news(
+        guild,
+        "🏆 TROPHY NEWS",
+        f"**{club_name}** conquista **{trophy_name}**!{extra}",
+        category="trophy",
+        club_name=club_name,
+        force=True
+    )
+
+
+async def publish_manager_change_news_if_important(guild, club_name, old_manager=None, new_manager=None, inherited=True, has_trophies=False):
+    old_text = old_manager or "precedente gestione"
+    new_text = new_manager or "nuovo manager"
+
+    return await publish_media_news(
+        guild,
+        "🧠 NUOVA ERA IN PANCHINA",
+        (
+            f"Il club **{club_name}** passa da **{old_text}** a **{new_text}**.\n"
+            f"La squadra eredita rosa, budget e percorso sportivo già esistente."
+        ),
+        category="manager_change",
+        club_name=club_name,
+        inherited=inherited,
+        has_trophies=has_trophies
+    )
+
+
+
+async def automatic_daily_backup_loop():
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        try:
+            path, error = create_database_backup("daily_auto")
+
+            if path:
+                print(f"[BACKUP] Backup automatico creato: {path}")
+            else:
+                print(f"[BACKUP] Errore backup automatico: {error}")
+
+        except Exception as e:
+            print(f"[BACKUP] Errore loop backup automatico: {e}")
+
+        # 24 ore
+        await asyncio.sleep(86400)
+
+
+# ======================================================================
+
 # ===================================
 
 BOT_ONLY_BYPASS_ROLE_IDS = {
@@ -328,6 +532,11 @@ def ensure_extra_tables():
         VALUES ('mode', 'fantacalcio')
     """)
 
+    cur.execute("""
+        INSERT OR IGNORE INTO league_settings (key, value)
+        VALUES ('market_open', 'closed')
+    """)
+
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS championships (
@@ -398,6 +607,7 @@ def ensure_extra_tables():
         age TEXT,
         platform TEXT,
         game_id TEXT,
+        club_preferences TEXT,
         status TEXT DEFAULT 'pending',
         club_name TEXT,
         handled_by TEXT,
@@ -405,6 +615,11 @@ def ensure_extra_tables():
         handled_at DATETIME
     )
     """)
+
+    try:
+        cur.execute("ALTER TABLE signup_requests ADD COLUMN club_preferences TEXT")
+    except Exception:
+        pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS fc26_clubs (
@@ -441,6 +656,97 @@ def ensure_extra_tables():
                 "UPDATE fc26_clubs SET league = ? WHERE name = ? AND (league IS NULL OR league = '')",
                 (league_name, club)
             )
+
+    # Tabelle extra: coppe, premi, hall of fame, media e offerte/controfferte
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS national_cups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        championship_id INTEGER NOT NULL,
+        group_id INTEGER,
+        name TEXT NOT NULL,
+        status TEXT DEFAULT 'active',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS national_cup_matches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cup_id INTEGER NOT NULL,
+        round_number INTEGER NOT NULL,
+        home_id TEXT,
+        away_id TEXT,
+        home_name TEXT,
+        away_name TEXT,
+        home_goals INTEGER,
+        away_goals INTEGER,
+        status TEXT DEFAULT 'pending',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS european_cups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        championship_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        cup_type TEXT NOT NULL,
+        season_number INTEGER DEFAULT 1,
+        qualification_mode TEXT DEFAULT 'random',
+        status TEXT DEFAULT 'active',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS european_cup_players (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cup_id INTEGER NOT NULL,
+        discord_id TEXT NOT NULL,
+        display_name TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS hall_of_fame (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        season TEXT,
+        competition TEXT,
+        winner_id TEXT,
+        winner_name TEXT,
+        club_name TEXT,
+        prize_budget INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS media_news (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        created_by TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS player_trade_offers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        proposer_id TEXT NOT NULL,
+        proposer_name TEXT,
+        target_id TEXT NOT NULL,
+        target_name TEXT,
+        player_id TEXT NOT NULL,
+        player_name TEXT,
+        amount INTEGER DEFAULT 0,
+        counter_amount INTEGER,
+        status TEXT DEFAULT 'pending',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME
+    )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -602,6 +908,30 @@ def set_league_mode(mode):
     conn.close()
 
 
+def is_market_open():
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM league_settings WHERE key = 'market_open'")
+    row = cur.fetchone()
+    conn.close()
+    return (row["value"] if row else "closed") == "open"
+
+
+def set_market_open(opened: bool):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO league_settings (key, value)
+        VALUES ('market_open', ?)
+    """, ("open" if opened else "closed",))
+    conn.commit()
+    conn.close()
+
+
+def market_status_label():
+    return "APERTO ✅" if is_market_open() else "CHIUSO 🔒"
+
+
 def budget_from_team_overall(avg_ovr):
     avg_ovr = float(avg_ovr or 0)
 
@@ -747,6 +1077,10 @@ def generate_roster_graphic(discord_id, display_name):
 
 
 async def place_bid(interaction: discord.Interaction, increment=None, all_in=False):
+    if not is_market_open():
+        await interaction.response.send_message("🔒 Il mercato è chiuso. Non puoi fare offerte in questo momento.", ephemeral=True)
+        return
+
     conn = connect()
     cur = conn.cursor()
 
@@ -898,6 +1232,950 @@ class AuctionView(discord.ui.View):
         await interaction.response.send_modal(CustomBidModal())
 
 
+
+# ================= SISTEMA BACKUP DATABASE =================
+
+BACKUP_DIR = Path("backups")
+BACKUP_DIR.mkdir(exist_ok=True)
+MAX_BACKUPS_TO_KEEP = 5
+
+# Se il tuo db.py usa un nome diverso, modifica qui.
+DATABASE_CANDIDATES = [
+    Path("data/fc26.db"),
+    Path("data/database.db"),
+    Path("data/bot.db"),
+    Path("fc26.db"),
+    Path("database.db"),
+    Path("bot.db"),
+]
+
+
+def get_database_path():
+    for candidate in DATABASE_CANDIDATES:
+        if candidate.exists():
+            return candidate
+
+    # fallback: cerca il primo .db nelle cartelle più probabili
+    for base in [Path("data"), Path(".")]:
+        if base.exists():
+            db_files = sorted(base.glob("*.db"))
+            if db_files:
+                return db_files[0]
+
+    return None
+
+
+def cleanup_old_backups():
+    backups = sorted(BACKUP_DIR.glob("backup_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old_backup in backups[MAX_BACKUPS_TO_KEEP:]:
+        try:
+            old_backup.unlink()
+        except Exception:
+            pass
+
+
+def create_database_backup(reason="manuale"):
+    db_path = get_database_path()
+    if not db_path:
+        return None, "Database non trovato. Controlla il nome del file database in DATABASE_CANDIDATES."
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    safe_reason = normalize_text(reason).replace(" ", "_")[:40] or "manuale"
+    backup_path = BACKUP_DIR / f"backup_{timestamp}_{safe_reason}.db"
+
+    shutil.copy2(db_path, backup_path)
+    cleanup_old_backups()
+    return backup_path, None
+
+
+def list_database_backups():
+    return sorted(BACKUP_DIR.glob("backup_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+async def auto_backup(reason="automatico"):
+    path, error = create_database_backup(reason)
+    return path is not None
+
+
+async def create_backup_before_sensitive_action(reason):
+    # Wrapper usato prima di reset, mercato, gironi, coppe, ecc.
+    try:
+        return await auto_backup(reason)
+    except Exception:
+        return False
+
+
+@tree.command(name="backup_now", description="Staff: crea subito un backup del database")
+async def backup_now(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può creare backup.", ephemeral=True)
+        return
+
+    path, error = create_database_backup("manuale")
+
+    if error:
+        await interaction.response.send_message(f"❌ Backup non creato: {error}", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"✅ Backup creato correttamente:\n`{path}`",
+        ephemeral=True
+    )
+
+
+@tree.command(name="backup_list", description="Staff: mostra gli ultimi backup disponibili")
+async def backup_list(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può vedere i backup.", ephemeral=True)
+        return
+
+    backups = list_database_backups()
+
+    if not backups:
+        await interaction.response.send_message("Nessun backup disponibile.", ephemeral=True)
+        return
+
+    lines = []
+    for idx, backup in enumerate(backups[:10], start=1):
+        size_mb = backup.stat().st_size / (1024 * 1024)
+        lines.append(f"**{idx}.** `{backup.name}` — {size_mb:.2f} MB")
+
+    await interaction.response.send_message(
+        "📦 **Backup disponibili**\n\n" + "\n".join(lines),
+        ephemeral=True
+    )
+
+
+class RestoreBackupSelect(discord.ui.Select):
+    def __init__(self, backups):
+        options = []
+        for backup in backups[:25]:
+            size_mb = backup.stat().st_size / (1024 * 1024)
+            options.append(discord.SelectOption(
+                label=backup.name[:100],
+                value=backup.name,
+                description=f"{size_mb:.2f} MB"
+            ))
+
+        super().__init__(
+            placeholder="Scegli il backup da ripristinare...",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può ripristinare backup.", ephemeral=True)
+            return
+
+        selected = BACKUP_DIR / self.values[0]
+        db_path = get_database_path()
+
+        if not selected.exists():
+            await interaction.response.send_message("❌ Backup non trovato.", ephemeral=True)
+            return
+
+        if not db_path:
+            await interaction.response.send_message("❌ Database attuale non trovato.", ephemeral=True)
+            return
+
+        # Backup di sicurezza prima del restore
+        create_database_backup("prima_del_restore")
+
+        try:
+            shutil.copy2(selected, db_path)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Errore durante il ripristino: `{e}`", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="✅ Backup ripristinato",
+            description=(
+                f"Backup ripristinato:\n`{selected.name}`\n\n"
+                "⚠️ Riavvia il bot per assicurarti che tutte le connessioni leggano il database ripristinato."
+            ),
+            color=discord.Color.green()
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+class RestoreBackupView(discord.ui.View):
+    def __init__(self, backups):
+        super().__init__(timeout=180)
+        self.add_item(RestoreBackupSelect(backups))
+
+
+@tree.command(name="restore_backup", description="Staff: ripristina un backup del database")
+async def restore_backup(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può ripristinare backup.", ephemeral=True)
+        return
+
+    backups = list_database_backups()
+
+    if not backups:
+        await interaction.response.send_message("Nessun backup disponibile da ripristinare.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="⚠️ Ripristino backup",
+        description=(
+            "Scegli il backup da ripristinare.\n\n"
+            "Il bot creerà automaticamente un backup di sicurezza prima del ripristino.\n"
+            "Dopo il restore è consigliato riavviare il bot."
+        ),
+        color=discord.Color.orange()
+    )
+
+    await interaction.response.send_message(embed=embed, view=RestoreBackupView(backups), ephemeral=True)
+
+# ===========================================================
+
+
+
+# ================= NOMI CUSTOM GIRONI RANDOM =================
+
+def parse_custom_league_names(raw_names: str, expected_count: int = None):
+    names = []
+    for part in str(raw_names or "").replace(";", "\n").split("\n"):
+        clean = part.strip()
+        if clean:
+            names.append(clean[:80])
+
+    if expected_count:
+        names = names[:expected_count]
+
+    return names
+
+
+def build_default_group_names(count: int):
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    names = []
+    for i in range(max(1, int(count))):
+        if i < len(alphabet):
+            names.append(f"Girone {alphabet[i]}")
+        else:
+            names.append(f"Girone {i + 1}")
+    return names
+
+
+class RandomLeagueNamesModal(discord.ui.Modal, title="Nomi campionati random"):
+    group_count = discord.ui.TextInput(
+        label="Numero campionati/gironi",
+        placeholder="Esempio: 2",
+        required=True,
+        max_length=2
+    )
+
+    league_names = discord.ui.TextInput(
+        label="Nomi campionati",
+        placeholder="Uno per riga. Esempio: Super League, Elite Division",
+        required=True,
+        style=discord.TextStyle.paragraph,
+        max_length=500
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può configurare i gironi.", ephemeral=True)
+            return
+
+        raw_count = str(self.group_count.value).strip()
+
+        if not raw_count.isdigit() or int(raw_count) <= 0:
+            await interaction.response.send_message("❌ Inserisci un numero valido di campionati/gironi.", ephemeral=True)
+            return
+
+        count = min(int(raw_count), 25)
+        names = parse_custom_league_names(str(self.league_names.value), count)
+
+        if len(names) < count:
+            defaults = build_default_group_names(count)
+            for default_name in defaults:
+                if len(names) >= count:
+                    break
+                if default_name not in names:
+                    names.append(default_name)
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO league_settings (key, value)
+            VALUES ('random_group_names', ?)
+        """, ("|".join(names),))
+        cur.execute("""
+            INSERT OR REPLACE INTO league_settings (key, value)
+            VALUES ('random_group_count', ?)
+        """, (str(count),))
+        cur.execute("""
+            INSERT OR REPLACE INTO league_settings (key, value)
+            VALUES ('group_generation_mode', 'random_custom')
+        """)
+        conn.commit()
+        conn.close()
+
+        await create_backup_before_sensitive_action("nomi_gironi_random")
+
+        embed = discord.Embed(
+            title="✅ Nomi campionati random salvati",
+            description=(
+                "Il bot userà questi nomi per la generazione random dei campionati/gironi:\n\n"
+                + "\n".join(f"• **{name}**" for name in names)
+            ),
+            color=discord.Color.green()
+        )
+        embed.set_footer(text="Se usi i campionati reali, il bot userà invece i nomi reali delle competizioni.")
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class GroupNamingModeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="Random con nomi custom", style=discord.ButtonStyle.primary, emoji="🎲")
+    async def random_custom(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può configurare i gironi.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RandomLeagueNamesModal())
+
+    @discord.ui.button(label="Campionati reali automatici", style=discord.ButtonStyle.success, emoji="🏆")
+    async def real_leagues(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può configurare i gironi.", ephemeral=True)
+            return
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO league_settings (key, value)
+            VALUES ('group_generation_mode', 'real_leagues')
+        """)
+        conn.commit()
+        conn.close()
+
+        embed = discord.Embed(
+            title="✅ Campionati reali attivati",
+            description=(
+                "Quando generi i gironi, il bot userà i nomi reali delle competizioni:\n"
+                "Serie A, Premier League, LaLiga, Bundesliga, Ligue 1, ecc.\n\n"
+                "I nomi vengono letti dal campo `league` dei club assegnati."
+            ),
+            color=discord.Color.green()
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+@tree.command(name="configura_gironi", description="Staff: configura nomi gironi random o campionati reali")
+async def configura_gironi(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può configurare i gironi.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="⚙️ Configurazione gironi/campionati",
+        description=(
+            "Scegli come nominare i campionati quando generi i gironi:\n\n"
+            "🎲 **Random con nomi custom**\n"
+            "Lo staff inserisce nomi personalizzati, esempio Super League, Elite Division.\n\n"
+            "🏆 **Campionati reali automatici**\n"
+            "Il bot usa automaticamente i nomi reali, esempio Serie A, Premier League, LaLiga."
+        ),
+        color=discord.Color.blue()
+    )
+
+    await interaction.response.send_message(embed=embed, view=GroupNamingModeView(), ephemeral=True)
+
+
+def get_random_group_names_for_generation(default_count=1):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM league_settings WHERE key = 'random_group_names'")
+    names_row = cur.fetchone()
+    cur.execute("SELECT value FROM league_settings WHERE key = 'random_group_count'")
+    count_row = cur.fetchone()
+    conn.close()
+
+    count = safe_int(count_row["value"], default_count) if count_row else default_count
+
+    if names_row and names_row["value"]:
+        names = [n.strip() for n in str(names_row["value"]).split("|") if n.strip()]
+        if names:
+            return names[:count]
+
+    return build_default_group_names(count)
+
+
+def get_group_generation_mode():
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM league_settings WHERE key = 'group_generation_mode'")
+    row = cur.fetchone()
+    conn.close()
+    return row["value"] if row else "random_custom"
+
+
+def get_real_league_names_from_assigned_clubs():
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT DISTINCT c.league
+            FROM fc26_clubs c
+            WHERE c.assigned_to IS NOT NULL
+              AND c.league IS NOT NULL
+              AND c.league != ''
+            ORDER BY c.league ASC
+        """)
+        rows = cur.fetchall()
+        names = [r["league"] for r in rows]
+    except Exception:
+        names = []
+    conn.close()
+
+    return names or get_current_league_names()
+
+
+@tree.command(name="nomi_gironi_random", description="Staff: imposta direttamente i nomi dei gironi random")
+async def nomi_gironi_random(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può configurare i gironi.", ephemeral=True)
+        return
+
+    await interaction.response.send_modal(RandomLeagueNamesModal())
+
+# ======================================================================
+
+
+# ================= SISTEMA ATTIVITÀ PLAYER =================
+
+INACTIVITY_CHANNEL_ID = 1505325803683184743
+INACTIVITY_HOURS_LIMIT = 22
+INACTIVITY_CHECK_INTERVAL = 79200  # 22 ore
+
+def ensure_activity_tables():
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS player_activity (
+        discord_id TEXT PRIMARY KEY,
+        last_discord_activity DATETIME,
+        last_match_played DATETIME,
+        last_response DATETIME,
+        warned INTEGER DEFAULT 0
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def update_player_activity(discord_id, activity_type="discord"):
+    conn = connect()
+    cur = conn.cursor()
+
+    field = {
+        "discord": "last_discord_activity",
+        "match": "last_match_played",
+        "response": "last_response"
+    }.get(activity_type, "last_discord_activity")
+
+    cur.execute(f"""
+        INSERT INTO player_activity (discord_id, {field})
+        VALUES (?, CURRENT_TIMESTAMP)
+        ON CONFLICT(discord_id)
+        DO UPDATE SET {field} = CURRENT_TIMESTAMP
+    """, (str(discord_id),))
+
+    conn.commit()
+    conn.close()
+
+
+async def send_inactivity_warning(guild, member, reason):
+    channel = guild.get_channel(INACTIVITY_CHANNEL_ID)
+
+    if not channel:
+        return
+
+    embed = discord.Embed(
+        title="⚠️ Segnalazione inattività",
+        description=(
+            f"👤 Player: {member.mention}\n"
+            f"📌 Motivo: **{reason}**\n\n"
+            f"Lo staff può valutare:\n"
+            f"• richiamo\n"
+            f"• sostituzione\n"
+            f"• liberazione club"
+        ),
+        color=discord.Color.orange()
+    )
+
+    await channel.send(embed=embed)
+
+
+async def check_player_inactivity():
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        try:
+            ensure_activity_tables()
+
+            conn = connect()
+            cur = conn.cursor()
+
+            cur.execute("""
+                SELECT *
+                FROM player_activity
+            """)
+
+            rows = cur.fetchall()
+
+            now = datetime.utcnow()
+
+            for row in rows:
+                discord_id = str(row["discord_id"])
+
+                for guild in bot.guilds:
+                    member = guild.get_member(int(discord_id))
+
+                    if not member:
+                        continue
+
+                    checks = [
+                        ("last_discord_activity", "Inattività Discord nelle ultime 22 ore"),
+                        ("last_match_played", "Partite non giocate nelle ultime 22 ore"),
+                        ("last_response", "Mancata risposta nelle ultime 22 ore")
+                    ]
+
+                    for field, reason in checks:
+                        value = row[field]
+
+                        if not value:
+                            continue
+
+                        try:
+                            dt = datetime.fromisoformat(str(value))
+                        except Exception:
+                            continue
+
+                        delta_hours = (now - dt).total_seconds() / 3600
+
+                        if delta_hours >= INACTIVITY_HOURS_LIMIT:
+                            await send_inactivity_warning(guild, member, reason)
+
+            conn.close()
+
+        except Exception as e:
+            print(f"[ATTIVITA] Errore controllo inattività: {e}")
+
+        await asyncio.sleep(INACTIVITY_CHECK_INTERVAL)  # controllo ogni 22 ore
+
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    try:
+        update_player_activity(message.author.id, "discord")
+    except Exception:
+        pass
+
+    await bot.process_commands(message)
+
+# ===========================================================
+
+# ================= SISTEMA FINE / NUOVA STAGIONE =================
+
+def ensure_season_tables():
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS seasons (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        status TEXT DEFAULT 'active',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        closed_at DATETIME
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS league_hierarchy (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        league_name TEXT NOT NULL,
+        parent_league TEXT,
+        hierarchy_type TEXT DEFAULT 'top',
+        season_id INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+        INSERT INTO seasons (name, status)
+        SELECT 'Stagione 1', 'active'
+        WHERE NOT EXISTS (SELECT 1 FROM seasons WHERE status = 'active')
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def get_active_season():
+    ensure_season_tables()
+    ensure_activity_tables()
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM seasons WHERE status = 'active' ORDER BY id DESC LIMIT 1")
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def close_active_season():
+    ensure_season_tables()
+    ensure_activity_tables()
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE seasons SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE status = 'active'")
+    conn.commit()
+    conn.close()
+
+
+def create_next_season():
+    ensure_season_tables()
+    ensure_activity_tables()
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT MAX(id) AS max_id FROM seasons")
+    row = cur.fetchone()
+    next_num = safe_int(row["max_id"], 0) + 1
+    cur.execute("INSERT INTO seasons (name, status) VALUES (?, 'active')", (f"Stagione {next_num}",))
+    season_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return season_id
+
+
+def reset_season_competition_data():
+    """
+    Reset leggero per nuova stagione:
+    - chiude/azzera partite campionato vecchie
+    - chiude campionati attivi
+    - mantiene manager, club, rose, budget e storico trasferimenti.
+    """
+    conn = connect()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("UPDATE championship_matches SET status = 'archived' WHERE status != 'archived'")
+    except Exception:
+        pass
+
+    try:
+        cur.execute("UPDATE championships SET status = 'archived' WHERE status = 'active'")
+    except Exception:
+        pass
+
+    try:
+        cur.execute("DELETE FROM match_scorers")
+    except Exception:
+        pass
+
+    conn.commit()
+    conn.close()
+
+
+def get_current_league_names():
+    conn = connect()
+    cur = conn.cursor()
+
+    names = []
+
+    try:
+        cur.execute("""
+            SELECT DISTINCT name
+            FROM championship_groups
+            ORDER BY name ASC
+        """)
+        names = [r["name"] for r in cur.fetchall()]
+    except Exception:
+        names = []
+
+    if not names:
+        try:
+            cur.execute("""
+                SELECT DISTINCT league
+                FROM fc26_clubs
+                WHERE league IS NOT NULL AND league != ''
+                ORDER BY league ASC
+            """)
+            names = [r["league"] for r in cur.fetchall()]
+        except Exception:
+            names = []
+
+    conn.close()
+
+    # fallback
+    if not names:
+        names = ["Girone A"]
+
+    return names
+
+
+def save_league_hierarchy(league_name, parent_league=None, hierarchy_type="top"):
+    season = get_active_season()
+    season_id = season["id"] if season else None
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO league_hierarchy (league_name, parent_league, hierarchy_type, season_id)
+        VALUES (?, ?, ?, ?)
+    """, (league_name, parent_league, hierarchy_type, season_id))
+    conn.commit()
+    conn.close()
+
+
+async def generate_new_season_competitions(interaction: discord.Interaction, with_europe=True):
+    """
+    Hook centrale per generare nuovi calendari.
+    Se nel tuo bot hai già funzioni/comandi specifici per generare calendari/coppe,
+    puoi collegarli qui. Questa funzione prepara il flusso e crea backup.
+    """
+    await create_backup_before_sensitive_action("avvio_nuova_stagione")
+
+    reset_season_competition_data()
+    new_season_id = create_next_season()
+
+    # Qui il bot mantiene rose/budget/club.
+    # Calendari e coppe nazionali/europee possono essere rigenerati usando le funzioni già presenti nel bot.
+    # Se le tue funzioni hanno nomi specifici, collegale qui.
+    generation_mode = get_group_generation_mode()
+    if generation_mode == "real_leagues":
+        league_names = get_real_league_names_from_assigned_clubs()
+        league_note = "✅ Campionati reali usati automaticamente: " + ", ".join(league_names[:10])
+    else:
+        league_names = get_random_group_names_for_generation()
+        league_note = "✅ Gironi random con nomi custom: " + ", ".join(league_names[:10])
+
+    generated_notes = [
+        "✅ Calendari/classifiche/statistiche della stagione precedente azzerati/archiviati.",
+        "✅ Nuova stagione creata.",
+        "✅ Rose, budget, club e trasferimenti mantenuti.",
+        league_note,
+        "✅ Coppe nazionali pronte per essere rigenerate sui nuovi gironi."
+    ]
+
+    if with_europe:
+        generated_notes.append("✅ Coppe europee da generare in base ai piazzamenti della stagione precedente.")
+
+    return new_season_id, generated_notes
+
+
+class EndSeasonView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="Avvia stagione nuova", style=discord.ButtonStyle.success, emoji="✅")
+    async def start_new_season(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può avviare la nuova stagione.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        close_active_season()
+        season_id, notes = await generate_new_season_competitions(interaction, with_europe=True)
+
+        embed = discord.Embed(
+            title="✅ Nuova stagione avviata",
+            description="\n".join(notes),
+            color=discord.Color.green()
+        )
+        embed.add_field(name="ID nuova stagione", value=str(season_id), inline=True)
+        embed.set_footer(text="Ora puoi rigenerare/controllare calendari, coppe nazionali e coppe europee.")
+
+        try:
+            await interaction.message.edit(embed=embed, view=None)
+        except Exception:
+            pass
+
+        await interaction.followup.send("✅ Nuova stagione avviata correttamente.", ephemeral=True)
+
+    @discord.ui.button(label="Avvia stagione con nuovi campionati", style=discord.ButtonStyle.primary, emoji="🏗️")
+    async def start_with_new_leagues(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può modificare la struttura campionati.", ephemeral=True)
+            return
+
+        leagues = get_current_league_names()
+
+        embed = discord.Embed(
+            title="🏗️ Nuovi campionati",
+            description=(
+                "Scegli un campionato corrente dalla tendina.\n\n"
+                "Poi potrai decidere se creare:\n"
+                "• un campionato inferiore collegato a quello scelto\n"
+                "• un nuovo campionato superiore/parallelo"
+            ),
+            color=discord.Color.blue()
+        )
+
+        await interaction.response.edit_message(embed=embed, view=LeagueExpansionView(leagues))
+
+
+class LeagueExpansionSelect(discord.ui.Select):
+    def __init__(self, leagues):
+        options = []
+        for league in leagues[:25]:
+            options.append(discord.SelectOption(
+                label=str(league)[:100],
+                value=str(league),
+                description="Campionato corrente"
+            ))
+
+        super().__init__(
+            placeholder="Scegli il campionato corrente...",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può modificare i campionati.", ephemeral=True)
+            return
+
+        selected_league = self.values[0]
+
+        embed = discord.Embed(
+            title="Scegli tipo nuovo campionato",
+            description=(
+                f"Campionato scelto: **{selected_league}**\n\n"
+                "• **Campionato inferiore**: esempio Girone A → A1\n"
+                "• **Nuovo campionato**: esempio nuovo Girone B"
+            ),
+            color=discord.Color.orange()
+        )
+
+        await interaction.response.edit_message(
+            embed=embed,
+            view=LeagueExpansionTypeView(selected_league)
+        )
+
+
+class LeagueExpansionView(discord.ui.View):
+    def __init__(self, leagues):
+        super().__init__(timeout=300)
+        self.add_item(LeagueExpansionSelect(leagues))
+
+
+class LeagueExpansionTypeView(discord.ui.View):
+    def __init__(self, selected_league):
+        super().__init__(timeout=300)
+        self.selected_league = selected_league
+
+    @discord.ui.button(label="Campionato inferiore", style=discord.ButtonStyle.secondary, emoji="⬇️")
+    async def lower_league(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può modificare i campionati.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(NewLeagueNameModal(self.selected_league, "lower"))
+
+    @discord.ui.button(label="Nuovo campionato", style=discord.ButtonStyle.primary, emoji="🆕")
+    async def new_top_league(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può modificare i campionati.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(NewLeagueNameModal(self.selected_league, "top"))
+
+
+class NewLeagueNameModal(discord.ui.Modal, title="Crea nuovo campionato"):
+    league_name = discord.ui.TextInput(
+        label="Nome nuovo campionato",
+        placeholder="Esempio: A1 oppure Girone B",
+        required=True,
+        max_length=80
+    )
+
+    def __init__(self, parent_league, hierarchy_type):
+        super().__init__()
+        self.parent_league = parent_league
+        self.hierarchy_type = hierarchy_type
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può creare campionati.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        await create_backup_before_sensitive_action("nuovi_campionati")
+
+        new_name = str(self.league_name.value).strip()
+
+        if self.hierarchy_type == "lower":
+            save_league_hierarchy(new_name, parent_league=self.parent_league, hierarchy_type="lower")
+            description = (
+                f"✅ Creato campionato inferiore **{new_name}** collegato a **{self.parent_league}**.\n\n"
+                "Questo potrà essere usato per promozioni/retrocessioni nelle stagioni successive."
+            )
+        else:
+            save_league_hierarchy(new_name, parent_league=None, hierarchy_type="top")
+            description = (
+                f"✅ Creato nuovo campionato principale/parallelo: **{new_name}**.\n\n"
+                "Esempio: se prima avevi Girone A, ora puoi avere anche Girone B."
+            )
+
+        close_active_season()
+        season_id, notes = await generate_new_season_competitions(interaction, with_europe=True)
+
+        embed = discord.Embed(
+            title="🏗️ Stagione con nuovi campionati avviata",
+            description=description + "\n\n" + "\n".join(notes),
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Nuova stagione ID", value=str(season_id), inline=True)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="fine_stagione", description="Staff: chiude la stagione e avvia il flusso nuova stagione")
+async def fine_stagione(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può chiudere la stagione.", ephemeral=True)
+        return
+
+    ensure_season_tables()
+    ensure_activity_tables()
+    season = get_active_season()
+
+    embed = discord.Embed(
+        title="🏁 Fine stagione",
+        description=(
+            f"Stagione attiva: **{season['name'] if season else 'N/D'}**\n\n"
+            "Scegli cosa fare:\n\n"
+            "✅ **Avvia stagione nuova**\n"
+            "Resetta calendari, classifiche e statistiche stagionali; mantiene rose, budget, club e storico.\n"
+            "Rigenera campionati, coppe nazionali e coppe europee in base ai piazzamenti.\n\n"
+            "🏗️ **Avvia stagione con nuovi campionati**\n"
+            "Permette di aggiungere campionati inferiori o nuovi campionati principali/paralleli.\\n\\n"
+            "⚙️ Per la generazione random usa `/configura_gironi` e scegli nomi custom; "
+            "con i campionati reali il bot userà i nomi ufficiali automaticamente."
+        ),
+        color=discord.Color.gold()
+    )
+
+    await interaction.response.send_message(embed=embed, view=EndSeasonView(), ephemeral=True)
+
+# ===========================================================
+
 # ================= SISTEMA ISCRIZIONI FC26 =================
 
 def get_signup_request(request_id):
@@ -1044,11 +2322,30 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
     eta = discord.ui.TextInput(label="Età", placeholder="Esempio: 18", required=True, max_length=3)
     piattaforma = discord.ui.TextInput(label="Piattaforma", placeholder="PS5 / Xbox / PC", required=True, max_length=30)
     game_id = discord.ui.TextInput(label="ID PSN/Xbox/EA", placeholder="Inserisci il tuo ID", required=True, max_length=60)
+    club_preferiti = discord.ui.TextInput(
+        label="Club che vorresti",
+        placeholder="Solo modalità reale: scrivine almeno 2, es. Milan, Real Madrid",
+        required=False,
+        max_length=200
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
         if str(interaction.channel_id) != str(SIGNUP_REQUEST_CHANNEL_ID):
             await interaction.response.send_message("❌ Puoi richiedere l'iscrizione solo nel canale dedicato.", ephemeral=True)
             return
+
+        mode = get_league_mode()
+        club_preferences = str(self.club_preferiti.value or "").strip()
+
+        if mode == "squadre_reali":
+            preferred = [c.strip() for c in club_preferences.replace("\n", ",").split(",") if c.strip()]
+            if len(preferred) < 2:
+                await interaction.response.send_message(
+                    "❌ In modalità **Squadre reali** devi inserire almeno **2 club preferiti**, separati da virgola.",
+                    ephemeral=True
+                )
+                return
+            club_preferences = ", ".join(preferred)
 
         conn = connect()
         cur = conn.cursor()
@@ -1060,15 +2357,16 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
             return
 
         cur.execute("""
-            INSERT INTO signup_requests (discord_id, discord_name, real_name, age, platform, game_id, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+            INSERT INTO signup_requests (discord_id, discord_name, real_name, age, platform, game_id, club_preferences, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
         """, (
             str(interaction.user.id),
             interaction.user.display_name,
             str(self.nome.value).strip(),
             str(self.eta.value).strip(),
             str(self.piattaforma.value).strip(),
-            str(self.game_id.value).strip()
+            str(self.game_id.value).strip(),
+            club_preferences
         ))
         request_id = cur.lastrowid
         conn.commit()
@@ -1090,7 +2388,7 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
 
         embed = discord.Embed(
             title="📩 Nuova richiesta iscrizione FC26",
-            description=f"Richiesta ID: **{request_id}**",
+            description=f"Richiesta ID: **{request_id}**\nModalità attiva: **{'Squadre reali' if mode == 'squadre_reali' else 'Fantacalcio'}**",
             color=discord.Color.orange()
         )
         embed.add_field(name="Player Discord", value=interaction.user.mention, inline=False)
@@ -1098,13 +2396,14 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
         embed.add_field(name="Età", value=str(self.eta.value), inline=True)
         embed.add_field(name="Piattaforma", value=str(self.piattaforma.value), inline=True)
         embed.add_field(name="ID PSN/Xbox/EA", value=str(self.game_id.value), inline=False)
+        if mode == "squadre_reali":
+            embed.add_field(name="Club preferiti", value=club_preferences or "Non indicati", inline=False)
         embed.set_footer(text="Lo staff deve scegliere ACCETTA o RIFIUTA.")
 
         if staff_channel:
             await staff_channel.send(embed=embed, view=StaffDecisionView(request_id))
 
         await interaction.response.send_message("✅ Richiesta inviata allo staff. Ti è stato assegnato il ruolo PRE-ISCRITTO.", ephemeral=True)
-
 
 class SignupStartView(discord.ui.View):
     def __init__(self):
@@ -1145,18 +2444,53 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     previous_owner_id = club_row["previous_owner_id"] if "previous_owner_id" in club_row.keys() else None
     inherited_from = None
 
+    assigned_real_players_count = 0
     if previous_owner_id and str(previous_owner_id) != str(member.id):
         inherited_from = club_row["previous_owner_name"] or f"ID {previous_owner_id}"
         transfer_club_data_to_new_owner(cur, previous_owner_id, str(member.id), member.display_name)
     else:
-        cur.execute(
-            "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
-            (str(member.id), member.display_name, DEFAULT_BUDGET)
-        )
-        cur.execute(
-            "UPDATE managers SET name = ?, budget = ? WHERE discord_id = ?",
-            (member.display_name, DEFAULT_BUDGET, str(member.id))
-        )
+        mode = get_league_mode()
+        if mode == "squadre_reali":
+            real_players, avg_ovr, real_budget = get_team_stats(club_name)
+            if real_players:
+                cur.execute(
+                    "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
+                    (str(member.id), member.display_name, real_budget)
+                )
+                cur.execute(
+                    "UPDATE managers SET name = ?, budget = ? WHERE discord_id = ?",
+                    (member.display_name, real_budget, str(member.id))
+                )
+                cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL WHERE owner_discord_id = ?", (str(member.id),))
+                for p in real_players:
+                    cur.execute(
+                        "UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?",
+                        (str(member.id), 0, p["id"])
+                    )
+                assigned_real_players_count = len(real_players)
+                cur.execute("""
+                    INSERT OR REPLACE INTO real_team_assignments
+                    (discord_id, manager_name, team_name, avg_overall, assigned_budget)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (str(member.id), member.display_name, club_name, avg_ovr, real_budget))
+            else:
+                cur.execute(
+                    "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
+                    (str(member.id), member.display_name, DEFAULT_BUDGET)
+                )
+                cur.execute(
+                    "UPDATE managers SET name = ?, budget = ? WHERE discord_id = ?",
+                    (member.display_name, DEFAULT_BUDGET, str(member.id))
+                )
+        else:
+            cur.execute(
+                "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
+                (str(member.id), member.display_name, DEFAULT_BUDGET)
+            )
+            cur.execute(
+                "UPDATE managers SET name = ?, budget = ? WHERE discord_id = ?",
+                (member.display_name, DEFAULT_BUDGET, str(member.id))
+            )
 
     cur.execute(
         "UPDATE fc26_clubs SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP, previous_owner_id = NULL, previous_owner_name = NULL WHERE name = ?",
@@ -1198,6 +2532,8 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     dm_embed.add_field(name="Piattaforma", value=request["platform"], inline=True)
     dm_embed.add_field(name="ID PSN/Xbox/EA", value=request["game_id"], inline=False)
     dm_embed.add_field(name="Budget", value=f"{effective_budget} crediti", inline=True)
+    if assigned_real_players_count:
+        dm_embed.add_field(name="Giocatori reali assegnati", value=str(assigned_real_players_count), inline=True)
     if inherited_from:
         dm_embed.add_field(name="Squadra ereditata da", value=str(inherited_from), inline=False)
     dm_embed.add_field(name="Stato", value="Iscritto ufficiale", inline=True)
@@ -1228,6 +2564,8 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     embed.add_field(name="Campionato", value=league_name, inline=True)
     embed.add_field(name="ID PSN/Xbox/EA", value=request["game_id"], inline=True)
     embed.add_field(name="Budget", value=f"{effective_budget} crediti", inline=True)
+    if assigned_real_players_count:
+        embed.add_field(name="Giocatori reali assegnati", value=str(assigned_real_players_count), inline=True)
     if inherited_from:
         embed.add_field(name="Eredità squadra", value=f"Dati ereditati da **{inherited_from}**", inline=False)
 
@@ -1429,7 +2767,8 @@ async def setup_iscrizioni(interaction: discord.Interaction):
             "• **Età**\n"
             "• **Piattaforma**\n"
             "• **ID PSN/Xbox/EA**\n\n"
-            "Dopo l'invio, lo staff controllerà la richiesta e assegnerà un club libero."
+            "Dopo l'invio, lo staff controllerà la richiesta e assegnerà un club libero.\n"
+            "Se la modalità attiva è **Squadre reali**, dovrai indicare almeno **2 club preferiti**."
         ),
         color=discord.Color.blue()
     )
@@ -1550,6 +2889,8 @@ async def libera_club(interaction: discord.Interaction, utente: discord.Member):
 async def on_ready():
     init_db()
     ensure_extra_tables()
+    ensure_season_tables()
+    ensure_activity_tables()
     reset_auction_state()
     bot.add_view(SignupStartView())
 
@@ -1804,6 +3145,104 @@ async def registra(interaction: discord.Interaction):
 
 
 
+
+
+
+class MarketStatusView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+        opened = is_market_open()
+        self.add_item(MarketToggleButton(opened))
+
+
+class MarketToggleButton(discord.ui.Button):
+    def __init__(self, opened: bool):
+        self.opened = opened
+
+        if opened:
+            super().__init__(
+                label="Chiudi mercato",
+                style=discord.ButtonStyle.danger,
+                emoji="🔒"
+            )
+        else:
+            super().__init__(
+                label="Apri mercato",
+                style=discord.ButtonStyle.success,
+                emoji="✅"
+            )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può modificare lo stato del mercato.", ephemeral=True)
+            return
+
+        new_state = not self.opened
+        await create_backup_before_sensitive_action("cambio_stato_mercato")
+        set_market_open(new_state)
+
+        if new_state:
+            embed = discord.Embed(
+                title="✅ Mercato aperto",
+                description=(
+                    "Da ora sono abilitate:\n"
+                    "• aste giocatori\n"
+                    "• offerte tra player\n"
+                    "• controfferte"
+                ),
+                color=discord.Color.green()
+            )
+        else:
+            embed = discord.Embed(
+                title="🔒 Mercato chiuso",
+                description=(
+                    "Da ora sono bloccate:\n"
+                    "• nuove aste\n"
+                    "• nuove offerte tra player\n"
+                    "• nuove controfferte"
+                ),
+                color=discord.Color.red()
+            )
+
+        await interaction.response.edit_message(embed=embed, view=MarketStatusView())
+
+
+@tree.command(name="mercato_stato", description="Staff: mostra lo stato mercato e permette di aprirlo/chiuderlo")
+async def mercato_stato(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+
+    opened = is_market_open()
+
+    if opened:
+        embed = discord.Embed(
+            title="📊 Stato mercato",
+            description="Il mercato è attualmente: **APERTO ✅**\n\nPremi il pulsante sotto per chiuderlo.",
+            color=discord.Color.green()
+        )
+    else:
+        embed = discord.Embed(
+            title="📊 Stato mercato",
+            description="Il mercato è attualmente: **CHIUSO 🔒**\n\nPremi il pulsante sotto per aprirlo.",
+            color=discord.Color.red()
+        )
+
+    await interaction.response.send_message(embed=embed, view=MarketStatusView(), ephemeral=True)
+
+
+@tree.command(name="stato_mercato", description="Mostra se il mercato è aperto o chiuso")
+async def stato_mercato(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="📊 Stato mercato",
+        description=f"Il mercato è: **{market_status_label()}**",
+        color=discord.Color.green() if is_market_open() else discord.Color.red()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+
 @tree.command(name="budget", description="Mostra il tuo budget residuo")
 async def budget(interaction: discord.Interaction):
     if not is_spam_channel(interaction):
@@ -1962,6 +3401,10 @@ async def card(interaction: discord.Interaction, player_id: str):
 async def asta(interaction: discord.Interaction, player_id: str):
     if AUCTION_CHANNEL_ID and str(interaction.channel_id) != str(AUCTION_CHANNEL_ID):
         await interaction.response.send_message("❌ Puoi avviare le aste solo nel canale aste.", delete_after=10)
+        return
+
+    if not is_market_open():
+        await interaction.response.send_message("🔒 Il mercato è chiuso. Lo staff deve aprirlo per avviare nuove aste.", ephemeral=True)
         return
 
     await interaction.response.defer()
@@ -3430,6 +4873,8 @@ async def reset_modalita(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
 
+    await create_backup_before_sensitive_action("reset_modalita")
+
     conn = connect()
     cur = conn.cursor()
     cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL")
@@ -3617,6 +5062,62 @@ def calculate_group_standings(championship_id, group_id):
     return sorted(table.values(), key=lambda x: (x["pts"], x["gd"], x["gf"]), reverse=True)
 
 
+def get_member_club_league(discord_id):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT name, league FROM fc26_clubs WHERE assigned_to = ?", (str(discord_id),))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return row["name"], row["league"] or "Altri Campionati"
+    return None, "Senza campionato"
+
+
+def sort_members_by_real_league(members):
+    buckets = {}
+    for member in members:
+        club_name, league_name = get_member_club_league(member.id)
+        buckets.setdefault(league_name or "Senza campionato", []).append(member)
+    ordered = []
+    for league_name in sorted(buckets.keys()):
+        random.shuffle(buckets[league_name])
+        ordered.extend(buckets[league_name])
+    return ordered
+
+
+def generate_single_elimination_pairs(players):
+    players = list(players)
+    random.shuffle(players)
+    pairs = []
+    while len(players) >= 2:
+        pairs.append((players.pop(0), players.pop(0)))
+    if players:
+        pairs.append((players.pop(0), (None, "BYE")))
+    return pairs
+
+
+def create_national_cups_for_groups(cur, championship_id, groups):
+    created = 0
+    for group_id, players in groups.items():
+        cur.execute("SELECT name FROM championship_groups WHERE id = ?", (group_id,))
+        g = cur.fetchone()
+        group_name = g["name"] if g else f"Girone {group_id}"
+        cup_name = f"Coppa Nazionale {group_name}"
+        cur.execute("""
+            INSERT INTO national_cups (championship_id, group_id, name, status)
+            VALUES (?, ?, ?, 'active')
+        """, (championship_id, group_id, cup_name))
+        cup_id = cur.lastrowid
+        for home, away in generate_single_elimination_pairs(players):
+            cur.execute("""
+                INSERT INTO national_cup_matches
+                (cup_id, round_number, home_id, away_id, home_name, away_name)
+                VALUES (?, 1, ?, ?, ?, ?)
+            """, (cup_id, home[0], away[0], home[1], away[1]))
+        created += 1
+    return created
+
+
 class CreaCampionatoModal(discord.ui.Modal, title="Crea campionato"):
     nome = discord.ui.TextInput(
         label="Nome campionato",
@@ -3642,6 +5143,10 @@ class CreaCampionatoModal(discord.ui.Modal, title="Crea campionato"):
         required=True,
         max_length=2
     )
+
+    def __init__(self, grouping_mode="random"):
+        super().__init__()
+        self.grouping_mode = grouping_mode
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_league_admin(interaction):
@@ -3671,7 +5176,10 @@ class CreaCampionatoModal(discord.ui.Modal, title="Crea campionato"):
             return
 
         members = [m for m in role.members if not m.bot]
-        random.shuffle(members)
+        if self.grouping_mode == "real_league" and get_league_mode() == "squadre_reali":
+            members = sort_members_by_real_league(members)
+        else:
+            random.shuffle(members)
 
         total_needed = group_count * teams_per_group
         selected = members[:total_needed]
@@ -3710,7 +5218,6 @@ class CreaCampionatoModal(discord.ui.Modal, title="Crea campionato"):
                     VALUES (?, ?, ?, ?)
                 """, (championship_id, group_id, str(member.id), member.display_name))
 
-        # Generate fixtures
         for group_id, players in groups.items():
             rounds = generate_round_robin(players)
             for round_idx, pairs in enumerate(rounds, start=1):
@@ -3724,21 +5231,46 @@ class CreaCampionatoModal(discord.ui.Modal, title="Crea campionato"):
                         home[0], away[0], home[1], away[1]
                     ))
 
+        cups_created = create_national_cups_for_groups(cur, championship_id, groups)
         conn.commit()
         conn.close()
 
+        mode_label = "Per campionato reale" if self.grouping_mode == "real_league" else "Random"
         embed = discord.Embed(
             title="🏆 Campionato creato",
             description=f"**{self.nome.value}** creato con calendario andata/ritorno.",
             color=discord.Color.gold()
         )
+        embed.add_field(name="Modalità gironi", value=mode_label, inline=True)
         embed.add_field(name="Gironi", value=str(group_count), inline=True)
         embed.add_field(name="Squadre per girone", value=str(teams_per_group), inline=True)
         embed.add_field(name="Iscritti usati", value=str(len(selected)), inline=True)
+        embed.add_field(name="Coppe nazionali create", value=str(cups_created), inline=True)
         embed.add_field(name="Nomi gironi", value=", ".join(group_names), inline=False)
+        embed.set_footer(text="Per creare Champions/Europa/Conference usa /genera_coppe_europee.")
 
         await interaction.response.send_message(embed=embed)
 
+
+class ChampionshipGroupingSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Random", value="random", emoji="🎲", description="Gironi casuali"),
+            discord.SelectOption(label="In base al campionato reale", value="real_league", emoji="🏆", description="Raggruppa usando il campionato del club assegnato"),
+        ]
+        super().__init__(placeholder="Scegli come generare i gironi...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_league_admin(interaction):
+            await interaction.response.send_message("❌ Solo gli admin possono creare il campionato.", ephemeral=True)
+            return
+        await interaction.response.send_modal(CreaCampionatoModal(self.values[0]))
+
+
+class ChampionshipGroupingView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(ChampionshipGroupingSelect())
 
 @tree.command(name="crea_campionato", description="Admin: crea gironi e calendario automatico")
 async def crea_campionato(interaction: discord.Interaction):
@@ -3746,7 +5278,15 @@ async def crea_campionato(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Solo gli admin possono creare il campionato.", ephemeral=True)
         return
 
-    await interaction.response.send_modal(CreaCampionatoModal())
+    if get_league_mode() == "squadre_reali":
+        embed = discord.Embed(
+            title="🏆 Creazione campionato",
+            description="Modalità **Squadre reali** attiva. Scegli se creare i gironi random o in base al campionato reale del club assegnato.",
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, view=ChampionshipGroupingView(), ephemeral=True)
+    else:
+        await interaction.response.send_modal(CreaCampionatoModal("random"))
 
 
 @tree.command(name="reset_campionato", description="Admin: archivia il campionato attivo")
@@ -3756,6 +5296,8 @@ async def reset_campionato(interaction: discord.Interaction):
         return
 
     await interaction.response.defer(ephemeral=True)
+
+    await create_backup_before_sensitive_action("generazione_campionato")
 
     conn = connect()
     cur = conn.cursor()
