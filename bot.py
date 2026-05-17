@@ -3335,6 +3335,173 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
         pass
 
 
+
+class SignupStaffView(discord.ui.View):
+    def __init__(self, request_id: int):
+        super().__init__(timeout=None)
+        self.request_id = int(request_id)
+
+    async def _get_request(self):
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT *
+            FROM signup_requests
+            WHERE id = %s
+            LIMIT 1
+        """, (self.request_id,))
+        row = cur.fetchone()
+        conn.close()
+        return row
+
+    async def _set_status(self, status: str, interaction: discord.Interaction):
+        conn = connect()
+        cur = conn.cursor()
+
+        # Compatibilità colonne Supabase
+        for sql in [
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_by TEXT",
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_at TIMESTAMP",
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'"
+        ]:
+            try:
+                cur.execute(sql)
+            except Exception:
+                pass
+
+        cur.execute("""
+            UPDATE signup_requests
+            SET status = %s,
+                handled_by = %s,
+                handled_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """, (status, str(interaction.user.id), self.request_id))
+
+        conn.commit()
+        conn.close()
+
+    @discord.ui.button(label="Accetta", style=discord.ButtonStyle.success, custom_id="signup_staff_accept")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        if not can_manage_signup(interaction.user):
+            await interaction.followup.send("❌ Non hai i permessi per gestire questa iscrizione.", ephemeral=True)
+            return
+
+        req = await self._get_request()
+        if not req:
+            await interaction.followup.send("❌ Richiesta non trovata.", ephemeral=True)
+            return
+
+        if str(req.get("status", "pending")) != "pending":
+            await interaction.followup.send("⚠️ Questa richiesta è già stata gestita.", ephemeral=True)
+            return
+
+        await self._set_status("accepted", interaction)
+
+        discord_id = str(req.get("discord_id"))
+        member = None
+        try:
+            member = await get_member_safe(interaction.guild, discord_id)
+        except Exception:
+            member = None
+
+        if member:
+            try:
+                pending_role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
+                registered_role = interaction.guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
+                if pending_role:
+                    await member.remove_roles(pending_role)
+                if registered_role:
+                    await member.add_roles(registered_role)
+            except Exception as e:
+                print(f"[SIGNUP STAFF] Errore ruoli accetta: {e}")
+
+        embed = discord.Embed(
+            title="✅ Iscrizione accettata",
+            description=f"Richiesta **#{self.request_id}** accettata da {interaction.user.mention}.",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Player", value=f"<@{discord_id}>", inline=False)
+        embed.add_field(name="Nome", value=str(req.get("real_name") or "-"), inline=True)
+        embed.add_field(name="Piattaforma", value=str(req.get("platform") or "-"), inline=True)
+        embed.add_field(name="ID PSN/Xbox/EA", value=str(req.get("game_id") or req.get("ea_id") or "-"), inline=False)
+
+        try:
+            await interaction.message.edit(embed=embed, view=None)
+        except Exception:
+            pass
+
+        try:
+            accept_channel = interaction.guild.get_channel(int(SIGNUP_ACCEPT_CHANNEL_ID))
+            if accept_channel:
+                await accept_channel.send(embed=embed)
+        except Exception:
+            pass
+
+        await interaction.followup.send("✅ Richiesta accettata.", ephemeral=True)
+
+    @discord.ui.button(label="Rifiuta", style=discord.ButtonStyle.danger, custom_id="signup_staff_reject")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        if not can_manage_signup(interaction.user):
+            await interaction.followup.send("❌ Non hai i permessi per gestire questa iscrizione.", ephemeral=True)
+            return
+
+        req = await self._get_request()
+        if not req:
+            await interaction.followup.send("❌ Richiesta non trovata.", ephemeral=True)
+            return
+
+        if str(req.get("status", "pending")) != "pending":
+            await interaction.followup.send("⚠️ Questa richiesta è già stata gestita.", ephemeral=True)
+            return
+
+        await self._set_status("rejected", interaction)
+
+        discord_id = str(req.get("discord_id"))
+
+        try:
+            member = await get_member_safe(interaction.guild, discord_id)
+            if member:
+                pending_role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
+                if pending_role:
+                    await member.remove_roles(pending_role)
+        except Exception as e:
+            print(f"[SIGNUP STAFF] Errore ruoli rifiuta: {e}")
+
+        embed = discord.Embed(
+            title="❌ Iscrizione rifiutata",
+            description=f"Richiesta **#{self.request_id}** rifiutata da {interaction.user.mention}.",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="Player", value=f"<@{discord_id}>", inline=False)
+        embed.add_field(name="Nome", value=str(req.get("real_name") or "-"), inline=True)
+        embed.add_field(name="Piattaforma", value=str(req.get("platform") or "-"), inline=True)
+        embed.add_field(name="ID PSN/Xbox/EA", value=str(req.get("game_id") or req.get("ea_id") or "-"), inline=False)
+
+        try:
+            await interaction.message.edit(embed=embed, view=None)
+        except Exception:
+            pass
+
+        try:
+            reject_channel = interaction.guild.get_channel(int(SIGNUP_REJECT_CHANNEL_ID))
+            if reject_channel:
+                await reject_channel.send(embed=embed)
+        except Exception:
+            pass
+
+        await interaction.followup.send("❌ Richiesta rifiutata.", ephemeral=True)
+
+
 class StaffDecisionSelect(discord.ui.Select):
     def __init__(self, request_id):
         self.request_id = int(request_id)
