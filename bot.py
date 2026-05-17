@@ -6883,4 +6883,140 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
 
 # ================================================================
 
+
+# ================= COMANDO PLAYER: MIA SQUADRA =================
+
+@tree.command(name="mia_squadra", description="Mostra la tua squadra, budget e rosa")
+async def mia_squadra(interaction: discord.Interaction):
+    if str(interaction.channel_id) != str(ROSE_CHANNEL_ID):
+        await interaction.response.send_message(
+            f"❌ Puoi usare questo comando solo nel canale <#{ROSE_CHANNEL_ID}>.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM managers WHERE discord_id = ?", (str(interaction.user.id),))
+    manager = cur.fetchone()
+
+    if not manager:
+        conn.close()
+        await interaction.followup.send(
+            "❌ Non risulti ancora registrato come manager.",
+            ephemeral=True
+        )
+        return
+
+    # Club assegnato
+    club_name = "N/D"
+    league_name = "N/D"
+
+    try:
+        cur.execute("""
+            SELECT name, league
+            FROM fc26_clubs
+            WHERE assigned_to = ?
+            LIMIT 1
+        """, (str(interaction.user.id),))
+        club = cur.fetchone()
+        if club:
+            club_name = club["name"]
+            league_name = club["league"] or "N/D"
+    except Exception:
+        pass
+
+    # Rosa
+    cur.execute("""
+        SELECT name, team, position, overall, sold_price
+        FROM players
+        WHERE owner_discord_id = ?
+        ORDER BY 
+            CASE 
+                WHEN position IN ('GK', 'POR') THEN 1
+                WHEN position IN ('CB','LB','RB','LWB','RWB','DC','TS','TD') THEN 2
+                WHEN position IN ('CDM','CM','CAM','LM','RM','MCO','CDC','CC') THEN 3
+                ELSE 4
+            END,
+            overall DESC
+    """, (str(interaction.user.id),))
+    players = cur.fetchall()
+
+    conn.close()
+
+    budget = manager["budget"] if "budget" in manager.keys() else 0
+
+    avg_ovr = 0
+    if players:
+        avg_ovr = sum(safe_int(p["overall"]) for p in players) / len(players)
+
+    embed = discord.Embed(
+        title=f"🏟️ La tua squadra — {club_name}",
+        description=f"Manager: {interaction.user.mention}",
+        color=discord.Color.blue()
+    )
+
+    embed.add_field(name="Club", value=club_name, inline=True)
+    embed.add_field(name="Campionato", value=league_name, inline=True)
+    embed.add_field(name="Budget", value=f"{budget} crediti", inline=True)
+    embed.add_field(name="Giocatori in rosa", value=str(len(players)), inline=True)
+    embed.add_field(name="OVR medio", value=f"{avg_ovr:.1f}" if players else "N/D", inline=True)
+
+    if not players:
+        embed.add_field(
+            name="Rosa",
+            value="Nessun giocatore assegnato.",
+            inline=False
+        )
+    else:
+        lines = []
+        for p in players[:25]:
+            lines.append(
+                f"• **{p['name']}** — {p['position']} — OVR {p['overall']}"
+            )
+
+        embed.add_field(
+            name="Rosa",
+            value="\n".join(lines),
+            inline=False
+        )
+
+        if len(players) > 25:
+            embed.set_footer(text=f"Mostrati 25 giocatori su {len(players)} totali.")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="mio_budget", description="Mostra rapidamente il tuo budget")
+async def mio_budget(interaction: discord.Interaction):
+    if str(interaction.channel_id) != str(ROSE_CHANNEL_ID):
+        await interaction.response.send_message(
+            f"❌ Puoi usare questo comando solo nel canale <#{ROSE_CHANNEL_ID}>.",
+            ephemeral=True
+        )
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (str(interaction.user.id),))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        await interaction.response.send_message(
+            "❌ Non risulti ancora registrato come manager.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"💰 Il tuo budget attuale è: **{row['budget']} crediti**.",
+        ephemeral=True
+    )
+
+# ===============================================================
+
 bot.run(TOKEN)
