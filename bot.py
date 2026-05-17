@@ -1485,6 +1485,26 @@ def can_use_normal_staff(member):
     return is_owner_staff_member(member) or is_limited_staff_member(member)
 
 
+def can_manage_signup(member):
+    """Permessi gestione iscrizioni."""
+    try:
+        if can_use_normal_staff(member):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if getattr(member.guild_permissions, "administrator", False):
+            return True
+    except Exception:
+        pass
+
+    try:
+        return any(str(role.id) in SIGNUP_STAFF_ROLE_IDS for role in getattr(member, "roles", []))
+    except Exception:
+        return False
+
+
 async def send_staff_log(guild, title, description, *, user=None, color=None):
     try:
         channel = None
@@ -2361,29 +2381,42 @@ def ensure_season_tables():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS seasons (
         id SERIAL PRIMARY KEY,
+        season_name TEXT,
         name TEXT,
         status TEXT DEFAULT 'active',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        closed_at TIMESTAMP
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS league_hierarchy (
-        id SERIAL PRIMARY KEY,
-        league_name TEXT NOT NULL,
-        parent_league TEXT,
-        hierarchy_type TEXT DEFAULT 'top',
-        season_id INTEGER,
+        active BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
-    cur.execute("""
-        INSERT INTO seasons (name, status)
-        SELECT 'Stagione 1', 'active'
-        WHERE NOT EXISTS (SELECT 1 FROM seasons WHERE status = 'active')
-    """)
+    try:
+        cur.execute("ALTER TABLE seasons ADD COLUMN IF NOT EXISTS name TEXT")
+    except Exception:
+        pass
+
+    try:
+        cur.execute("ALTER TABLE seasons ADD COLUMN IF NOT EXISTS season_name TEXT")
+    except Exception:
+        pass
+
+    try:
+        cur.execute("ALTER TABLE seasons ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'")
+    except Exception:
+        pass
+
+    try:
+        cur.execute("ALTER TABLE seasons ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE")
+    except Exception:
+        pass
+
+    try:
+        cur.execute("""
+            UPDATE seasons
+            SET name = COALESCE(name, season_name)
+            WHERE name IS NULL
+        """)
+    except Exception:
+        pass
 
     conn.commit()
     conn.close()
@@ -2418,7 +2451,7 @@ def create_next_season():
     cur.execute("SELECT MAX(id) AS max_id FROM seasons")
     row = cur.fetchone()
     next_num = safe_int(row["max_id"], 0) + 1
-    cur.execute("INSERT INTO seasons (name, status) VALUES (%s, 'active')", (f"Stagione {next_num}",))
+    cur.execute("INSERT INTO seasons (name, season_name, status, active) VALUES (%s, %s, 'active', TRUE)", (f"Stagione {next_num}", f"Stagione {next_num}"))
     season_id = cur.lastrowid
     conn.commit()
     conn.close()
@@ -3998,7 +4031,7 @@ async def asta(interaction: discord.Interaction, player_id: str):
         FROM auctions a
         JOIN players p ON p.id = a.player_id
         WHERE a.id = %s
-    """, (auction_id,))
+    """, (auction_id, auction_id))
     auction_row = cur.fetchone()
     conn.close()
 
