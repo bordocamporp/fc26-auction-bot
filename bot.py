@@ -6510,4 +6510,160 @@ async def ripubblica_richieste(interaction: discord.Interaction):
 
 # ===============================================================
 
+
+# ================= FORZA ASSEGNAZIONE SQUADRA REALE =================
+
+@tree.command(name="forza_squadra_reale", description="Staff: assegna/ricorregge rosa reale e budget a un player già iscritto")
+@app_commands.describe(utente="Player già iscritto", squadra="Nome squadra reale da assegnare, es. Inter")
+async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.Member, squadra: str):
+    if not can_use_normal_staff(interaction.user):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    club_name = str(squadra).strip()
+
+    # Controlla rosa reale nel database
+    players, avg_ovr, budget = get_team_stats(club_name)
+
+    if not players:
+        await interaction.followup.send(
+            f"❌ Non ho trovato giocatori liberi per **{club_name}** nel database.\n"
+            f"Usa `/diagnostica_squadra {club_name}` per vedere il nome corretto della squadra nel database.",
+            ephemeral=True
+        )
+        return
+
+    real_team_name = players[0]["team"]
+
+    conn = connect()
+    cur = conn.cursor()
+
+    # Libera eventuali giocatori attuali del player, così non resta con doppia rosa.
+    cur.execute("""
+        UPDATE players
+        SET owner_discord_id = NULL, sold_price = NULL
+        WHERE owner_discord_id = ?
+    """, (str(utente.id),))
+
+    # Assegna tutti i giocatori reali trovati
+    for p in players:
+        cur.execute("""
+            UPDATE players
+            SET owner_discord_id = ?, sold_price = ?
+            WHERE id = ?
+        """, (str(utente.id), 0, p["id"]))
+
+    # Aggiorna/crea manager con budget corretto
+    cur.execute("""
+        INSERT OR IGNORE INTO managers (discord_id, name, budget)
+        VALUES (?, ?, ?)
+    """, (str(utente.id), utente.display_name, budget))
+
+    cur.execute("""
+        UPDATE managers
+        SET name = ?, budget = ?
+        WHERE discord_id = ?
+    """, (utente.display_name, budget, str(utente.id)))
+
+    # Aggiorna club assegnato, se presente nella tabella club
+    try:
+        cur.execute("""
+            UPDATE fc26_clubs
+            SET assigned_to = NULL
+            WHERE assigned_to = ?
+        """, (str(utente.id),))
+
+        cur.execute("""
+            UPDATE fc26_clubs
+            SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP
+            WHERE LOWER(name) = LOWER(?)
+        """, (str(utente.id), real_team_name))
+
+        if cur.rowcount == 0:
+            cur.execute("""
+                UPDATE fc26_clubs
+                SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP
+                WHERE LOWER(name) = LOWER(?)
+            """, (str(utente.id), club_name))
+    except Exception:
+        pass
+
+    # Aggiorna real_team_assignments
+    cur.execute("""
+        INSERT OR REPLACE INTO real_team_assignments
+        (discord_id, manager_name, team_name, avg_overall, assigned_budget)
+        VALUES (?, ?, ?, ?, ?)
+    """, (str(utente.id), utente.display_name, real_team_name, avg_ovr, budget))
+
+    # Aggiorna ultima richiesta accettata se esiste
+    try:
+        cur.execute("""
+            UPDATE signup_requests
+            SET club_name = ?
+            WHERE discord_id = ? AND status = 'accepted'
+        """, (real_team_name, str(utente.id)))
+    except Exception:
+        pass
+
+    conn.commit()
+    conn.close()
+
+    # Ruoli
+    registered_role = interaction.guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
+    pending_role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
+
+    if registered_role:
+        try:
+            await utente.add_roles(registered_role, reason="Squadra reale assegnata manualmente")
+        except Exception:
+            pass
+
+    if pending_role:
+        try:
+            await utente.remove_roles(pending_role, reason="Squadra reale assegnata manualmente")
+        except Exception:
+            pass
+
+    embed = discord.Embed(
+        title="✅ Squadra reale assegnata",
+        description=f"{utente.mention} ora gestisce **{real_team_name}**.",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Giocatori assegnati", value=str(len(players)), inline=True)
+    embed.add_field(name="OVR medio", value=f"{avg_ovr:.1f}", inline=True)
+    embed.add_field(name="Budget corretto", value=f"{budget} crediti", inline=True)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    try:
+        await utente.send(
+            f"✅ La tua squadra reale è stata aggiornata.\n\n"
+            f"🏟️ Club: **{real_team_name}**\n"
+            f"👥 Giocatori assegnati: **{len(players)}**\n"
+            f"💰 Budget: **{budget} crediti**"
+        )
+    except Exception:
+        pass
+
+    try:
+        await send_staff_log(
+            interaction.guild,
+            "✅ Squadra reale forzata/aggiornata",
+            (
+                f"Player: {utente.mention}\n"
+                f"Club: **{real_team_name}**\n"
+                f"Giocatori assegnati: **{len(players)}**\n"
+                f"OVR medio: **{avg_ovr:.1f}**\n"
+                f"Budget: **{budget} crediti**"
+            ),
+            user=interaction.user,
+            color=discord.Color.green()
+        )
+    except Exception:
+        pass
+
+# ================================================================
+
 bot.run(TOKEN)
