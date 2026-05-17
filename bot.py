@@ -364,10 +364,8 @@ def normalize_text(value):
 
 
 def is_admin(interaction: discord.Interaction):
-    if ADMIN_ROLE_ID:
-        return any(str(role.id) == str(ADMIN_ROLE_ID) for role in getattr(interaction.user, "roles", []))
-
-    return bool(interaction.user.guild_permissions.administrator)
+    # Operazioni staff normali: ruolo owner staff + ruolo staff limitato.
+    return can_use_normal_staff(interaction.user)
 
 
 def is_search_channel(interaction: discord.Interaction):
@@ -1252,6 +1250,133 @@ class AuctionView(discord.ui.View):
 
 
 
+
+# ================= PERMESSI STAFF / LOG / CONFERME =================
+
+OWNER_STAFF_ROLE_ID = "1498341567105339492"      # Può fare tutto
+LIMITED_STAFF_ROLE_ID = "1505151387015581757"    # Staff limitato
+STAFF_LOG_CHANNEL_ID = 1498345679511355582
+
+DANGEROUS_ACTIONS = {
+    "reset",
+    "backup",
+    "restore",
+    "fine_stagione",
+    "inizio_stagione",
+    "nuova_stagione",
+    "reset_modalita",
+    "reset_competizione"
+}
+
+
+def has_role_id(member, role_id: str):
+    return any(str(role.id) == str(role_id) for role in getattr(member, "roles", []))
+
+
+def is_owner_staff_member(member):
+    return has_role_id(member, OWNER_STAFF_ROLE_ID) or getattr(member.guild_permissions, "administrator", False)
+
+
+def is_limited_staff_member(member):
+    return has_role_id(member, LIMITED_STAFF_ROLE_ID)
+
+
+def can_use_dangerous_commands(member):
+    # Solo ruolo 1498341567105339492 o Administrator Discord
+    return is_owner_staff_member(member)
+
+
+def can_use_staff_panel(member):
+    # Staff panel SOLO ruolo 1498341567105339492 o Administrator Discord
+    return is_owner_staff_member(member)
+
+
+def can_use_normal_staff(member):
+    # Entrambi i ruoli possono fare operazioni normali
+    return is_owner_staff_member(member) or is_limited_staff_member(member)
+
+
+async def send_staff_log(guild, title, description, *, user=None, color=None):
+    try:
+        channel = None
+        if guild:
+            channel = guild.get_channel(int(STAFF_LOG_CHANNEL_ID))
+        if not channel:
+            channel = await bot.fetch_channel(int(STAFF_LOG_CHANNEL_ID))
+
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=color or discord.Color.blue()
+        )
+        if user:
+            embed.add_field(name="Eseguito da", value=f"{user.mention} (`{user.id}`)", inline=False)
+        embed.set_footer(text="FC26 Staff Log")
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"[STAFF LOG] Errore invio log: {e}")
+
+
+class ConfirmDangerView(discord.ui.View):
+    def __init__(self, action_name, callback_func, *, timeout=180):
+        super().__init__(timeout=timeout)
+        self.action_name = action_name
+        self.callback_func = callback_func
+
+    @discord.ui.button(label="Conferma", style=discord.ButtonStyle.danger, emoji="⚠️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not can_use_dangerous_commands(interaction.user):
+            await interaction.response.send_message("❌ Non hai i permessi per confermare questa azione.", ephemeral=True)
+            return
+
+        await self.callback_func(interaction)
+
+    @discord.ui.button(label="Annulla", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="❌ Azione annullata",
+            description=f"L'azione **{self.action_name}** è stata annullata.",
+            color=discord.Color.dark_grey()
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+        await send_staff_log(
+            interaction.guild,
+            "♻️ Backup ripristinato dallo staff",
+            f"Backup ripristinato: `{selected.name}`\nDatabase: `{db_path}`",
+            user=interaction.user,
+            color=discord.Color.orange()
+        )
+        await send_staff_log(
+            interaction.guild,
+            "❌ Azione annullata",
+            f"Azione annullata: **{self.action_name}**",
+            user=interaction.user,
+            color=discord.Color.dark_grey()
+        )
+
+
+async def ask_danger_confirmation(interaction, action_name, description, callback_func):
+    if not can_use_dangerous_commands(interaction.user):
+        await interaction.response.send_message(
+            "❌ Non hai i permessi per usare questa azione critica.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"⚠️ Conferma richiesta: {action_name}",
+        description=description + "\n\nPremi **Conferma** per procedere oppure **Annulla**.",
+        color=discord.Color.orange()
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=ConfirmDangerView(action_name, callback_func),
+        ephemeral=True
+    )
+
+# ===========================================================
+
 # ================= SISTEMA BACKUP DATABASE =================
 
 BACKUP_DIR = Path("backups")
@@ -1325,32 +1450,52 @@ async def create_backup_before_sensitive_action(reason):
         return False
 
 
-@tree.command(name="backup_now", description="Staff: crea subito un backup del database")
+@tree.command(name="backup_now", description="Owner staff: crea subito un backup del database")
 async def backup_now(interaction: discord.Interaction):
-    if not is_admin(interaction):
-        await interaction.response.send_message("❌ Solo lo staff può creare backup.", ephemeral=True)
-        return
+    async def do_backup(confirm_interaction: discord.Interaction):
+        path, error = create_database_backup("manuale")
 
-    path, error = create_database_backup("manuale")
+        if error:
+            await confirm_interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="❌ Backup non creato",
+                    description=str(error),
+                    color=discord.Color.red()
+                ),
+                view=None
+            )
+            return
 
-    if error:
-        await interaction.response.send_message(f"❌ Backup non creato: {error}", ephemeral=True)
-        return
+        embed = discord.Embed(
+            title="✅ Backup creato correttamente",
+            description=f"`{path}`",
+            color=discord.Color.green()
+        )
+        await confirm_interaction.response.edit_message(embed=embed, view=None)
 
-    await interaction.response.send_message(
-        f"✅ Backup creato correttamente:\n`{path}`",
-        ephemeral=True
-    )
+        await send_backup_notification(
+            f"🛠️ Backup manuale creato da {confirm_interaction.user.mention}.\n```{path}```"
+        )
+        await send_staff_log(
+            confirm_interaction.guild,
+            "💾 Backup manuale creato",
+            f"Percorso backup:\n`{path}`",
+            user=confirm_interaction.user,
+            color=discord.Color.green()
+        )
 
-    await send_backup_notification(
-        f"🛠️ Backup manuale creato da {interaction.user.mention}.\n```{path}```"
+    await ask_danger_confirmation(
+        interaction,
+        "Backup manuale",
+        "Stai per creare un backup manuale del database.",
+        do_backup
     )
 
 
 @tree.command(name="backup_list", description="Staff: mostra gli ultimi backup disponibili")
 async def backup_list(interaction: discord.Interaction):
-    if not is_admin(interaction):
-        await interaction.response.send_message("❌ Solo lo staff può vedere i backup.", ephemeral=True)
+    if not can_use_dangerous_commands(interaction.user):
+        await interaction.response.send_message("❌ Solo lo staff autorizzato può vedere i backup.", ephemeral=True)
         return
 
     backups = list_database_backups()
@@ -1432,8 +1577,8 @@ class RestoreBackupView(discord.ui.View):
 
 @tree.command(name="restore_backup", description="Staff: ripristina un backup del database")
 async def restore_backup(interaction: discord.Interaction):
-    if not is_admin(interaction):
-        await interaction.response.send_message("❌ Solo lo staff può ripristinare backup.", ephemeral=True)
+    if not can_use_dangerous_commands(interaction.user):
+        await interaction.response.send_message("❌ Solo lo staff autorizzato può ripristinare backup.", ephemeral=True)
         return
 
     backups = list_database_backups()
@@ -2170,607 +2315,42 @@ class NewLeagueNameModal(discord.ui.Modal, title="Crea nuovo campionato"):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="fine_stagione", description="Staff: chiude la stagione e avvia il flusso nuova stagione")
+@tree.command(name="fine_stagione", description="Owner staff: chiude la stagione e avvia il flusso nuova stagione")
 async def fine_stagione(interaction: discord.Interaction):
-    if not is_admin(interaction):
-        await interaction.response.send_message("❌ Solo lo staff può chiudere la stagione.", ephemeral=True)
-        return
-
-    ensure_season_tables()
-    ensure_activity_tables()
-    season = get_active_season()
-
-    embed = discord.Embed(
-        title="🏁 Fine stagione",
-        description=(
-            f"Stagione attiva: **{season['name'] if season else 'N/D'}**\n\n"
-            "Scegli cosa fare:\n\n"
-            "✅ **Avvia stagione nuova**\n"
-            "Resetta calendari, classifiche e statistiche stagionali; mantiene rose, budget, club e storico.\n"
-            "Rigenera campionati, coppe nazionali e coppe europee in base ai piazzamenti.\n\n"
-            "🏗️ **Avvia stagione con nuovi campionati**\n"
-            "Permette di aggiungere campionati inferiori o nuovi campionati principali/paralleli.\\n\\n"
-            "⚙️ Per la generazione random usa `/configura_gironi` e scegli nomi custom; "
-            "con i campionati reali il bot userà i nomi ufficiali automaticamente."
-        ),
-        color=discord.Color.gold()
-    )
-
-    await interaction.response.send_message(embed=embed, view=EndSeasonView(), ephemeral=True)
-
-# ===========================================================
-
-# ================= SISTEMA ISCRIZIONI FC26 =================
-
-def get_signup_request(request_id):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM signup_requests WHERE id = ?", (int(request_id),))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def can_manage_signup(member):
-    return any(str(role.id) in SIGNUP_STAFF_ROLE_IDS for role in getattr(member, "roles", [])) or getattr(member.guild_permissions, "administrator", False)
-
-
-def get_free_signup_leagues():
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT league, COUNT(*) AS total
-        FROM fc26_clubs
-        WHERE assigned_to IS NULL
-        GROUP BY league
-        ORDER BY league ASC
-    """)
-    rows = cur.fetchall()
-    conn.close()
-    return [(r["league"] or "Senza campionato", r["total"]) for r in rows if r["total"] > 0]
-
-
-def get_free_signup_clubs(league=None):
-    conn = connect()
-    cur = conn.cursor()
-    if league:
-        cur.execute(
-            "SELECT name FROM fc26_clubs WHERE assigned_to IS NULL AND league = ? ORDER BY name ASC",
-            (str(league),)
-        )
-    else:
-        cur.execute("SELECT name FROM fc26_clubs WHERE assigned_to IS NULL ORDER BY name ASC")
-    rows = cur.fetchall()
-    conn.close()
-    return [r["name"] for r in rows]
-
-
-def get_club_row_by_name(club_name):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM fc26_clubs WHERE LOWER(name) = LOWER(?)", (str(club_name).strip(),))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def transfer_club_data_to_new_owner(cur, old_id, new_id, new_name):
-    """Trasferisce rosa, budget, partite e storico dal vecchio owner al nuovo owner."""
-    old_id = str(old_id)
-    new_id = str(new_id)
-    new_name = str(new_name)
-
-    if old_id == new_id:
-        cur.execute("UPDATE managers SET name = ? WHERE discord_id = ?", (new_name, new_id))
-        return
-
-    cur.execute("DELETE FROM managers WHERE discord_id = ?", (new_id,))
-    cur.execute("UPDATE managers SET discord_id = ?, name = ? WHERE discord_id = ?", (new_id, new_name, old_id))
-    if cur.rowcount == 0:
-        cur.execute(
-            "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
-            (new_id, new_name, DEFAULT_BUDGET)
-        )
-
-    cur.execute("UPDATE players SET owner_discord_id = ? WHERE owner_discord_id = ?", (new_id, old_id))
-    cur.execute("UPDATE championship_players SET discord_id = ?, display_name = ? WHERE discord_id = ?", (new_id, new_name, old_id))
-    cur.execute("UPDATE championship_matches SET home_id = ?, home_name = ? WHERE home_id = ?", (new_id, new_name, old_id))
-    cur.execute("UPDATE championship_matches SET away_id = ?, away_name = ? WHERE away_id = ?", (new_id, new_name, old_id))
-    cur.execute("UPDATE match_scorers SET team_owner_id = ? WHERE team_owner_id = ?", (new_id, old_id))
-    cur.execute("UPDATE transfer_history SET manager_id = ?, manager_name = ? WHERE manager_id = ?", (new_id, new_name, old_id))
-    cur.execute("UPDATE bid_history SET bidder_id = ?, bidder_name = ? WHERE bidder_id = ?", (new_id, new_name, old_id))
-    cur.execute("UPDATE trade_offers SET proposer_id = ?, proposer_name = ? WHERE proposer_id = ?", (new_id, new_name, old_id))
-    cur.execute("UPDATE trade_offers SET target_id = ?, target_name = ? WHERE target_id = ?", (new_id, new_name, old_id))
-    cur.execute("UPDATE real_team_assignments SET discord_id = ?, manager_name = ? WHERE discord_id = ?", (new_id, new_name, old_id))
-
-
-async def reset_registered_players_to_request_role(guild):
-    """Toglie ISCRITTO e assegna RICHIESTA ISCRIZIONE ai player iscritti."""
-    if not guild:
-        return 0
-
-    registered_role = guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
-    request_role = guild.get_role(int(REQUEST_ROLE_ID))
-
-    if not registered_role or not request_role:
-        return 0
-
-    updated = 0
-    seen = set()
-    members = list(getattr(registered_role, "members", []))
-
-    try:
-        async for member in guild.fetch_members(limit=None):
-            if registered_role in member.roles and member.id not in seen:
-                members.append(member)
-                seen.add(member.id)
-    except Exception:
-        pass
-
-    seen.clear()
-    for member in members:
-        if member.id in seen:
-            continue
-        seen.add(member.id)
-        try:
-            await member.remove_roles(registered_role, reason="Reset competizione/modalità FC26")
-            await member.add_roles(request_role, reason="Reset competizione/modalità FC26")
-            updated += 1
-        except Exception:
-            pass
-
-    return updated
-
-
-async def send_signup_channel_log(guild, channel_id, content=None, embed=None):
-    channel = guild.get_channel(int(channel_id)) if guild else None
-    if not channel:
-        try:
-            channel = await bot.fetch_channel(int(channel_id))
-        except Exception:
-            channel = None
-    if channel:
-        await channel.send(content=content, embed=embed)
-
-
-async def send_signup_accept_log(guild, content=None, embed=None):
-    await send_signup_channel_log(guild, SIGNUP_ACCEPT_CHANNEL_ID, content=content, embed=embed)
-
-
-async def send_signup_reject_log(guild, content=None, embed=None):
-    await send_signup_channel_log(guild, SIGNUP_REJECT_CHANNEL_ID, content=content, embed=embed)
-
-
-class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
-    nome = discord.ui.TextInput(label="Nome", placeholder="Inserisci il tuo nome", required=True, max_length=50)
-    eta = discord.ui.TextInput(label="Età", placeholder="Esempio: 18", required=True, max_length=3)
-    piattaforma = discord.ui.TextInput(label="Piattaforma", placeholder="PS5 / Xbox / PC", required=True, max_length=30)
-    game_id = discord.ui.TextInput(label="ID PSN/Xbox/EA", placeholder="Inserisci il tuo ID", required=True, max_length=60)
-    club_preferiti = discord.ui.TextInput(
-        label="Club che vorresti",
-        placeholder="Solo modalità reale: scrivine almeno 2, es. Milan, Real Madrid",
-        required=False,
-        max_length=200
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if str(interaction.channel_id) != str(SIGNUP_REQUEST_CHANNEL_ID):
-            await interaction.response.send_message("❌ Puoi richiedere l'iscrizione solo nel canale dedicato.", ephemeral=True)
-            return
-
-        mode = get_league_mode()
-        club_preferences = str(self.club_preferiti.value or "").strip()
-
-        if mode == "squadre_reali":
-            preferred = [c.strip() for c in club_preferences.replace("\n", ",").split(",") if c.strip()]
-            if len(preferred) < 2:
-                await interaction.response.send_message(
-                    "❌ In modalità **Squadre reali** devi inserire almeno **2 club preferiti**, separati da virgola.",
-                    ephemeral=True
-                )
-                return
-            club_preferences = ", ".join(preferred)
-
-        conn = connect()
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM signup_requests WHERE discord_id = ? AND status = 'pending'", (str(interaction.user.id),))
-        existing = cur.fetchone()
-        if existing:
-            conn.close()
-            await interaction.response.send_message("⚠️ Hai già una richiesta in attesa di valutazione.", ephemeral=True)
-            return
-
-        cur.execute("""
-            INSERT INTO signup_requests (discord_id, discord_name, real_name, age, platform, game_id, club_preferences, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-        """, (
-            str(interaction.user.id),
-            interaction.user.display_name,
-            str(self.nome.value).strip(),
-            str(self.eta.value).strip(),
-            str(self.piattaforma.value).strip(),
-            str(self.game_id.value).strip(),
-            club_preferences
-        ))
-        request_id = cur.lastrowid
-        conn.commit()
-        conn.close()
-
-        pending_role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID)) if interaction.guild else None
-        if pending_role:
-            try:
-                await interaction.user.add_roles(pending_role, reason="Richiesta iscrizione FC26 inviata")
-            except Exception:
-                pass
-
-        staff_channel = interaction.guild.get_channel(int(SIGNUP_STAFF_CHANNEL_ID)) if interaction.guild else None
-        if not staff_channel:
-            try:
-                staff_channel = await bot.fetch_channel(int(SIGNUP_STAFF_CHANNEL_ID))
-            except Exception:
-                staff_channel = None
+    async def show_end_panel(confirm_interaction: discord.Interaction):
+        ensure_season_tables()
+        season = get_active_season()
+        await create_backup_before_sensitive_action("fine_stagione")
 
         embed = discord.Embed(
-            title="📩 Nuova richiesta iscrizione FC26",
-            description=f"Richiesta ID: **{request_id}**\nModalità attiva: **{'Squadre reali' if mode == 'squadre_reali' else 'Fantacalcio'}**",
-            color=discord.Color.orange()
-        )
-        embed.add_field(name="Player Discord", value=interaction.user.mention, inline=False)
-        embed.add_field(name="Nome", value=str(self.nome.value), inline=True)
-        embed.add_field(name="Età", value=str(self.eta.value), inline=True)
-        embed.add_field(name="Piattaforma", value=str(self.piattaforma.value), inline=True)
-        embed.add_field(name="ID PSN/Xbox/EA", value=str(self.game_id.value), inline=False)
-        if mode == "squadre_reali":
-            embed.add_field(name="Club preferiti", value=club_preferences or "Non indicati", inline=False)
-        embed.set_footer(text="Lo staff deve scegliere ACCETTA o RIFIUTA.")
-
-        if staff_channel:
-            await staff_channel.send(embed=embed, view=StaffDecisionView(request_id))
-
-        await interaction.response.send_message("✅ Richiesta inviata allo staff. Ti è stato assegnato il ruolo PRE-ISCRITTO.", ephemeral=True)
-
-class SignupStartView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Richiedi iscrizione", style=discord.ButtonStyle.green, custom_id="fc26_signup_start")
-    async def signup_start(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(SignupModal())
-
-
-async def complete_signup_accept(interaction: discord.Interaction, request_id: int, club: str):
-    request = get_signup_request(request_id)
-    if not request or request["status"] != "pending":
-        await interaction.response.send_message("Richiesta non valida o già gestita.", ephemeral=True)
-        return
-
-    guild = interaction.guild
-    member = await get_member_safe(guild, request["discord_id"])
-    if not member:
-        await interaction.response.send_message("Player non trovato nel server.", ephemeral=True)
-        return
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT name, league, assigned_to, previous_owner_id, previous_owner_name FROM fc26_clubs WHERE LOWER(name) = LOWER(?)", (str(club).strip(),))
-    club_row = cur.fetchone()
-    if not club_row:
-        conn.close()
-        await interaction.response.send_message("❌ Club non trovato nel database.", ephemeral=True)
-        return
-    if club_row["assigned_to"]:
-        conn.close()
-        await interaction.response.send_message("❌ Questo club non è più libero. Scegli un altro club.", ephemeral=True)
-        return
-
-    club_name = club_row["name"]
-    league_name = club_row["league"] or "N/D"
-    previous_owner_id = club_row["previous_owner_id"] if "previous_owner_id" in club_row.keys() else None
-    inherited_from = None
-
-    assigned_real_players_count = 0
-    if previous_owner_id and str(previous_owner_id) != str(member.id):
-        inherited_from = club_row["previous_owner_name"] or f"ID {previous_owner_id}"
-        transfer_club_data_to_new_owner(cur, previous_owner_id, str(member.id), member.display_name)
-    else:
-        mode = get_league_mode()
-        if mode == "squadre_reali":
-            real_players, avg_ovr, real_budget = get_team_stats(club_name)
-            if real_players:
-                cur.execute(
-                    "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
-                    (str(member.id), member.display_name, real_budget)
-                )
-                cur.execute(
-                    "UPDATE managers SET name = ?, budget = ? WHERE discord_id = ?",
-                    (member.display_name, real_budget, str(member.id))
-                )
-                cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL WHERE owner_discord_id = ?", (str(member.id),))
-                for p in real_players:
-                    cur.execute(
-                        "UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?",
-                        (str(member.id), 0, p["id"])
-                    )
-                assigned_real_players_count = len(real_players)
-                cur.execute("""
-                    INSERT OR REPLACE INTO real_team_assignments
-                    (discord_id, manager_name, team_name, avg_overall, assigned_budget)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (str(member.id), member.display_name, club_name, avg_ovr, real_budget))
-            else:
-                cur.execute(
-                    "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
-                    (str(member.id), member.display_name, DEFAULT_BUDGET)
-                )
-                cur.execute(
-                    "UPDATE managers SET name = ?, budget = ? WHERE discord_id = ?",
-                    (member.display_name, DEFAULT_BUDGET, str(member.id))
-                )
-        else:
-            cur.execute(
-                "INSERT OR IGNORE INTO managers (discord_id, name, budget) VALUES (?, ?, ?)",
-                (str(member.id), member.display_name, DEFAULT_BUDGET)
-            )
-            cur.execute(
-                "UPDATE managers SET name = ?, budget = ? WHERE discord_id = ?",
-                (member.display_name, DEFAULT_BUDGET, str(member.id))
-            )
-
-    cur.execute(
-        "UPDATE fc26_clubs SET assigned_to = ?, assigned_at = CURRENT_TIMESTAMP, previous_owner_id = NULL, previous_owner_name = NULL WHERE name = ?",
-        (str(member.id), club_name)
-    )
-    cur.execute("""
-        UPDATE signup_requests
-        SET status = 'accepted', club_name = ?, handled_by = ?, handled_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-    """, (club_name, str(interaction.user.id), int(request_id)))
-
-    cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (str(member.id),))
-    budget_row = cur.fetchone()
-    effective_budget = budget_row["budget"] if budget_row else DEFAULT_BUDGET
-
-    conn.commit()
-    conn.close()
-
-    pending_role = guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
-    registered_role = guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
-    if registered_role:
-        try:
-            await member.add_roles(registered_role, reason="Iscrizione FC26 accettata")
-        except Exception:
-            pass
-    if pending_role:
-        try:
-            await member.remove_roles(pending_role, reason="Iscrizione FC26 completata")
-        except Exception:
-            pass
-
-    dm_embed = discord.Embed(
-        title="✅ Richiesta accettata!",
-        description="La tua iscrizione al torneo **FC 26 Manager Mode** è stata approvata.",
-        color=discord.Color.green()
-    )
-    dm_embed.add_field(name="Club assegnato", value=club_name, inline=True)
-    dm_embed.add_field(name="Campionato", value=league_name, inline=True)
-    dm_embed.add_field(name="Piattaforma", value=request["platform"], inline=True)
-    dm_embed.add_field(name="ID PSN/Xbox/EA", value=request["game_id"], inline=False)
-    dm_embed.add_field(name="Budget", value=f"{effective_budget} crediti", inline=True)
-    if assigned_real_players_count:
-        dm_embed.add_field(name="Giocatori reali assegnati", value=str(assigned_real_players_count), inline=True)
-    if inherited_from:
-        dm_embed.add_field(name="Squadra ereditata da", value=str(inherited_from), inline=False)
-    dm_embed.add_field(name="Stato", value="Iscritto ufficiale", inline=True)
-    dm_embed.set_footer(text="Usa il club assegnato per le partite ufficiali su FC 26.")
-    try:
-        await member.send(embed=dm_embed)
-    except Exception:
-        pass
-
-    await send_signup_accept_log(
-        guild,
-        content=(
-            f"✅ **Richiesta accettata**\n\n"
-            f"👤 Player: {member.mention}\n"
-            f"🏟️ Club assegnato: **{club_name}**\n"
-            f"🏆 Campionato: **{league_name}**\n"
-            f"🆔 ID PSN/Xbox/EA: **{request['game_id']}**"
-            + (f"\n🔁 Squadra ereditata da: **{inherited_from}**" if inherited_from else "")
-        )
-    )
-
-    embed = discord.Embed(
-        title="✅ Iscrizione completata",
-        description=f"{member.mention} è stato registrato ufficialmente.",
-        color=discord.Color.green()
-    )
-    embed.add_field(name="Club", value=club_name, inline=True)
-    embed.add_field(name="Campionato", value=league_name, inline=True)
-    embed.add_field(name="ID PSN/Xbox/EA", value=request["game_id"], inline=True)
-    embed.add_field(name="Budget", value=f"{effective_budget} crediti", inline=True)
-    if assigned_real_players_count:
-        embed.add_field(name="Giocatori reali assegnati", value=str(assigned_real_players_count), inline=True)
-    if inherited_from:
-        embed.add_field(name="Eredità squadra", value=f"Dati ereditati da **{inherited_from}**", inline=False)
-
-    # Aggiorna il messaggio staff rimuovendo la tendina dei club.
-    # Uso interaction.message.edit perché dopo DM/log/DB l'interaction può risultare già gestita
-    # o scaduta, mentre il messaggio originale resta modificabile.
-    try:
-        await interaction.message.edit(embed=embed, view=None)
-    except Exception:
-        pass
-
-    # Conferma privata allo staff che ha completato l'assegnazione.
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                f"✅ Club **{club_name}** assegnato a {member.mention}.",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                f"✅ Club **{club_name}** assegnato a {member.mention}.",
-                ephemeral=True
-            )
-    except Exception:
-        pass
-
-
-class StaffDecisionSelect(discord.ui.Select):
-    def __init__(self, request_id):
-        self.request_id = int(request_id)
-        options = [
-            discord.SelectOption(label="ACCETTA", value="accept", emoji="✅", description="Accetta e scegli campionato/club"),
-            discord.SelectOption(label="RIFIUTA", value="reject", emoji="❌", description="Rifiuta la richiesta")
-        ]
-        super().__init__(placeholder="Scegli esito richiesta...", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        if not can_manage_signup(interaction.user):
-            await interaction.response.send_message("❌ Solo lo staff può gestire le richieste.", ephemeral=True)
-            return
-
-        request = get_signup_request(self.request_id)
-        if not request:
-            await interaction.response.send_message("Richiesta non trovata.", ephemeral=True)
-            return
-        if request["status"] != "pending":
-            await interaction.response.send_message("Questa richiesta è già stata gestita.", ephemeral=True)
-            return
-
-        if self.values[0] == "reject":
-            # Rispondiamo subito a Discord per evitare "Questa interazione non è riuscita".
-            await interaction.response.defer(ephemeral=True)
-
-            guild = interaction.guild
-            member = await get_member_safe(guild, request["discord_id"])
-
-            conn = connect()
-            cur = conn.cursor()
-            cur.execute("""
-                UPDATE signup_requests
-                SET status = 'rejected', handled_by = ?, handled_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (str(interaction.user.id), self.request_id))
-            conn.commit()
-            conn.close()
-
-            if member:
-                pending_role = guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
-                if pending_role:
-                    try:
-                        await member.remove_roles(pending_role, reason="Richiesta FC26 rifiutata")
-                    except Exception:
-                        pass
-                try:
-                    await member.send("❌ **Richiesta rifiutata**\n\nLa tua richiesta per il torneo **FC 26** è stata rifiutata dallo staff.")
-                except Exception:
-                    pass
-
-            await send_signup_reject_log(
-                guild,
-                content=f"❌ **Richiesta rifiutata**\n\n👤 Player: <@{request['discord_id']}>"
-            )
-
-            embed = discord.Embed(
-                title="❌ Richiesta rifiutata",
-                description=f"Player: <@{request['discord_id']}>\nGestita da: {interaction.user.mention}",
-                color=discord.Color.red()
-            )
-
-            try:
-                await interaction.message.edit(embed=embed, view=None)
-            except Exception:
-                pass
-
-            try:
-                await interaction.followup.send("✅ Richiesta rifiutata correttamente.", ephemeral=True)
-            except Exception:
-                pass
-            return
-
-        leagues = get_free_signup_leagues()
-        if not leagues:
-            await interaction.response.send_message("❌ Non ci sono club liberi disponibili.", ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title="✅ Richiesta accettata: scegli campionato",
+            title="🏁 Fine stagione",
             description=(
-                f"Player: <@{request['discord_id']}>\n"
-                "Prima scegli il campionato, poi il bot mostrerà solo i club liberi di quel campionato."
+                f"Stagione attiva: **{season['name'] if season else 'N/D'}**\n\n"
+                "Scegli cosa fare:\n\n"
+                "✅ **Avvia stagione nuova**\n"
+                "Resetta calendari, classifiche e statistiche stagionali; mantiene rose, budget, club e storico.\n"
+                "Rigenera campionati, coppe nazionali e coppe europee in base ai piazzamenti.\n\n"
+                "🏗️ **Avvia stagione con nuovi campionati**\n"
+                "Permette di aggiungere campionati inferiori o nuovi campionati principali/paralleli."
             ),
-            color=discord.Color.green()
+            color=discord.Color.gold()
         )
-        await interaction.response.edit_message(embed=embed, view=LeagueAssignView(self.request_id, leagues))
 
-
-class StaffDecisionView(discord.ui.View):
-    def __init__(self, request_id):
-        super().__init__(timeout=None)
-        self.add_item(StaffDecisionSelect(request_id))
-
-
-class LeagueAssignSelect(discord.ui.Select):
-    def __init__(self, request_id, leagues):
-        self.request_id = int(request_id)
-        options = []
-        for league_name, free_count in leagues[:25]:
-            options.append(discord.SelectOption(
-                label=str(league_name)[:100],
-                value=str(league_name),
-                description=f"Club liberi: {free_count}"
-            ))
-        super().__init__(placeholder="Scegli il campionato...", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        if not can_manage_signup(interaction.user):
-            await interaction.response.send_message("❌ Solo lo staff può assegnare il club.", ephemeral=True)
-            return
-
-        league = self.values[0]
-        clubs = get_free_signup_clubs(league)
-        if not clubs:
-            await interaction.response.send_message("❌ Non ci sono club liberi in questo campionato.", ephemeral=True)
-            return
-
-        request = get_signup_request(self.request_id)
-        embed = discord.Embed(
-            title="🏟️ Scegli club libero",
-            description=f"Player: <@{request['discord_id']}>\nCampionato scelto: **{league}**",
-            color=discord.Color.blue()
+        await confirm_interaction.response.edit_message(embed=embed, view=EndSeasonView())
+        await send_staff_log(
+            confirm_interaction.guild,
+            "🏁 Fine stagione confermata",
+            "Lo staff ha confermato l'apertura del pannello di fine stagione.",
+            user=confirm_interaction.user,
+            color=discord.Color.gold()
         )
-        if len(clubs) > 25:
-            embed.set_footer(text="Discord mostra massimo 25 club per menu. Per gli altri usa /assegna_club @utente nome_club.")
 
-        await interaction.response.edit_message(embed=embed, view=ClubAssignView(self.request_id, clubs, league))
-
-
-class LeagueAssignView(discord.ui.View):
-    def __init__(self, request_id, leagues):
-        super().__init__(timeout=180)
-        self.add_item(LeagueAssignSelect(request_id, leagues))
-
-
-class ClubAssignSelect(discord.ui.Select):
-    def __init__(self, request_id, clubs, league=None):
-        self.request_id = int(request_id)
-        self.league = league
-        options = [discord.SelectOption(label=club[:100], value=club) for club in clubs[:25]]
-        super().__init__(placeholder="Scegli il club libero da assegnare...", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        if not can_manage_signup(interaction.user):
-            await interaction.response.send_message("❌ Solo lo staff può assegnare il club.", ephemeral=True)
-            return
-        await complete_signup_accept(interaction, self.request_id, self.values[0])
-
-
-class ClubAssignView(discord.ui.View):
-    def __init__(self, request_id, clubs, league=None):
-        super().__init__(timeout=180)
-        self.add_item(ClubAssignSelect(request_id, clubs, league))
+    await ask_danger_confirmation(
+        interaction,
+        "Fine stagione",
+        "Stai per chiudere la stagione e aprire il pannello di nuova stagione.",
+        show_end_panel
+    )
 
 @tree.command(name="setup_iscrizioni", description="Staff: pubblica il pannello richiesta iscrizione FC26")
 async def setup_iscrizioni(interaction: discord.Interaction):
@@ -3230,6 +2810,13 @@ class MarketToggleButton(discord.ui.Button):
             )
 
         await interaction.response.edit_message(embed=embed, view=MarketStatusView())
+        await send_staff_log(
+            interaction.guild,
+            "📈 Stato mercato modificato",
+            "Mercato impostato su: **APERTO**" if new_state else "Mercato impostato su: **CHIUSO**",
+            user=interaction.user,
+            color=discord.Color.green() if new_state else discord.Color.red()
+        )
 
 
 @tree.command(name="mercato_stato", description="Staff: mostra lo stato mercato e permette di aprirlo/chiuderlo")
@@ -3300,6 +2887,13 @@ async def reset_budget(interaction: discord.Interaction, importo: int = DEFAULT_
     conn.close()
 
     await interaction.response.send_message(f"✅ Budget resettato a **{importo}** crediti per tutti.")
+    await send_staff_log(
+        interaction.guild,
+        "💰 Budget resettato dallo staff",
+        f"Nuovo budget: **{importo}** crediti per tutti.",
+        user=interaction.user,
+        color=discord.Color.orange()
+    )
 
 
 @tree.command(name="reset_asta", description="Admin: chiude tutte le aste aperte")
@@ -3315,6 +2909,13 @@ async def reset_asta(interaction: discord.Interaction):
     conn.close()
 
     await interaction.response.send_message("✅ Aste aperte resettate.")
+    await send_staff_log(
+        interaction.guild,
+        "🔨 Aste resettate dallo staff",
+        "Tutte le aste aperte sono state chiuse.",
+        user=interaction.user,
+        color=discord.Color.orange()
+    )
 
 
 @tree.command(name="database", description="Mostra statistiche del database giocatori")
@@ -4889,36 +4490,62 @@ async def squadre_assegnate(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="reset_modalita", description="Admin: resetta modalità, rose e squadre assegnate")
+@tree.command(name="reset_modalita", description="Owner staff: resetta modalità, rose e squadre assegnate")
 async def reset_modalita(interaction: discord.Interaction):
-    if not is_admin(interaction):
-        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
-        return
+    async def do_reset(confirm_interaction: discord.Interaction):
+        await create_backup_before_sensitive_action("reset_modalita")
 
-    await interaction.response.defer(ephemeral=True)
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL")
+        cur.execute("UPDATE managers SET budget = ?", (DEFAULT_BUDGET,))
+        cur.execute("DELETE FROM real_team_assignments")
+        cur.execute("UPDATE auctions SET status = 'closed' WHERE status = 'open'")
+        try:
+            cur.execute("UPDATE fc26_clubs SET assigned_to = NULL, assigned_at = NULL")
+        except Exception:
+            pass
+        conn.commit()
+        conn.close()
 
-    await create_backup_before_sensitive_action("reset_modalita")
+        # Ruoli reset: rimuove ISCRITTO, assegna RICHIESTA ISCRIZIONE
+        changed = 0
+        guild = confirm_interaction.guild
+        registered_role = guild.get_role(int(LEAGUE_PLAYER_ROLE_ID)) if guild else None
+        request_role = guild.get_role(int(REQUEST_ROLE_ID)) if guild else None
+        if registered_role:
+            for member in list(registered_role.members):
+                try:
+                    await member.remove_roles(registered_role, reason="Reset modalità FC26")
+                    if request_role:
+                        await member.add_roles(request_role, reason="Reset modalità FC26")
+                    changed += 1
+                except Exception:
+                    pass
 
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL")
-    cur.execute("UPDATE managers SET budget = ?", (DEFAULT_BUDGET,))
-    cur.execute("DELETE FROM real_team_assignments")
-    cur.execute("UPDATE auctions SET status = 'closed' WHERE status = 'open'")
-    cur.execute("UPDATE fc26_clubs SET assigned_to = NULL, assigned_at = NULL, previous_owner_id = NULL, previous_owner_name = NULL")
-    cur.execute("UPDATE signup_requests SET status = 'reset' WHERE status IN ('pending', 'accepted', 'released')")
-    conn.commit()
-    conn.close()
+        embed = discord.Embed(
+            title="✅ Reset modalità completato",
+            description=(
+                "Rose svuotate, budget ripristinato, squadre assegnate cancellate.\n"
+                f"Ruoli aggiornati per **{changed}** player."
+            ),
+            color=discord.Color.green()
+        )
+        await confirm_interaction.response.edit_message(embed=embed, view=None)
+        await send_staff_log(
+            confirm_interaction.guild,
+            "⚠️ Reset modalità eseguito",
+            f"Reset modalità completato. Ruoli aggiornati: **{changed}**.",
+            user=confirm_interaction.user,
+            color=discord.Color.red()
+        )
 
-    updated_roles = await reset_registered_players_to_request_role(interaction.guild)
-
-    await interaction.followup.send(
-        f"✅ Reset completato: rose svuotate, budget ripristinato, squadre assegnate cancellate.\n"
-        f"🔁 Ruoli aggiornati: **{updated_roles}** player hanno perso ISCRITTO e ricevuto RICHIESTA ISCRIZIONE.",
-        ephemeral=True
+    await ask_danger_confirmation(
+        interaction,
+        "Reset modalità",
+        "Questa azione resetta rose, budget, assegnazioni squadre e aggiorna i ruoli dei player.",
+        do_reset
     )
-
-
 
 @tree.command(name="dashboard_admin", description="Admin dashboard completa del bot")
 async def dashboard_admin(interaction: discord.Interaction):
@@ -6070,4 +5697,84 @@ async def sostituisci_player(interaction: discord.Interaction):
 if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN mancante nel file .env")
-    bot.run(TOKEN)
+    
+# ================= STAFF PANEL =================
+
+class StaffPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="Stato mercato", style=discord.ButtonStyle.primary, emoji="📈")
+    async def market(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not can_use_staff_panel(interaction.user):
+            await interaction.response.send_message("❌ Non hai accesso allo staff panel.", ephemeral=True)
+            return
+        opened = is_market_open()
+        embed = discord.Embed(
+            title="📊 Stato mercato",
+            description=f"Il mercato è: **{'APERTO ✅' if opened else 'CHIUSO 🔒'}**",
+            color=discord.Color.green() if opened else discord.Color.red()
+        )
+        await interaction.response.send_message(embed=embed, view=MarketStatusView(), ephemeral=True)
+
+    @discord.ui.button(label="Backup", style=discord.ButtonStyle.secondary, emoji="💾")
+    async def backup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not can_use_staff_panel(interaction.user):
+            await interaction.response.send_message("❌ Non hai accesso allo staff panel.", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title="💾 Backup",
+            description="Usa `/backup_now`, `/backup_list` o `/restore_backup`.\nLe azioni critiche richiedono conferma.",
+            color=discord.Color.blue()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Fine stagione", style=discord.ButtonStyle.danger, emoji="🏁")
+    async def season(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not can_use_staff_panel(interaction.user):
+            await interaction.response.send_message("❌ Non hai accesso allo staff panel.", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title="🏁 Fine stagione",
+            description="Usa `/fine_stagione` per avviare il flusso protetto con conferma.",
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Inattivi", style=discord.ButtonStyle.secondary, emoji="⚠️")
+    async def inactive(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not can_use_staff_panel(interaction.user):
+            await interaction.response.send_message("❌ Non hai accesso allo staff panel.", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title="⚠️ Sistema inattività",
+            description="Il bot controlla automaticamente ogni 22 ore e invia segnalazioni nel canale configurato.",
+            color=discord.Color.orange()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="staff_panel", description="Owner staff: pannello centrale gestione bot")
+async def staff_panel(interaction: discord.Interaction):
+    if not can_use_staff_panel(interaction.user):
+        await interaction.response.send_message("❌ Solo il ruolo autorizzato può usare lo staff panel.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🛠️ FC26 Staff Panel",
+        description=(
+            "Pannello rapido per la gestione della lega.\n\n"
+            "Accesso riservato al ruolo owner staff."
+        ),
+        color=discord.Color.red()
+    )
+    embed.add_field(name="Mercato", value="Apri/chiudi mercato", inline=True)
+    embed.add_field(name="Backup", value="Backup e restore protetti", inline=True)
+    embed.add_field(name="Stagioni", value="Fine/nuova stagione", inline=True)
+    embed.add_field(name="Inattivi", value="Controlli automatici", inline=True)
+
+    await interaction.response.send_message(embed=embed, view=StaffPanelView(), ephemeral=True)
+
+# ===========================================================
+
+bot.run(TOKEN)
