@@ -267,6 +267,22 @@ async def publish_manager_change_news_if_important(guild, club_name, old_manager
 
 
 
+
+
+async def send_backup_notification(message: str):
+    try:
+        channel = bot.get_channel(BACKUP_NOTIFICATION_CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(
+                title="💾 Backup database",
+                description=message,
+                color=discord.Color.green()
+            )
+            await channel.send(embed=embed)
+    except Exception as e:
+        print(f"[BACKUP] Errore invio notifica backup: {e}")
+
+
 async def automatic_daily_backup_loop():
     await bot.wait_until_ready()
 
@@ -276,6 +292,9 @@ async def automatic_daily_backup_loop():
 
             if path:
                 print(f"[BACKUP] Backup automatico creato: {path}")
+                await send_backup_notification(
+                    f"✅ Backup automatico creato correttamente.\n```{path}```"
+                )
             else:
                 print(f"[BACKUP] Errore backup automatico: {error}")
 
@@ -1238,6 +1257,7 @@ class AuctionView(discord.ui.View):
 BACKUP_DIR = Path("backups")
 BACKUP_DIR.mkdir(exist_ok=True)
 MAX_BACKUPS_TO_KEEP = 5
+BACKUP_NOTIFICATION_CHANNEL_ID = 1498345679511355582
 
 # Se il tuo db.py usa un nome diverso, modifica qui.
 DATABASE_CANDIDATES = [
@@ -1320,6 +1340,10 @@ async def backup_now(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"✅ Backup creato correttamente:\n`{path}`",
         ephemeral=True
+    )
+
+    await send_backup_notification(
+        f"🛠️ Backup manuale creato da {interaction.user.mention}.\n```{path}```"
     )
 
 
