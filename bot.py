@@ -3499,11 +3499,28 @@ class SignupStartView(discord.ui.View):
     )
     async def signup_start(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
+            # IMPORTANTISSIMO:
+            # non fare defer() prima di send_modal()
+            # altrimenti Discord dice:
+            # "Interaction has already been acknowledged"
             await interaction.response.send_modal(SignupModal())
+
         except Exception as e:
             print(f"[SIGNUP BUTTON] Errore apertura modal: {e}")
-            if not interaction.response.is_done():
-                await interaction.response.send_message(f"❌ Errore apertura modulo: `{e}`", ephemeral=True)
+
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        f"❌ Errore apertura modulo: `{e}`",
+                        ephemeral=True
+                    )
+                else:
+                    await interaction.response.send_message(
+                        f"❌ Errore apertura modulo: `{e}`",
+                        ephemeral=True
+                    )
+            except Exception:
+                pass
 
 
 @bot.event
