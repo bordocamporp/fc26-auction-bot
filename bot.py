@@ -3336,6 +3336,263 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
 
 
 
+
+class SignupLeagueSelect(discord.ui.Select):
+    def __init__(self, request_id: int):
+        self.request_id = int(request_id)
+
+        options = []
+        conn = connect()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT league, COUNT(*) AS free_count
+                FROM fc26_clubs
+                WHERE assigned_to IS NULL OR assigned_to = ''
+                GROUP BY league
+                ORDER BY league ASC
+            """)
+            rows = cur.fetchall()
+        except Exception as e:
+            print(f"[SIGNUP LEAGUE SELECT] Errore caricamento campionati: {e}")
+            rows = []
+        conn.close()
+
+        for row in rows:
+            league_name = row.get("league") or "Altri"
+            free_count = row.get("free_count") or 0
+            options.append(discord.SelectOption(
+                label=str(league_name)[:100],
+                value=str(league_name)[:100],
+                description=f"{free_count} squadre libere"
+            ))
+
+        if not options:
+            options.append(discord.SelectOption(
+                label="Nessuna squadra libera",
+                value="__none__",
+                description="Non ci sono club disponibili"
+            ))
+
+        super().__init__(
+            placeholder="Scegli il campionato...",
+            min_values=1,
+            max_values=1,
+            options=options[:25]
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        if not can_manage_signup(interaction.user):
+            await interaction.followup.send("❌ Non hai i permessi.", ephemeral=True)
+            return
+
+        league = self.values[0]
+        if league == "__none__":
+            await interaction.followup.send("❌ Nessuna squadra libera disponibile.", ephemeral=True)
+            return
+
+        await interaction.followup.send(
+            f"Campionato selezionato: **{league}**\nOra scegli la squadra libera:",
+            view=SignupClubSelectView(self.request_id, league),
+            ephemeral=True
+        )
+
+
+class SignupLeagueSelectView(discord.ui.View):
+    def __init__(self, request_id: int):
+        super().__init__(timeout=180)
+        self.add_item(SignupLeagueSelect(request_id))
+
+
+class SignupClubSelect(discord.ui.Select):
+    def __init__(self, request_id: int, league: str):
+        self.request_id = int(request_id)
+        self.league = str(league)
+
+        options = []
+        conn = connect()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT name
+                FROM fc26_clubs
+                WHERE league = %s
+                  AND (assigned_to IS NULL OR assigned_to = '')
+                ORDER BY name ASC
+            """, (self.league,))
+            rows = cur.fetchall()
+        except Exception as e:
+            print(f"[SIGNUP CLUB SELECT] Errore caricamento club: {e}")
+            rows = []
+        conn.close()
+
+        for row in rows:
+            club_name = row.get("name")
+            if club_name:
+                options.append(discord.SelectOption(
+                    label=str(club_name)[:100],
+                    value=str(club_name)[:100],
+                    description=f"{self.league}"
+                ))
+
+        if not options:
+            options.append(discord.SelectOption(
+                label="Nessuna squadra libera",
+                value="__none__",
+                description="Tutte le squadre sono occupate"
+            ))
+
+        super().__init__(
+            placeholder="Scegli la squadra libera...",
+            min_values=1,
+            max_values=1,
+            options=options[:25]
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        if not can_manage_signup(interaction.user):
+            await interaction.followup.send("❌ Non hai i permessi.", ephemeral=True)
+            return
+
+        club_name = self.values[0]
+        if club_name == "__none__":
+            await interaction.followup.send("❌ Nessuna squadra libera in questo campionato.", ephemeral=True)
+            return
+
+        conn = connect()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT *
+            FROM signup_requests
+            WHERE id = %s
+            LIMIT 1
+        """, (self.request_id,))
+        req = cur.fetchone()
+
+        if not req:
+            conn.close()
+            await interaction.followup.send("❌ Richiesta non trovata.", ephemeral=True)
+            return
+
+        if str(req.get("status", "pending")) not in {"pending", "choosing_club"}:
+            conn.close()
+            await interaction.followup.send("⚠️ Questa richiesta è già stata gestita.", ephemeral=True)
+            return
+
+        discord_id = str(req.get("discord_id"))
+
+        cur.execute("""
+            SELECT assigned_to
+            FROM fc26_clubs
+            WHERE LOWER(name) = LOWER(%s)
+            LIMIT 1
+        """, (club_name,))
+        club_row = cur.fetchone()
+
+        if not club_row:
+            conn.close()
+            await interaction.followup.send("❌ Club non trovato.", ephemeral=True)
+            return
+
+        if club_row.get("assigned_to"):
+            conn.close()
+            await interaction.followup.send("❌ Questa squadra è già stata assegnata.", ephemeral=True)
+            return
+
+        # Aggiorna richiesta e club
+        cur.execute("""
+            UPDATE signup_requests
+            SET status = 'accepted',
+                club_name = %s,
+                handled_by = %s,
+                handled_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """, (club_name, str(interaction.user.id), self.request_id))
+
+        cur.execute("""
+            UPDATE fc26_clubs
+            SET assigned_to = %s,
+                assigned_at = CURRENT_TIMESTAMP
+            WHERE LOWER(name) = LOWER(%s)
+        """, (discord_id, club_name))
+
+        conn.commit()
+        conn.close()
+
+        # Sync rosa reale + budget
+        players_count, avg_ovr, budget, real_team_name = sync_real_team_roster_to_manager(discord_id, club_name)
+
+        # Ruoli
+        try:
+            member = await get_member_safe(interaction.guild, discord_id)
+            if member:
+                pending_role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
+                registered_role = interaction.guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
+                if pending_role:
+                    await member.remove_roles(pending_role)
+                if registered_role:
+                    await member.add_roles(registered_role)
+        except Exception as e:
+            print(f"[SIGNUP CLUB SELECT] Errore ruoli: {e}")
+
+        embed = discord.Embed(
+            title="✅ Iscrizione completata",
+            description=f"<@{discord_id}> è stato registrato ufficialmente.",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Club", value=club_name, inline=True)
+        embed.add_field(name="Campionato", value=self.league, inline=True)
+        embed.add_field(name="Budget", value=f"{budget} crediti", inline=True)
+        embed.add_field(name="Giocatori assegnati", value=str(players_count), inline=True)
+        embed.add_field(name="OVR medio", value=f"{avg_ovr:.1f}" if avg_ovr else "N/D", inline=True)
+        embed.add_field(name="Gestito da", value=interaction.user.mention, inline=False)
+
+        try:
+            await interaction.message.edit(embed=embed, view=None)
+        except Exception:
+            pass
+
+        try:
+            accept_channel = interaction.guild.get_channel(int(SIGNUP_ACCEPT_CHANNEL_ID))
+            if accept_channel:
+                await accept_channel.send(embed=embed)
+        except Exception:
+            pass
+
+        try:
+            await send_staff_log(
+                interaction.guild,
+                "✅ Iscrizione accettata con squadra reale",
+                f"Richiesta #{self.request_id}\nPlayer: <@{discord_id}>\nClub: **{club_name}**\nBudget: **{budget}**\nGiocatori: **{players_count}**",
+                user=interaction.user,
+                color=discord.Color.green()
+            )
+        except Exception:
+            pass
+
+        await interaction.followup.send(
+            f"✅ Iscrizione accettata e squadra **{club_name}** assegnata.",
+            ephemeral=True
+        )
+
+
+class SignupClubSelectView(discord.ui.View):
+    def __init__(self, request_id: int, league: str):
+        super().__init__(timeout=180)
+        self.add_item(SignupClubSelect(request_id, league))
+
+
 class SignupStaffView(discord.ui.View):
     def __init__(self, request_id: int):
         super().__init__(timeout=None)
@@ -3358,11 +3615,12 @@ class SignupStaffView(discord.ui.View):
         conn = connect()
         cur = conn.cursor()
 
-        # Compatibilità colonne Supabase
         for sql in [
             "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_by TEXT",
             "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_at TIMESTAMP",
-            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'"
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_name TEXT",
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'",
+            "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP"
         ]:
             try:
                 cur.execute(sql)
@@ -3400,6 +3658,32 @@ class SignupStaffView(discord.ui.View):
             await interaction.followup.send("⚠️ Questa richiesta è già stata gestita.", ephemeral=True)
             return
 
+        mode = get_league_mode()
+
+        if mode == "squadre_reali":
+            # Non accetta subito: apre scelta campionato/squadra libera.
+            conn = connect()
+            cur = conn.cursor()
+            try:
+                cur.execute("""
+                    UPDATE signup_requests
+                    SET status = 'choosing_club',
+                        handled_by = %s
+                    WHERE id = %s
+                """, (str(interaction.user.id), self.request_id))
+                conn.commit()
+            except Exception as e:
+                print(f"[SIGNUP STAFF] Errore status choosing_club: {e}")
+            conn.close()
+
+            await interaction.followup.send(
+                "Modalità **Squadre reali** attiva.\nScegli prima il campionato:",
+                view=SignupLeagueSelectView(self.request_id),
+                ephemeral=True
+            )
+            return
+
+        # Modalità fantacalcio / altre: accetta senza squadra reale.
         await self._set_status("accepted", interaction)
 
         discord_id = str(req.get("discord_id"))
@@ -3460,7 +3744,7 @@ class SignupStaffView(discord.ui.View):
             await interaction.followup.send("❌ Richiesta non trovata.", ephemeral=True)
             return
 
-        if str(req.get("status", "pending")) != "pending":
+        if str(req.get("status", "pending")) not in {"pending", "choosing_club"}:
             await interaction.followup.send("⚠️ Questa richiesta è già stata gestita.", ephemeral=True)
             return
 
