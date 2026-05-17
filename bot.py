@@ -5698,6 +5698,73 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN mancante nel file .env")
     
+
+# ================= LOG AUTOMATICO COMANDI STAFF =================
+
+async def log_every_staff_slash_command(interaction: discord.Interaction):
+    """
+    Logga automaticamente OGNI slash command usato dallo staff
+    nel canale LOG 1498345679511355582.
+    """
+    try:
+        if not interaction.guild:
+            return
+
+        if not getattr(interaction, "command", None):
+            return
+
+        user = interaction.user
+
+        # Logga solo utenti con ruoli staff configurati.
+        if not can_use_normal_staff(user):
+            return
+
+        command_name = interaction.command.qualified_name if interaction.command else "comando_sconosciuto"
+
+        # Evita loop/rumore eccessivo per comandi puramente informativi se vuoi:
+        # al momento logghiamo TUTTO come richiesto.
+
+        options_text = "Nessun parametro rilevato"
+        try:
+            data = getattr(interaction, "data", {}) or {}
+            options = data.get("options", [])
+            if options:
+                parts = []
+                for opt in options:
+                    name = opt.get("name", "parametro")
+                    value = opt.get("value", "")
+                    parts.append(f"`{name}` = `{value}`")
+                options_text = "\n".join(parts)
+        except Exception:
+            pass
+
+        channel_text = f"<#{interaction.channel_id}>" if interaction.channel_id else "Canale non rilevato"
+
+        await send_staff_log(
+            interaction.guild,
+            "🧾 Comando staff eseguito",
+            (
+                f"👤 Staff: {user.mention} (`{user.id}`)\n"
+                f"💬 Comando: `/{command_name}`\n"
+                f"📍 Canale: {channel_text}\n\n"
+                f"**Parametri:**\n{options_text}"
+            ),
+            user=user,
+            color=discord.Color.blurple()
+        )
+
+    except Exception as e:
+        print(f"[STAFF COMMAND LOG] Errore log comando staff: {e}")
+
+
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    # Log automatico di tutti i comandi slash staff.
+    if interaction.type == discord.InteractionType.application_command:
+        await log_every_staff_slash_command(interaction)
+
+# =================================================================
+
 # ================= STAFF PANEL =================
 
 class StaffPanelView(discord.ui.View):
