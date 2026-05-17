@@ -2987,20 +2987,22 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
             return
 
         try:
-            real_name = str(self.real_name.value).strip()
-            age = str(self.age.value).strip()
-            platform = str(self.platform.value).strip()
-            game_id = str(self.game_id.value).strip()
+            # Compatibilità con i nomi reali dei campi del modal:
+            # nome / eta / piattaforma / game_id / club_preferiti
+            real_name = str(getattr(self, "nome").value).strip()
+            age = str(getattr(self, "eta").value).strip()
+            platform = str(getattr(self, "piattaforma").value).strip()
+            game_id = str(getattr(self, "game_id").value).strip()
 
             try:
-                club_preferences = str(self.club_preferences.value).strip()
+                club_preferences = str(getattr(self, "club_preferiti").value).strip()
             except Exception:
                 club_preferences = ""
 
             conn = connect()
             cur = conn.cursor()
 
-            # Sicurezza schema: aggiunge colonne mancanti se il DB Supabase era stato creato prima.
+            # Sicurezza schema Supabase
             for sql in [
                 "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS discord_name TEXT",
                 "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS real_name TEXT",
@@ -3021,7 +3023,6 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
                 except Exception:
                     pass
 
-            # Blocca doppia richiesta pending
             cur.execute(
                 "SELECT id FROM signup_requests WHERE discord_id = %s AND status = 'pending' LIMIT 1",
                 (str(interaction.user.id),)
@@ -3030,13 +3031,9 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
 
             if existing:
                 conn.close()
-                await interaction.followup.send(
-                    "⚠️ Hai già una richiesta in attesa di valutazione.",
-                    ephemeral=True
-                )
+                await interaction.followup.send("⚠️ Hai già una richiesta in attesa di valutazione.", ephemeral=True)
                 return
 
-            # Blocca utenti già accettati
             cur.execute(
                 "SELECT id FROM signup_requests WHERE discord_id = %s AND status = 'accepted' LIMIT 1",
                 (str(interaction.user.id),)
@@ -3051,7 +3048,6 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
                 )
                 return
 
-            # Salva richiesta
             cur.execute("""
                 INSERT INTO signup_requests
                 (discord_id, discord_name, real_name, age, platform, game_id,
@@ -3083,7 +3079,6 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
 
             conn.close()
 
-            # Ruolo pending
             try:
                 role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
                 if role:
@@ -3091,7 +3086,6 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
             except Exception as e:
                 print(f"[SIGNUP MODAL] Errore ruolo pending: {e}")
 
-            # Invio canale staff
             try:
                 staff_channel = interaction.guild.get_channel(int(SIGNUP_STAFF_CHANNEL_ID))
                 if not staff_channel:
@@ -3126,10 +3120,7 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
         except Exception as e:
             print(f"[SIGNUP MODAL] Errore submit: {e}")
             try:
-                await interaction.followup.send(
-                    f"❌ Errore invio richiesta: `{e}`",
-                    ephemeral=True
-                )
+                await interaction.followup.send(f"❌ Errore invio richiesta: `{e}`", ephemeral=True)
             except Exception:
                 pass
 
