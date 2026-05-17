@@ -2782,38 +2782,67 @@ async def fine_stagione(interaction: discord.Interaction):
 
 @tree.command(name="setup_iscrizioni", description="Staff: pubblica il pannello richiesta iscrizione FC26")
 async def setup_iscrizioni(interaction: discord.Interaction):
-    if not can_manage_signup(interaction.user):
-        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+    # Risposta immediata: deve essere la PRIMA cosa possibile.
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception as e:
+        print(f"[SETUP ISCRIZIONI] Defer fallito: {e}")
         return
-
-    # Risponde subito a Discord per evitare "Applicazione non ha risposto".
-    await interaction.response.defer(ephemeral=True)
-
-    channel = interaction.guild.get_channel(int(SIGNUP_REQUEST_CHANNEL_ID)) if interaction.guild else None
-    if not channel:
-        await interaction.followup.send("Canale richiesta iscrizione non trovato.", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title="📋 Richiesta iscrizione torneo FC 26",
-        description=(
-            "Premi il pulsante qui sotto e compila:\n\n"
-            "• **Nome**\n"
-            "• **Età**\n"
-            "• **Piattaforma**\n"
-            "• **ID PSN/Xbox/EA**\n\n"
-            "Dopo l'invio, lo staff controllerà la richiesta e assegnerà un club libero.\n"
-            "Se la modalità attiva è **Squadre reali**, dovrai indicare almeno **2 club preferiti**."
-        ),
-        color=discord.Color.blue()
-    )
 
     try:
+        if not can_manage_signup(interaction.user):
+            await interaction.followup.send("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+            return
+
+        channel = None
+        if interaction.guild:
+            channel = interaction.guild.get_channel(int(SIGNUP_REQUEST_CHANNEL_ID))
+
+        if not channel:
+            try:
+                channel = await bot.fetch_channel(int(SIGNUP_REQUEST_CHANNEL_ID))
+            except Exception:
+                channel = None
+
+        if not channel:
+            await interaction.followup.send("❌ Canale richiesta iscrizione non trovato.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="📋 Richiesta iscrizione torneo FC 26",
+            description=(
+                "Premi il pulsante qui sotto e compila:\n\n"
+                "• **Nome**\n"
+                "• **Età**\n"
+                "• **Piattaforma**\n"
+                "• **ID PSN/Xbox/EA**\n\n"
+                "Dopo l'invio, lo staff controllerà la richiesta e assegnerà un club libero.\n"
+                "Se la modalità attiva è **Squadre reali**, dovrai indicare almeno **2 club preferiti**."
+            ),
+            color=discord.Color.blue()
+        )
+
         await channel.send(embed=embed, view=SignupStartView())
         await interaction.followup.send("✅ Pannello iscrizioni pubblicato.", ephemeral=True)
+
+        try:
+            await send_staff_log(
+                interaction.guild,
+                "📋 Pannello iscrizioni pubblicato",
+                f"Canale: <#{SIGNUP_REQUEST_CHANNEL_ID}>",
+                user=interaction.user,
+                color=discord.Color.blue()
+            )
+        except Exception as e:
+            print(f"[SETUP ISCRIZIONI] Errore log staff: {e}")
+
     except Exception as e:
-        await interaction.followup.send(f"❌ Errore pubblicazione pannello iscrizioni: `{e}`", ephemeral=True)
         print(f"[SETUP ISCRIZIONI] Errore: {e}")
+        try:
+            await interaction.followup.send(f"❌ Errore setup iscrizioni: `{e}`", ephemeral=True)
+        except Exception:
+            pass
+
 
 @tree.command(name="assegna_club", description="Staff: assegna manualmente un club a una richiesta/utente")
 @app_commands.describe(utente="Player da accettare", club="Nome del club da assegnare")
