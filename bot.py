@@ -3885,60 +3885,6 @@ async def database(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="cerca", description="Cerca un giocatore FC26")
-@app_commands.describe(nome="Nome o parte del nome")
-async def cerca(interaction: discord.Interaction, nome: str):
-    if not is_search_channel(interaction):
-        await interaction.response.send_message(
-            "❌ Puoi cercare i giocatori solo nel canale dedicato alla ricerca.",
-            ephemeral=True
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    search = normalize_text(nome)
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM players ORDER BY overall DESC")
-    rows = cur.fetchall()
-    conn.close()
-
-    results = []
-    for r in rows:
-        haystack = " ".join([
-            normalize_text(r["name"]),
-            normalize_text(r["team"]),
-            normalize_text(r["position"]),
-            normalize_text(r["nation"]),
-            normalize_text(r["league"])
-        ])
-        if search in haystack:
-            results.append(r)
-            if len(results) >= 10:
-                break
-
-    if not results:
-        await interaction.followup.send("Nessun giocatore trovato.", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title=f"🔎 Risultati ricerca: {nome}",
-        description="Usa l'ID del giocatore per avviare l'asta o vedere la card.",
-        color=discord.Color.blue()
-    )
-
-    for r in results:
-        stato = "🟢 libero" if not r["owner_discord_id"] else f"🔴 assegnato {r['sold_price']} cr"
-        embed.add_field(
-            name=f"{r['name']} • ID {r['id']}",
-            value=f"{r['position']} • {r['team']} • OVR **{r['overall']}** • {stato}",
-            inline=False
-        )
-
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
 
 @tree.command(name="card", description="Mostra la card grafica di un giocatore")
 @app_commands.describe(player_id="ID giocatore")
@@ -7640,5 +7586,139 @@ class TradeOfferResponseView(discord.ui.View):
         await interaction.response.send_modal(CounterOfferModal(self.offer_id))
 
 # =========================================================================
+
+
+# ================= RICERCA GIOCATORI: NOME O CLUB =================
+
+@tree.command(name="cerca", description="Cerca giocatori per nome oppure per club")
+@app_commands.describe(
+    tipo="Scegli se cercare per nome giocatore o per club",
+    testo="Scrivi il nome del giocatore o del club"
+)
+@app_commands.choices(tipo=[
+    app_commands.Choice(name="Nome giocatore", value="player"),
+    app_commands.Choice(name="Nome club", value="club"),
+])
+async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str], testo: str):
+    if not is_search_channel(interaction):
+        await interaction.response.send_message(
+            f"❌ Puoi usare questo comando solo nel canale <#{SEARCH_CHANNEL_ID}>.",
+            ephemeral=True
+        )
+        return
+
+    query = normalize_text(testo).strip()
+
+    if len(query) < 2:
+        await interaction.response.send_message(
+            "❌ Scrivi almeno 2 caratteri per la ricerca.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    conn = connect()
+    cur = conn.cursor()
+
+    if tipo.value == "player":
+        cur.execute("""
+            SELECT *
+            FROM players
+            WHERE LOWER(name) LIKE ?
+            ORDER BY overall DESC
+            LIMIT 10
+        """, (f"%{testo.lower()}%",))
+        rows = cur.fetchall()
+
+        conn.close()
+
+        if not rows:
+            await interaction.followup.send("❌ Nessun giocatore trovato con quel nome.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="Risultati ricerca giocatore",
+            description=f"Ricerca: **{testo}**",
+            color=discord.Color.blue()
+        )
+
+        for p in rows:
+            owner = p["owner_discord_id"]
+            status = f"Assegnato a <@{owner}>" if owner else "Libero"
+            embed.add_field(
+                name=f"{p['name']} — OVR {p['overall']}",
+                value=(
+                    f"Club: **{p['team']}**\n"
+                    f"Ruolo: **{p['position']}**\n"
+                    f"Stato: **{status}**\n"
+                    f"ID: `{p['id']}`"
+                ),
+                inline=False
+            )
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    # Ricerca per club
+    cur.execute("""
+        SELECT *
+        FROM players
+        ORDER BY overall DESC
+    """)
+    all_players = cur.fetchall()
+    conn.close()
+
+    matched = [
+        p for p in all_players
+        if query in normalize_text(p["team"])
+    ]
+
+    if not matched:
+        await interaction.followup.send(
+            "❌ Nessun giocatore trovato per questo club. Prova con un nome diverso, esempio `Arsenal`, `Inter`, `Real Madrid`.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="Risultati ricerca club",
+        description=f"Club cercato: **{testo}**\nGiocatori trovati: **{len(matched)}**",
+        color=discord.Color.green()
+    )
+
+    for p in matched[:25]:
+        owner = p["owner_discord_id"]
+        status = f"Assegnato a <@{owner}>" if owner else "Libero"
+        embed.add_field(
+            name=f"{p['name']} — OVR {p['overall']}",
+            value=(
+                f"Club: **{p['team']}**\n"
+                f"Ruolo: **{p['position']}**\n"
+                f"Stato: **{status}**\n"
+                f"ID: `{p['id']}`"
+            ),
+            inline=False
+        )
+
+    if len(matched) > 25:
+        embed.set_footer(text=f"Mostrati 25 giocatori su {len(matched)} trovati.")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="cerc", description="Alias rapido: cerca giocatori per nome oppure club")
+@app_commands.describe(
+    tipo="Scegli se cercare per nome giocatore o per club",
+    testo="Scrivi il nome del giocatore o del club"
+)
+@app_commands.choices(tipo=[
+    app_commands.Choice(name="Nome giocatore", value="player"),
+    app_commands.Choice(name="Nome club", value="club"),
+])
+async def cerc(interaction: discord.Interaction, tipo: app_commands.Choice[str], testo: str):
+    await cerca.callback(interaction, tipo, testo)
+
+# ===========================================================
 
 bot.run(TOKEN)
