@@ -2491,6 +2491,7 @@ async def libera_club(interaction: discord.Interaction, utente: discord.Member):
 
 
 
+
 class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
     nome = discord.ui.TextInput(label="Nome", placeholder="Inserisci il tuo nome", required=True, max_length=50)
     eta = discord.ui.TextInput(label="Età", placeholder="Esempio: 18", required=True, max_length=3)
@@ -2498,8 +2499,94 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
     game_id = discord.ui.TextInput(label="ID PSN/Xbox/EA", placeholder="Inserisci il tuo ID", required=True, max_length=60)
 
     async def on_submit(self, interaction: discord.Interaction):
+        if str(interaction.channel_id) != str(SIGNUP_REQUEST_CHANNEL_ID):
+            await interaction.response.send_message("❌ Puoi richiedere l'iscrizione solo nel canale dedicato.", ephemeral=True)
+            return
+
+        mode = get_league_mode() if "get_league_mode" in globals() else "fantacalcio"
+
+        conn = connect()
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT id FROM signup_requests WHERE discord_id = ? AND status = 'pending'",
+            (str(interaction.user.id),)
+        )
+        existing = cur.fetchone()
+
+        if existing:
+            conn.close()
+            await interaction.response.send_message("⚠️ Hai già una richiesta in attesa di valutazione.", ephemeral=True)
+            return
+
+        cur.execute("""
+            INSERT INTO signup_requests
+            (discord_id, discord_name, real_name, age, platform, game_id, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+        """, (
+            str(interaction.user.id),
+            interaction.user.display_name,
+            str(self.nome.value).strip(),
+            str(self.eta.value).strip(),
+            str(self.piattaforma.value).strip(),
+            str(self.game_id.value).strip()
+        ))
+
+        request_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+        # Assegna ruolo PRE-ISCRITTO / richiesta
+        pending_role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID)) if interaction.guild else None
+        if pending_role:
+            try:
+                await interaction.user.add_roles(pending_role, reason="Richiesta iscrizione FC26 inviata")
+            except Exception:
+                pass
+
+        # Canale staff richieste
+        staff_channel = interaction.guild.get_channel(int(SIGNUP_STAFF_CHANNEL_ID)) if interaction.guild else None
+        if not staff_channel:
+            try:
+                staff_channel = await bot.fetch_channel(int(SIGNUP_STAFF_CHANNEL_ID))
+            except Exception:
+                staff_channel = None
+
+        embed = discord.Embed(
+            title="📩 Nuova richiesta iscrizione FC26",
+            description=f"Richiesta ID: **{request_id}**",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Player Discord", value=interaction.user.mention, inline=False)
+        embed.add_field(name="Nome", value=str(self.nome.value), inline=True)
+        embed.add_field(name="Età", value=str(self.eta.value), inline=True)
+        embed.add_field(name="Piattaforma", value=str(self.piattaforma.value), inline=True)
+        embed.add_field(name="ID PSN/Xbox/EA", value=str(self.game_id.value), inline=False)
+        embed.add_field(name="Modalità attiva", value=str(mode), inline=True)
+        embed.set_footer(text="Lo staff deve scegliere ACCETTA o RIFIUTA.")
+
+        if staff_channel:
+            # Se esiste la view staff completa, usa quella. Altrimenti manda solo embed.
+            try:
+                await staff_channel.send(embed=embed, view=StaffDecisionView(request_id))
+            except NameError:
+                await staff_channel.send(embed=embed)
+            except Exception:
+                await staff_channel.send(embed=embed)
+
+        try:
+            await send_staff_log(
+                interaction.guild,
+                "📩 Nuova richiesta iscrizione inviata",
+                f"Player: {interaction.user.mention}\nRichiesta ID: **{request_id}**",
+                user=interaction.user,
+                color=discord.Color.orange()
+            )
+        except Exception:
+            pass
+
         await interaction.response.send_message(
-            "✅ Richiesta ricevuta. Lo staff la gestirà dal canale dedicato.",
+            "✅ Richiesta inviata allo staff. Ti è stato assegnato il ruolo PRE-ISCRITTO.",
             ephemeral=True
         )
 
@@ -5871,5 +5958,102 @@ async def staff_panel(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=StaffPanelView(), ephemeral=True)
 
 # ===========================================================
+
+
+# ================= RIPUBBLICA RICHIESTE PENDING =================
+
+@tree.command(name="ripubblica_richieste", description="Staff: ripubblica tutte le richieste pending nel canale staff")
+async def ripubblica_richieste(interaction: discord.Interaction):
+    if not can_use_normal_staff(interaction.user):
+        await interaction.response.send_message(
+            "❌ Non hai i permessi per usare questo comando.",
+            ephemeral=True
+        )
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT *
+        FROM signup_requests
+        WHERE status = 'pending'
+        ORDER BY id ASC
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await interaction.response.send_message(
+            "ℹ️ Nessuna richiesta pending trovata.",
+            ephemeral=True
+        )
+        return
+
+    staff_channel = interaction.guild.get_channel(int(SIGNUP_STAFF_CHANNEL_ID))
+    if not staff_channel:
+        await interaction.response.send_message(
+            "❌ Canale staff richieste non trovato.",
+            ephemeral=True
+        )
+        return
+
+    sent = 0
+
+    for request in rows:
+        try:
+            member = interaction.guild.get_member(int(request["discord_id"]))
+
+            embed = discord.Embed(
+                title="📩 Richiesta iscrizione FC26",
+                description=f"Richiesta ID: **{request['id']}**",
+                color=discord.Color.orange()
+            )
+
+            player_text = member.mention if member else f"<@{request['discord_id']}>"
+
+            embed.add_field(name="Player Discord", value=player_text, inline=False)
+            embed.add_field(name="Nome", value=request["real_name"] or "N/D", inline=True)
+            embed.add_field(name="Età", value=request["age"] or "N/D", inline=True)
+            embed.add_field(name="Piattaforma", value=request["platform"] or "N/D", inline=True)
+            embed.add_field(name="ID PSN/Xbox/EA", value=request["game_id"] or "N/D", inline=False)
+
+            if request["club_preferences"]:
+                embed.add_field(
+                    name="Club preferiti",
+                    value=request["club_preferences"],
+                    inline=False
+                )
+
+            embed.set_footer(text="Lo staff deve scegliere ACCETTA o RIFIUTA.")
+
+            try:
+                await staff_channel.send(
+                    embed=embed,
+                    view=StaffDecisionView(request["id"])
+                )
+            except Exception:
+                await staff_channel.send(embed=embed)
+
+            sent += 1
+
+        except Exception as e:
+            print(f"[RIPUBBLICA_RICHIESTE] Errore richiesta {request['id']}: {e}")
+
+    await send_staff_log(
+        interaction.guild,
+        "📨 Richieste ripubblicate",
+        f"Ripubblicate **{sent}** richieste pending nel canale staff.",
+        user=interaction.user,
+        color=discord.Color.green()
+    )
+
+    await interaction.response.send_message(
+        f"✅ Ripubblicate {sent} richieste pending nel canale staff.",
+        ephemeral=True
+    )
+
+# ===============================================================
 
 bot.run(TOKEN)
