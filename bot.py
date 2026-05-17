@@ -2929,6 +2929,7 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
         except Exception:
             pass
 
+        # Blocca richieste duplicate pending
         cur.execute(
             "SELECT id FROM signup_requests WHERE discord_id = ? AND status = 'pending'",
             (str(interaction.user.id),)
@@ -2937,8 +2938,61 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
 
         if existing:
             conn.close()
-            await interaction.response.send_message("⚠️ Hai già una richiesta in attesa di valutazione.", ephemeral=True)
+            await interaction.response.send_message(
+                "⚠️ Hai già una richiesta in attesa di valutazione.",
+                ephemeral=True
+            )
             return
+
+        # Blocca utenti già ACCETTATI
+        cur.execute(
+            "SELECT id FROM signup_requests WHERE discord_id = ? AND status = 'accepted'",
+            (str(interaction.user.id),)
+        )
+        already_accepted = cur.fetchone()
+
+        if already_accepted:
+            conn.close()
+            await interaction.response.send_message(
+                "❌ Sei già iscritto al torneo. Non puoi inviare una nuova richiesta.",
+                ephemeral=True
+            )
+            return
+
+        # Blocca utenti che hanno già un club assegnato
+        try:
+            cur.execute("""
+                SELECT name
+                FROM fc26_clubs
+                WHERE assigned_to = ?
+                LIMIT 1
+            """, (str(interaction.user.id),))
+
+            already_club = cur.fetchone()
+
+            if already_club:
+                conn.close()
+                await interaction.response.send_message(
+                    f"❌ Risulti già assegnato al club **{already_club['name']}**.",
+                    ephemeral=True
+                )
+                return
+        except Exception:
+            pass
+
+        # Blocca utenti con ruolo iscritto
+        try:
+            registered_role = interaction.guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
+
+            if registered_role and registered_role in interaction.user.roles:
+                conn.close()
+                await interaction.response.send_message(
+                    "❌ Hai già il ruolo iscritto e non puoi inviare una nuova richiesta.",
+                    ephemeral=True
+                )
+                return
+        except Exception:
+            pass
 
         cur.execute("""
             INSERT INTO signup_requests
@@ -4967,107 +5021,6 @@ class TradeView(discord.ui.View):
 
         await interaction.response.edit_message(content="❌ Scambio rifiutato.", embed=None, view=None)
 
-
-@tree.command(name="scambio", description="Proponi uno scambio con giocatori e/o crediti")
-@app_commands.describe(
-    utente="Utente a cui proporre lo scambio",
-    offro_player_id="ID giocatore che offri, opzionale",
-    chiedo_player_id="ID giocatore che vuoi ricevere, opzionale",
-    crediti_offerti="Crediti che offri all'altro utente",
-    crediti_richiesti="Crediti che chiedi all'altro utente"
-)
-async def scambio(
-    interaction: discord.Interaction,
-    utente: discord.Member,
-    offro_player_id: str = None,
-    chiedo_player_id: str = None,
-    crediti_offerti: int = 0,
-    crediti_richiesti: int = 0
-):
-    if not is_scambi_channel(interaction):
-        await interaction.response.send_message("❌ Usa questo comando solo nel canale SCAMBI.", ephemeral=True)
-        return
-
-    if utente.id == interaction.user.id:
-        await interaction.response.send_message("Non puoi proporre uno scambio a te stesso.", ephemeral=True)
-        return
-
-    if not offro_player_id and not chiedo_player_id and crediti_offerti <= 0 and crediti_richiesti <= 0:
-        await interaction.response.send_message("Devi inserire almeno un giocatore o dei crediti.", ephemeral=True)
-        return
-
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("SELECT * FROM managers WHERE discord_id = ?", (str(interaction.user.id),))
-    proposer = cur.fetchone()
-    cur.execute("SELECT * FROM managers WHERE discord_id = ?", (str(utente.id),))
-    target = cur.fetchone()
-
-    if not proposer or not target:
-        conn.close()
-        await interaction.response.send_message("Entrambi gli utenti devono essere registrati con `/registrami`.", ephemeral=True)
-        return
-
-    if crediti_offerti > safe_int(proposer["budget"]):
-        conn.close()
-        await interaction.response.send_message("Non hai abbastanza crediti da offrire.", ephemeral=True)
-        return
-
-    if crediti_richiesti > safe_int(target["budget"]):
-        conn.close()
-        await interaction.response.send_message("L'altro utente non ha abbastanza crediti per questa proposta.", ephemeral=True)
-        return
-
-    offer_name = "Nessuno"
-    request_name = "Nessuno"
-
-    if offro_player_id:
-        cur.execute("SELECT name, owner_discord_id FROM players WHERE id = ?", (offro_player_id,))
-        p = cur.fetchone()
-        if not p or str(p["owner_discord_id"]) != str(interaction.user.id):
-            conn.close()
-            await interaction.response.send_message("Non possiedi il giocatore che vuoi offrire.", ephemeral=True)
-            return
-        offer_name = p["name"]
-
-    if chiedo_player_id:
-        cur.execute("SELECT name, owner_discord_id FROM players WHERE id = ?", (chiedo_player_id,))
-        p = cur.fetchone()
-        if not p or str(p["owner_discord_id"]) != str(utente.id):
-            conn.close()
-            await interaction.response.send_message("L'altro utente non possiede il giocatore richiesto.", ephemeral=True)
-            return
-        request_name = p["name"]
-
-    cur.execute("""
-        INSERT INTO trade_offers
-        (proposer_id, proposer_name, target_id, target_name, offer_player_id, request_player_id, credits_to_target, credits_to_proposer)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        str(interaction.user.id),
-        interaction.user.display_name,
-        str(utente.id),
-        utente.display_name,
-        offro_player_id,
-        chiedo_player_id,
-        crediti_offerti,
-        crediti_richiesti
-    ))
-    trade_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-
-    embed = discord.Embed(
-        title="🔁 Proposta di scambio",
-        description=f"**{interaction.user.display_name}** propone uno scambio a **{utente.display_name}**.",
-        color=discord.Color.blue()
-    )
-    embed.add_field(name="Offre", value=f"Giocatore: **{offer_name}**\nCrediti: **{crediti_offerti}**", inline=True)
-    embed.add_field(name="Chiede", value=f"Giocatore: **{request_name}**\nCrediti: **{crediti_richiesti}**", inline=True)
-    embed.set_footer(text=f"ID scambio: {trade_id}")
-
-    await interaction.response.send_message(content=f"{utente.mention}", embed=embed, view=TradeView(trade_id))
 
 
 @tree.command(name="blacklist_add", description="Admin: aggiungi un giocatore alla blacklist")
@@ -7172,5 +7125,519 @@ async def mio_budget(interaction: discord.Interaction):
     )
 
 # ===============================================================
+
+
+# ================= SISTEMA SCAMBI GUIDATO CLUB/GIOCATORI/CREDITI =================
+
+def get_occupied_clubs_for_autocomplete():
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT c.name, c.league, c.assigned_to, m.name AS manager_name
+            FROM fc26_clubs c
+            LEFT JOIN managers m ON m.discord_id = c.assigned_to
+            WHERE c.assigned_to IS NOT NULL
+            ORDER BY c.name ASC
+        """)
+        rows = cur.fetchall()
+    except Exception:
+        rows = []
+    conn.close()
+    return rows
+
+
+async def occupied_club_autocomplete(interaction: discord.Interaction, current: str):
+    current_norm = normalize_text(current)
+    results = []
+
+    for row in get_occupied_clubs_for_autocomplete():
+        club = row["name"]
+        league = row["league"] or "N/D"
+        manager_name = row["manager_name"] or f"ID {row['assigned_to']}"
+
+        label = f"{club} — {manager_name}"
+        value = club
+
+        if current_norm and current_norm not in normalize_text(label):
+            continue
+
+        results.append(app_commands.Choice(
+            name=label[:100],
+            value=value[:100]
+        ))
+
+        if len(results) >= 25:
+            break
+
+    return results
+
+
+def get_club_owner_id(club_name):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT assigned_to
+        FROM fc26_clubs
+        WHERE LOWER(name) = LOWER(?)
+        LIMIT 1
+    """, (str(club_name).strip(),))
+    row = cur.fetchone()
+    conn.close()
+    return str(row["assigned_to"]) if row and row["assigned_to"] else None
+
+
+def get_player_by_name_from_owner(owner_id, player_name):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM players
+        WHERE owner_discord_id = ?
+          AND LOWER(name) = LOWER(?)
+        LIMIT 1
+    """, (str(owner_id), str(player_name).strip()))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_roster_players_for_owner(owner_id, current=""):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, name, position, overall
+        FROM players
+        WHERE owner_discord_id = ?
+        ORDER BY overall DESC, name ASC
+    """, (str(owner_id),))
+    rows = cur.fetchall()
+    conn.close()
+
+    cur_norm = normalize_text(current)
+    if cur_norm:
+        rows = [r for r in rows if cur_norm in normalize_text(r["name"])]
+
+    return rows[:25]
+
+
+async def requested_player_autocomplete(interaction: discord.Interaction, current: str):
+    # Autocomplete giocatori del club scelto
+    club_name = None
+
+    try:
+        ns = interaction.namespace
+        club_name = getattr(ns, "club", None)
+    except Exception:
+        club_name = None
+
+    if not club_name:
+        return []
+
+    owner_id = get_club_owner_id(club_name)
+    if not owner_id:
+        return []
+
+    results = []
+    for p in get_roster_players_for_owner(owner_id, current):
+        label = f"{p['name']} — {p['position']} — OVR {p['overall']}"
+        results.append(app_commands.Choice(name=label[:100], value=str(p["name"])[:100]))
+
+    return results
+
+
+async def offered_player_autocomplete(interaction: discord.Interaction, current: str):
+    # Autocomplete tuoi giocatori
+    results = []
+    for p in get_roster_players_for_owner(str(interaction.user.id), current):
+        label = f"{p['name']} — {p['position']} — OVR {p['overall']}"
+        results.append(app_commands.Choice(name=label[:100], value=str(p["name"])[:100]))
+
+    return results
+
+
+@tree.command(name="scambio", description="Proponi uno scambio a un club occupato")
+@app_commands.describe(
+    club="Club occupato a cui proporre lo scambio",
+    giocatore_richiesto="Giocatore che vuoi dal club scelto",
+    mio_giocatore="Tuo giocatore da offrire, opzionale",
+    crediti="Crediti che vuoi offrire, opzionale"
+)
+@app_commands.autocomplete(
+    club=occupied_club_autocomplete,
+    giocatore_richiesto=requested_player_autocomplete,
+    mio_giocatore=offered_player_autocomplete
+)
+async def scambio(
+    interaction: discord.Interaction,
+    club: str,
+    giocatore_richiesto: str,
+    mio_giocatore: str = None,
+    crediti: int = 0
+):
+    if not is_market_open():
+        await interaction.response.send_message(
+            "🔒 Il mercato è chiuso. Non puoi proporre scambi in questo momento.",
+            ephemeral=True
+        )
+        return
+
+    if str(interaction.channel_id) != str(SCAMBI_CHANNEL_ID):
+        await interaction.response.send_message(
+            f"❌ Puoi proporre scambi solo nel canale <#{SCAMBI_CHANNEL_ID}>.",
+            ephemeral=True
+        )
+        return
+
+    target_owner_id = get_club_owner_id(club)
+
+    if not target_owner_id:
+        await interaction.response.send_message(
+            "❌ Questo club non risulta assegnato a nessun manager.",
+            ephemeral=True
+        )
+        return
+
+    if str(target_owner_id) == str(interaction.user.id):
+        await interaction.response.send_message(
+            "❌ Non puoi proporre uno scambio alla tua stessa squadra.",
+            ephemeral=True
+        )
+        return
+
+    requested_player = get_player_by_name_from_owner(target_owner_id, giocatore_richiesto)
+    if not requested_player:
+        await interaction.response.send_message(
+            "❌ Il giocatore richiesto non risulta nella rosa del club selezionato.",
+            ephemeral=True
+        )
+        return
+
+    offered_player = None
+    if mio_giocatore:
+        offered_player = get_player_by_name_from_owner(str(interaction.user.id), mio_giocatore)
+        if not offered_player:
+            await interaction.response.send_message(
+                "❌ Il giocatore che vuoi offrire non risulta nella tua rosa.",
+                ephemeral=True
+            )
+            return
+
+    crediti = safe_int(crediti, 0)
+    if crediti < 0:
+        await interaction.response.send_message("❌ I crediti non possono essere negativi.", ephemeral=True)
+        return
+
+    if not offered_player and crediti <= 0:
+        await interaction.response.send_message(
+            "❌ Devi offrire almeno un tuo giocatore oppure dei crediti.",
+            ephemeral=True
+        )
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (str(interaction.user.id),))
+    proposer_manager = cur.fetchone()
+
+    if crediti > 0 and (not proposer_manager or safe_int(proposer_manager["budget"]) < crediti):
+        conn.close()
+        await interaction.response.send_message(
+            "❌ Budget insufficiente per proporre questi crediti.",
+            ephemeral=True
+        )
+        return
+
+    target_member = await get_member_safe(interaction.guild, target_owner_id)
+    target_name = target_member.display_name if target_member else f"Manager {target_owner_id}"
+
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS player_trade_offers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposer_id TEXT NOT NULL,
+                proposer_name TEXT,
+                target_id TEXT NOT NULL,
+                target_name TEXT,
+                player_id TEXT NOT NULL,
+                player_name TEXT,
+                offered_player_id TEXT,
+                offered_player_name TEXT,
+                amount INTEGER DEFAULT 0,
+                counter_amount INTEGER,
+                status TEXT DEFAULT 'pending',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME
+            )
+        """)
+
+        # Migrazioni per chi aveva vecchia tabella
+        for col_def in [
+            "offered_player_id TEXT",
+            "offered_player_name TEXT"
+        ]:
+            try:
+                cur.execute(f"ALTER TABLE player_trade_offers ADD COLUMN {col_def}")
+            except Exception:
+                pass
+
+        cur.execute("""
+            INSERT INTO player_trade_offers
+            (proposer_id, proposer_name, target_id, target_name, player_id, player_name,
+             offered_player_id, offered_player_name, amount, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+        """, (
+            str(interaction.user.id),
+            interaction.user.display_name,
+            str(target_owner_id),
+            target_name,
+            str(requested_player["id"]),
+            requested_player["name"],
+            str(offered_player["id"]) if offered_player else None,
+            offered_player["name"] if offered_player else None,
+            crediti
+        ))
+
+        offer_id = cur.lastrowid
+        conn.commit()
+
+    except Exception as e:
+        conn.close()
+        await interaction.response.send_message(f"❌ Errore creazione offerta: `{e}`", ephemeral=True)
+        return
+
+    conn.close()
+
+    embed = discord.Embed(
+        title="📨 Nuova proposta di scambio",
+        description=f"Offerta ID: **{offer_id}**",
+        color=discord.Color.orange()
+    )
+    embed.add_field(name="Da", value=interaction.user.mention, inline=True)
+    embed.add_field(name="A club", value=f"**{club}**", inline=True)
+    embed.add_field(name="Manager destinatario", value=f"<@{target_owner_id}>", inline=True)
+    embed.add_field(
+        name="Giocatore richiesto",
+        value=f"**{requested_player['name']}** — {requested_player['position']} — OVR {requested_player['overall']}",
+        inline=False
+    )
+
+    offered_parts = []
+    if offered_player:
+        offered_parts.append(f"**{offered_player['name']}** — {offered_player['position']} — OVR {offered_player['overall']}")
+    if crediti > 0:
+        offered_parts.append(f"**{crediti} crediti**")
+
+    embed.add_field(name="Offerta", value="\n".join(offered_parts), inline=False)
+    embed.set_footer(text="Il manager destinatario può accettare, rifiutare o fare controfferta.")
+
+    view = TradeOfferResponseView(offer_id)
+
+    await interaction.response.send_message(embed=embed, view=view)
+
+    try:
+        if target_member:
+            await target_member.send(embed=embed)
+    except Exception:
+        pass
+
+    try:
+        await send_staff_log(
+            interaction.guild,
+            "🤝 Nuova proposta di scambio",
+            (
+                f"Offerta ID: **{offer_id}**\n"
+                f"Da: {interaction.user.mention}\n"
+                f"A: <@{target_owner_id}> / Club: **{club}**\n"
+                f"Richiesto: **{requested_player['name']}**\n"
+                f"Offerta: {', '.join(offered_parts)}"
+            ),
+            user=interaction.user,
+            color=discord.Color.orange()
+        )
+    except Exception:
+        pass
+
+
+class CounterOfferModal(discord.ui.Modal, title="Controfferta"):
+    credits = discord.ui.TextInput(
+        label="Crediti richiesti/inclusi",
+        placeholder="Esempio: 50",
+        required=False,
+        max_length=6
+    )
+
+    note = discord.ui.TextInput(
+        label="Messaggio controfferta",
+        placeholder="Scrivi la tua controproposta",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=500
+    )
+
+    def __init__(self, offer_id):
+        super().__init__()
+        self.offer_id = int(offer_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        amount = safe_int(str(self.credits.value).strip() or 0, 0)
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE player_trade_offers
+            SET status = 'countered', counter_amount = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (amount, self.offer_id))
+        conn.commit()
+
+        cur.execute("SELECT * FROM player_trade_offers WHERE id = ?", (self.offer_id,))
+        offer = cur.fetchone()
+        conn.close()
+
+        proposer_id = offer["proposer_id"] if offer else None
+
+        embed = discord.Embed(
+            title="🔁 Controfferta inviata",
+            description=f"Offerta ID: **{self.offer_id}**",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Crediti controfferta", value=f"{amount} crediti", inline=True)
+        if str(self.note.value).strip():
+            embed.add_field(name="Messaggio", value=str(self.note.value).strip(), inline=False)
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        try:
+            if proposer_id:
+                user = await bot.fetch_user(int(proposer_id))
+                await user.send(embed=embed)
+        except Exception:
+            pass
+
+
+class TradeOfferResponseView(discord.ui.View):
+    def __init__(self, offer_id):
+        super().__init__(timeout=None)
+        self.offer_id = int(offer_id)
+
+    async def _get_offer(self):
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM player_trade_offers WHERE id = ?", (self.offer_id,))
+        offer = cur.fetchone()
+        conn.close()
+        return offer
+
+    @discord.ui.button(label="Accetta", style=discord.ButtonStyle.success, custom_id="trade_accept_btn")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        offer = await self._get_offer()
+        if not offer:
+            await interaction.response.send_message("Offerta non trovata.", ephemeral=True)
+            return
+
+        if str(interaction.user.id) != str(offer["target_id"]):
+            await interaction.response.send_message("❌ Solo il destinatario può accettare questa offerta.", ephemeral=True)
+            return
+
+        if offer["status"] != "pending":
+            await interaction.response.send_message("Questa offerta non è più pending.", ephemeral=True)
+            return
+
+        conn = connect()
+        cur = conn.cursor()
+
+        proposer_id = str(offer["proposer_id"])
+        target_id = str(offer["target_id"])
+        requested_player_id = str(offer["player_id"])
+        offered_player_id = offer["offered_player_id"]
+        amount = safe_int(offer["amount"])
+
+        # Controlli proprietà attuali
+        cur.execute("SELECT owner_discord_id FROM players WHERE id = ?", (requested_player_id,))
+        req = cur.fetchone()
+        if not req or str(req["owner_discord_id"]) != target_id:
+            conn.close()
+            await interaction.response.send_message("❌ Il giocatore richiesto non appartiene più al destinatario.", ephemeral=True)
+            return
+
+        if offered_player_id:
+            cur.execute("SELECT owner_discord_id FROM players WHERE id = ?", (str(offered_player_id),))
+            off = cur.fetchone()
+            if not off or str(off["owner_discord_id"]) != proposer_id:
+                conn.close()
+                await interaction.response.send_message("❌ Il giocatore offerto non appartiene più al proponente.", ephemeral=True)
+                return
+
+        if amount > 0:
+            cur.execute("SELECT budget FROM managers WHERE discord_id = ?", (proposer_id,))
+            proposer = cur.fetchone()
+            if not proposer or safe_int(proposer["budget"]) < amount:
+                conn.close()
+                await interaction.response.send_message("❌ Il proponente non ha più budget sufficiente.", ephemeral=True)
+                return
+
+        # Trasferimento giocatore richiesto al proponente
+        cur.execute("UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?", (proposer_id, amount, requested_player_id))
+
+        # Trasferimento eventuale giocatore offerto al destinatario
+        if offered_player_id:
+            cur.execute("UPDATE players SET owner_discord_id = ?, sold_price = ? WHERE id = ?", (target_id, 0, str(offered_player_id)))
+
+        # Crediti dal proponente al destinatario
+        if amount > 0:
+            cur.execute("UPDATE managers SET budget = budget - ? WHERE discord_id = ?", (amount, proposer_id))
+            cur.execute("UPDATE managers SET budget = budget + ? WHERE discord_id = ?", (amount, target_id))
+
+        cur.execute("UPDATE player_trade_offers SET status = 'accepted', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (self.offer_id,))
+        conn.commit()
+        conn.close()
+
+        embed = discord.Embed(
+            title="✅ Scambio accettato",
+            description=f"Offerta ID: **{self.offer_id}** completata.",
+            color=discord.Color.green()
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    @discord.ui.button(label="Rifiuta", style=discord.ButtonStyle.danger, custom_id="trade_reject_btn")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        offer = await self._get_offer()
+        if not offer:
+            await interaction.response.send_message("Offerta non trovata.", ephemeral=True)
+            return
+
+        if str(interaction.user.id) != str(offer["target_id"]):
+            await interaction.response.send_message("❌ Solo il destinatario può rifiutare questa offerta.", ephemeral=True)
+            return
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("UPDATE player_trade_offers SET status = 'rejected', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (self.offer_id,))
+        conn.commit()
+        conn.close()
+
+        embed = discord.Embed(
+            title="❌ Scambio rifiutato",
+            description=f"Offerta ID: **{self.offer_id}** rifiutata.",
+            color=discord.Color.red()
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    @discord.ui.button(label="Controfferta", style=discord.ButtonStyle.secondary, custom_id="trade_counter_btn")
+    async def counter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        offer = await self._get_offer()
+        if not offer:
+            await interaction.response.send_message("Offerta non trovata.", ephemeral=True)
+            return
+
+        if str(interaction.user.id) != str(offer["target_id"]):
+            await interaction.response.send_message("❌ Solo il destinatario può fare una controfferta.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(CounterOfferModal(self.offer_id))
+
+# =========================================================================
 
 bot.run(TOKEN)
