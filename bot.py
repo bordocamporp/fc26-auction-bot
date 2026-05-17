@@ -2752,9 +2752,12 @@ async def setup_iscrizioni(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
+    # Risponde subito a Discord per evitare "Applicazione non ha risposto".
+    await interaction.response.defer(ephemeral=True)
+
     channel = interaction.guild.get_channel(int(SIGNUP_REQUEST_CHANNEL_ID)) if interaction.guild else None
     if not channel:
-        await interaction.response.send_message("Canale richiesta iscrizione non trovato.", ephemeral=True)
+        await interaction.followup.send("Canale richiesta iscrizione non trovato.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -2770,9 +2773,13 @@ async def setup_iscrizioni(interaction: discord.Interaction):
         ),
         color=discord.Color.blue()
     )
-    await channel.send(embed=embed, view=SignupStartView())
-    await interaction.response.send_message("✅ Pannello iscrizioni pubblicato.", ephemeral=True)
 
+    try:
+        await channel.send(embed=embed, view=SignupStartView())
+        await interaction.followup.send("✅ Pannello iscrizioni pubblicato.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Errore pubblicazione pannello iscrizioni: `{e}`", ephemeral=True)
+        print(f"[SETUP ISCRIZIONI] Errore: {e}")
 
 @tree.command(name="assegna_club", description="Staff: assegna manualmente un club a una richiesta/utente")
 @app_commands.describe(utente="Player da accettare", club="Nome del club da assegnare")
@@ -3419,7 +3426,12 @@ class SignupStartView(discord.ui.View):
         custom_id="fc26_signup_start"
     )
     async def signup_start(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(SignupModal())
+        try:
+            await interaction.response.send_modal(SignupModal())
+        except Exception as e:
+            print(f"[SIGNUP BUTTON] Errore apertura modal: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"❌ Errore apertura modulo: `{e}`", ephemeral=True)
 
 
 @bot.event
@@ -6601,8 +6613,12 @@ async def log_every_staff_slash_command(interaction: discord.Interaction):
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     # Log automatico di tutti i comandi slash staff.
+    # IMPORTANTE: lo mandiamo in background, così non blocca la risposta del comando Discord.
     if interaction.type == discord.InteractionType.application_command:
-        await log_every_staff_slash_command(interaction)
+        try:
+            bot.loop.create_task(log_every_staff_slash_command(interaction))
+        except Exception as e:
+            print(f"[STAFF COMMAND LOG] Errore avvio task log: {e}")
 
 # =================================================================
 
