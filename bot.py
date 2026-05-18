@@ -2309,27 +2309,48 @@ def ensure_activity_tables():
         last_discord_activity TIMESTAMP,
         last_match_played TIMESTAMP,
         last_response TIMESTAMP,
-        warned_discord INTEGER DEFAULT 0,
-        warned_match INTEGER DEFAULT 0,
-        warned_response INTEGER DEFAULT 0,
+        warnings INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'active',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
+    """)
+
+    for sql in [
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS last_discord_activity TIMESTAMP",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS last_match_played TIMESTAMP",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS last_response TIMESTAMP",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS warnings INTEGER DEFAULT 0",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception:
+            pass
 
     try:
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_player_activity_discord_id ON player_activity(discord_id)")
     except Exception:
         pass
-    """)
 
-    # Migrazioni per versioni precedenti
-    for col in ["warned_discord", "warned_match", "warned_response", "created_at"]:
-        try:
-            if col == "created_at":
-                cur.execute("ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-            else:
-                cur.execute(f"ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS {col} INTEGER DEFAULT 0")
-        except Exception:
-            pass
+    # Inserisce in player_activity tutti i manager/utenti iscritti senza creare duplicati.
+    try:
+        cur.execute("""
+            INSERT INTO player_activity
+                (discord_id, last_discord_activity, last_match_played, last_response, created_at)
+            SELECT x.discord_id, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            FROM (
+                SELECT discord_id FROM managers WHERE discord_id IS NOT NULL
+                UNION
+                SELECT discord_id FROM signup_requests WHERE discord_id IS NOT NULL AND status = 'accepted'
+                UNION
+                SELECT assigned_to AS discord_id FROM fc26_clubs WHERE assigned_to IS NOT NULL AND assigned_to <> ''
+            ) AS x
+            WHERE x.discord_id IS NOT NULL
+            ON CONFLICT (discord_id) DO NOTHING
+        """)
+    except Exception as e:
+        print(f"[ATTIVITA] Errore popolamento player_activity: {e}")
 
     conn.commit()
     conn.close()
