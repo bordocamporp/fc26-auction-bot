@@ -8681,6 +8681,17 @@ async def offered_player_autocomplete(interaction: discord.Interaction, current:
 
 # =============================================================
 
+
+# Alias compatibilità finale autocomplete scambi
+async def autocomplete_club_occupati_final(interaction: discord.Interaction, current: str):
+    return await occupied_club_autocomplete(interaction, current)
+
+async def autocomplete_giocatore_richiesto_final(interaction: discord.Interaction, current: str):
+    return await requested_player_autocomplete(interaction, current)
+
+async def autocomplete_mio_giocatore_final(interaction: discord.Interaction, current: str):
+    return await offered_player_autocomplete(interaction, current)
+
 @tree.command(name="scambio", description="Proponi uno scambio a un club occupato")
 @app_commands.describe(
     club="Club occupato a cui proporre lo scambio",
@@ -8693,7 +8704,7 @@ async def offered_player_autocomplete(interaction: discord.Interaction, current:
     giocatore_richiesto=requested_player_autocomplete,
     mio_giocatore=offered_player_autocomplete
 )
-@app_commands.autocomplete(club=autocomplete_club_occupati)
+@app_commands.autocomplete(club=occupied_club_autocomplete)
 @app_commands.autocomplete(giocatore_richiesto=lambda interaction, current: autocomplete_giocatori_di_manager(interaction, current, interaction.namespace.club))
 async def scambio(
     interaction: discord.Interaction,
