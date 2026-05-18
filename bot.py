@@ -929,6 +929,77 @@ async def get_log_channel():
         return None
 
 
+async def send_auction_history_log(guild, title, description, *, color=None, embed=None):
+    """
+    Storico aste/scambi nel canale 1505148650723217540.
+    """
+    try:
+        channel = None
+        if guild:
+            channel = guild.get_channel(int(AUCTION_LOG_CHANNEL_ID))
+        if not channel:
+            channel = await bot.fetch_channel(int(AUCTION_LOG_CHANNEL_ID))
+
+        if embed is None:
+            embed = discord.Embed(
+                title=title,
+                description=description,
+                color=color or discord.Color.blurple()
+            )
+        embed.set_footer(text="FC26 • Storico aste e scambi")
+        await channel.send(embed=embed)
+        return True
+    except Exception as e:
+        print(f"[AUCTION HISTORY] Errore invio storico: {e}")
+        return False
+
+
+async def send_outbid_dm(user_id, player_name, new_bid, bidder_name):
+    """
+    DM opzionale al superato: se l'utente ha i DM chiusi, ignora senza errori.
+    """
+    try:
+        user = await bot.fetch_user(int(user_id))
+        embed = discord.Embed(
+            title="🔔 Offerta superata",
+            description=(
+                f"Sei stato superato nell'asta di **{player_name}**.\n\n"
+                f"Nuova offerta: **{new_bid} crediti**\n"
+                f"Nuovo leader: **{bidder_name}**"
+            ),
+            color=discord.Color.orange()
+        )
+        await user.send(embed=embed)
+        return True
+    except Exception:
+        return False
+
+
+async def publish_auction_news(guild, title, description, *, force=False, overall=0, price=0):
+    """
+    News automatiche per aste importanti.
+    Pubblica nel canale media solo eventi interessanti.
+    """
+    try:
+        important = bool(force) or safe_int(overall) >= MEDIA_TRANSFER_MIN_OVERALL or safe_int(price) >= MEDIA_TRANSFER_MIN_PRICE
+        if not important:
+            return False
+
+        return await publish_media_news(
+            guild,
+            title,
+            description,
+            category="transfer",
+            player_overall=overall,
+            price=price,
+            force=force
+        )
+    except Exception as e:
+        print(f"[AUCTION NEWS] Errore news asta: {e}")
+        return False
+
+
+
 def get_roster_role_count(discord_id, group):
     conn = connect()
     cur = conn.cursor()
@@ -1527,10 +1598,26 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
 
     record_bid(auction_id, player_id, str(interaction.user.id), bidder_name, new_bid)
 
+    try:
+        await send_auction_history_log(
+            interaction.guild,
+            "📈 Nuova offerta asta",
+            (
+                f"Giocatore: **{auction['player_name']}** (`{player_id}`)\n"
+                f"Offerente: {interaction.user.mention}\n"
+                f"Offerta: **{new_bid} crediti**"
+            ),
+            color=discord.Color.gold()
+        )
+    except Exception:
+        pass
+
     if previous_bidder_id and str(previous_bidder_id) != str(interaction.user.id):
-        await safe_dm(
+        await send_outbid_dm(
             previous_bidder_id,
-            f"🔔 Sei stato superato nell'asta di **{auction['player_name']}**. Nuova offerta: **{new_bid}** crediti."
+            auction["player_name"],
+            new_bid,
+            bidder_name
         )
 
     auction_last_bids.setdefault(auction_id, [])
@@ -4628,11 +4715,21 @@ async def start_auction_for_player(interaction: discord.Interaction, player_id: 
         await interaction.followup.send("Questo giocatore è in blacklist e non può andare all'asta.", ephemeral=True)
         return
 
-    cur.execute("SELECT * FROM auctions WHERE status = 'open' LIMIT 1")
+    cur.execute("SELECT * FROM auctions WHERE status = 'open' ORDER BY id DESC LIMIT 1")
     open_auction = cur.fetchone()
     if open_auction:
         conn.close()
-        await interaction.followup.send("C'è già un'asta aperta. Chiudila prima con `/chiudi_asta`.", ephemeral=True)
+        msg_ref = ""
+        try:
+            if open_auction.get("channel_id") and open_auction.get("message_id"):
+                msg_ref = f"\nAsta attiva: https://discord.com/channels/{interaction.guild.id}/{open_auction['channel_id']}/{open_auction['message_id']}"
+        except Exception:
+            pass
+        await interaction.followup.send(
+            "❌ C'è già un'asta aperta. Non puoi aprirne un'altra finché non termina o viene chiusa con `/chiudi_asta`."
+            + msg_ref,
+            ephemeral=True
+        )
         return
 
     cur.execute("SELECT * FROM managers WHERE discord_id = %s", (str(interaction.user.id),))
@@ -4713,6 +4810,38 @@ async def start_auction_for_player(interaction: discord.Interaction, player_id: 
             f"Giocatore: **{player['name']}** (`{player_id}`)\nBase: **{base} crediti**\nAperta da: {interaction.user.mention}",
             user=interaction.user,
             color=discord.Color.gold()
+        )
+    except Exception:
+        pass
+
+    try:
+        await send_auction_history_log(
+            interaction.guild,
+            "🔨 Asta avviata",
+            (
+                f"Giocatore: **{player['name']}** (`{player_id}`)\n"
+                f"Squadra: **{player['team']}**\n"
+                f"OVR: **{player['overall']}**\n"
+                f"Base: **{base} crediti**\n"
+                f"Aperta da: {interaction.user.mention}"
+            ),
+            color=discord.Color.gold()
+        )
+    except Exception:
+        pass
+
+    try:
+        await publish_auction_news(
+            interaction.guild,
+            "🔨 ASTA TOP AVVIATA",
+            (
+                f"Parte l'asta per **{player['name']}**!\n"
+                f"⭐ Overall: **{player['overall']}**\n"
+                f"🏟️ Squadra: **{player['team']}**\n"
+                f"💰 Base: **{base} crediti**"
+            ),
+            overall=player["overall"],
+            price=base
         )
     except Exception:
         pass
@@ -5037,26 +5166,35 @@ async def close_auction(channel, auction_id: int, message=None):
 
             await channel.send(embed=embed)
 
-            log_channel = await get_log_channel()
-            if log_channel:
-                log_embed = discord.Embed(
-                    title="📜 Log asta",
-                    description=f"**{auction['player_name']}** → **{winner.display_name}**",
-                    color=discord.Color.green()
-                )
-                log_embed.add_field(name="Prezzo", value=f"{auction['highest_bid']} crediti", inline=True)
-                log_embed.add_field(name="Tassa", value=f"{tax_amount} crediti", inline=True)
-                log_embed.add_field(name="Totale", value=f"{final_price} crediti", inline=True)
-                log_embed.add_field(name="ID giocatore", value=str(auction["player_id"]), inline=True)
-                await log_channel.send(embed=log_embed)
+            log_embed = discord.Embed(
+                title="📜 Asta conclusa",
+                description=f"**{auction['player_name']}** → **{winner.display_name}**",
+                color=discord.Color.green()
+            )
+            log_embed.add_field(name="Prezzo", value=f"{auction['highest_bid']} crediti", inline=True)
+            log_embed.add_field(name="Tassa", value=f"{tax_amount} crediti", inline=True)
+            log_embed.add_field(name="Totale", value=f"{final_price} crediti", inline=True)
+            log_embed.add_field(name="ID giocatore", value=str(auction["player_id"]), inline=True)
+            log_embed.add_field(name="Vincitore", value=f"<@{auction['highest_bidder_id']}>", inline=True)
+
+            await send_auction_history_log(
+                channel.guild if hasattr(channel, "guild") else None,
+                "📜 Asta conclusa",
+                "",
+                embed=log_embed
+            )
 
             try:
-                await publish_transfer_news_if_important(
+                await publish_auction_news(
                     channel.guild if hasattr(channel, "guild") else None,
-                    winner.display_name,
-                    auction["player_name"],
-                    final_price,
-                    0
+                    "📰 COLPO DI MERCATO",
+                    (
+                        f"**{winner.display_name}** si aggiudica **{auction['player_name']}**!\n"
+                        f"💰 Prezzo finale: **{auction['highest_bid']}** crediti\n"
+                        f"🏦 Totale con tassa: **{final_price}** crediti"
+                    ),
+                    price=final_price,
+                    force=False
                 )
             except Exception:
                 pass
@@ -5088,6 +5226,15 @@ async def close_auction(channel, auction_id: int, message=None):
             color=discord.Color.red()
         )
         await channel.send(embed=embed)
+        try:
+            await send_auction_history_log(
+                channel.guild if hasattr(channel, "guild") else None,
+                "❌ Asta annullata",
+                f"Giocatore: **{auction['player_name']}**\nMotivo: **{reason}**",
+                color=discord.Color.red()
+            )
+        except Exception:
+            pass
         auction_last_bids.pop(int(auction_id), None)
         return
 
@@ -5108,6 +5255,123 @@ async def close_auction(channel, auction_id: int, message=None):
     )
     await channel.send(embed=embed)
     auction_last_bids.pop(int(auction_id), None)
+
+
+
+
+@tree.command(name="storico_aste_scambi", description="Mostra riepilogo storico aste e scambi")
+async def storico_aste_scambi(interaction: discord.Interaction):
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT p.name, p.sold_price, p.owner_discord_id
+        FROM players p
+        WHERE p.owner_discord_id IS NOT NULL
+          AND p.owner_discord_id <> ''
+          AND p.sold_price IS NOT NULL
+        ORDER BY p.sold_price DESC
+        LIMIT 10
+    """)
+    buys = cur.fetchall()
+
+    cur.execute("""
+        SELECT proposer_name, target_name, player_name, amount, status, created_at
+        FROM player_trade_offers
+        ORDER BY id DESC
+        LIMIT 10
+    """)
+    trades = cur.fetchall()
+    conn.close()
+
+    embed = discord.Embed(
+        title="📜 Storico aste e scambi",
+        color=discord.Color.blurple()
+    )
+
+    if buys:
+        embed.add_field(
+            name="Ultimi/Top acquisti asta",
+            value="\\n".join(
+                f"• **{r['name']}** → <@{r['owner_discord_id']}> • **{r['sold_price']} cr**"
+                for r in buys[:10]
+            ),
+            inline=False
+        )
+    else:
+        embed.add_field(name="Aste", value="Nessuna asta registrata.", inline=False)
+
+    if trades:
+        embed.add_field(
+            name="Ultime offerte/scambi",
+            value="\\n".join(
+                f"• {r['proposer_name'] or '-'} → {r['target_name'] or '-'} | {r['player_name'] or '-'} | {r['amount'] or 0} cr | `{r['status']}`"
+                for r in trades[:10]
+            ),
+            inline=False
+        )
+    else:
+        embed.add_field(name="Scambi", value="Nessuno scambio registrato.", inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@tree.command(name="mercato_panel", description="Mostra il pannello live del mercato")
+async def mercato_panel(interaction: discord.Interaction):
+    if not can_use_normal_staff(interaction.user):
+        await interaction.response.send_message("❌ Solo lo staff può pubblicare il panel mercato.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) AS c FROM players WHERE owner_discord_id IS NULL OR owner_discord_id = ''")
+    free_players = cur.fetchone()["c"]
+
+    cur.execute("SELECT COUNT(*) AS c FROM players WHERE owner_discord_id IS NOT NULL AND owner_discord_id <> ''")
+    assigned_players = cur.fetchone()["c"]
+
+    cur.execute("SELECT COUNT(*) AS c FROM auctions WHERE status = 'open'")
+    open_auctions = cur.fetchone()["c"]
+
+    cur.execute("SELECT COUNT(*) AS c FROM auctions WHERE status = 'closed'")
+    closed_auctions = cur.fetchone()["c"]
+
+    cur.execute("""
+        SELECT p.name, p.overall, p.sold_price, p.owner_discord_id
+        FROM players p
+        WHERE p.owner_discord_id IS NOT NULL
+          AND p.owner_discord_id <> ''
+          AND p.sold_price IS NOT NULL
+        ORDER BY p.sold_price DESC
+        LIMIT 5
+    """)
+    top_sales = cur.fetchall()
+    conn.close()
+
+    status = market_status_label()
+
+    embed = discord.Embed(
+        title="📊 Panel live mercato FC26",
+        description=f"Stato mercato: **{status}**",
+        color=discord.Color.green() if is_market_open() else discord.Color.red()
+    )
+    embed.add_field(name="Giocatori liberi", value=str(free_players), inline=True)
+    embed.add_field(name="Giocatori assegnati", value=str(assigned_players), inline=True)
+    embed.add_field(name="Aste aperte", value=str(open_auctions), inline=True)
+    embed.add_field(name="Aste concluse", value=str(closed_auctions), inline=True)
+
+    if top_sales:
+        lines = []
+        for idx, r in enumerate(top_sales, 1):
+            lines.append(
+                f"**{idx}.** {r['name']} • OVR {r['overall']} • **{r['sold_price']} cr** → <@{r['owner_discord_id']}>"
+            )
+        embed.add_field(name="Top acquisti", value="\\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="Top acquisti", value="Nessun acquisto registrato.", inline=False)
+
+    embed.set_footer(text="Aggiornato live dal bot • Usa /asta_info per l'asta attiva")
+    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="asta_info", description="Mostra l'asta attualmente aperta")
