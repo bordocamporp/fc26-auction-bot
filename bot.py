@@ -2314,6 +2314,11 @@ def ensure_activity_tables():
         warned_response INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
+
+    try:
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_player_activity_discord_id ON player_activity(discord_id)")
+    except Exception:
+        pass
     """)
 
     # Migrazioni per versioni precedenti
@@ -2351,6 +2356,7 @@ def update_player_activity(discord_id, activity_type="discord"):
     cur.execute(f"""
         INSERT INTO player_activity (discord_id, {field}, {warned_field})
         VALUES (?, CURRENT_TIMESTAMP, 0)
+        ON CONFLICT (discord_id) DO NOTHING
         ON CONFLICT(discord_id)
         DO UPDATE SET {field} = CURRENT_TIMESTAMP, {warned_field} = 0
     """, (str(discord_id),))
@@ -2388,6 +2394,7 @@ def ensure_registered_players_in_activity():
             INSERT INTO player_activity
             (discord_id, last_discord_activity, last_match_played, last_response, created_at)
             VALUES (%s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT (discord_id) DO NOTHING
         """, (discord_id,))
 
     conn.commit()
@@ -8561,114 +8568,96 @@ def get_occupied_clubs_for_autocomplete():
     return rows
 
 
-async def occupied_club_autocomplete(interaction: discord.Interaction, current: str):
+async def club_scambio_autocomplete(interaction: discord.Interaction, current: str):
+    return await autocomplete_club_occupati(interaction, current)
+
+
+async def autocomplete_giocatori_di_manager(interaction: discord.Interaction, current: str, manager_id: str):
+    """
+    Lista giocatori appartenenti a un manager.
+    """
+    if not manager_id:
+        return []
+
     current_norm = normalize_text(current)
-    results = []
 
-    for row in get_occupied_clubs_for_autocomplete():
-        club = row["name"]
-        league = row["league"] or "N/D"
-        manager_name = row["manager_name"] or f"ID {row['assigned_to']}"
-
-        label = f"{club} — {manager_name}"
-        value = club
-
-        if current_norm and current_norm not in normalize_text(label):
-            continue
-
-        results.append(app_commands.Choice(
-            name=label[:100],
-            value=value[:100]
-        ))
-
-        if len(results) >= 25:
-            break
-
-    return results
-
-
-def get_club_owner_id(club_name):
     conn = connect()
     cur = conn.cursor()
     cur.execute("""
-        SELECT assigned_to
-        FROM fc26_clubs
-        WHERE LOWER(name) = LOWER(%s)
-        LIMIT 1
-    """, (str(club_name).strip(),))
-    row = cur.fetchone()
-    conn.close()
-    return str(row["assigned_to"]) if row and row["assigned_to"] else None
-
-
-def get_player_by_name_from_owner(owner_id, player_name):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT *
+        SELECT id, name, team, position, overall
         FROM players
         WHERE owner_discord_id = %s
-          AND LOWER(name) = LOWER(%s)
-        LIMIT 1
-    """, (str(owner_id), str(player_name).strip()))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def get_roster_players_for_owner(owner_id, current=""):
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, name, position, overall
-        FROM players
-        WHERE owner_discord_id = %s
-        ORDER BY overall DESC, name ASC
-    """, (str(owner_id),))
+        ORDER BY overall DESC NULLS LAST, name ASC
+    """, (str(manager_id),))
     rows = cur.fetchall()
     conn.close()
 
-    cur_norm = normalize_text(current)
-    if cur_norm:
-        rows = [r for r in rows if cur_norm in normalize_text(r["name"])]
+    choices = []
+    for r in rows:
+        name = str(r["name"] or "")
+        team = str(r["team"] or "")
+        pos = str(r["position"] or "")
+        ovr = str(r["overall"] or "")
 
-    return rows[:25]
+        haystack = normalize_text(f"{name} {team} {pos} {ovr}")
+        if current_norm and current_norm not in haystack:
+            continue
 
+        label = f"{name} • {pos} • {ovr} • {team}"
+        choices.append(app_commands.Choice(
+            name=label[:100],
+            value=str(r["id"])
+        ))
 
-async def requested_player_autocomplete(interaction: discord.Interaction, current: str):
-    # Autocomplete giocatori del club scelto
-    club_name = None
+        if len(choices) >= 25:
+            break
 
-    try:
-        ns = interaction.namespace
-        club_name = getattr(ns, "club", None)
-    except Exception:
-        club_name = None
-
-    if not club_name:
-        return []
-
-    owner_id = get_club_owner_id(club_name)
-    if not owner_id:
-        return []
-
-    results = []
-    for p in get_roster_players_for_owner(owner_id, current):
-        label = f"{p['name']} — {p['position']} — OVR {p['overall']}"
-        results.append(app_commands.Choice(name=label[:100], value=str(p["name"])[:100]))
-
-    return results
+    return choices
 
 
-async def offered_player_autocomplete(interaction: discord.Interaction, current: str):
-    # Autocomplete tuoi giocatori
-    results = []
-    for p in get_roster_players_for_owner(str(interaction.user.id), current):
-        label = f"{p['name']} — {p['position']} — OVR {p['overall']}"
-        results.append(app_commands.Choice(name=label[:100], value=str(p["name"])[:100]))
+async def autocomplete_miei_giocatori_o_crediti(interaction: discord.Interaction, current: str):
+    """
+    Lista giocatori del manager che propone lo scambio + opzione crediti.
+    """
+    current_norm = normalize_text(current)
+    choices = []
 
-    return results
+    if "crediti".startswith(current_norm) or current_norm in {"", "credito", "cred"}:
+        choices.append(app_commands.Choice(name="💰 Offro solo crediti / aggiungo crediti", value="__credits__"))
 
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, name, team, position, overall
+        FROM players
+        WHERE owner_discord_id = %s
+        ORDER BY overall DESC NULLS LAST, name ASC
+    """, (str(interaction.user.id),))
+    rows = cur.fetchall()
+    conn.close()
+
+    for r in rows:
+        name = str(r["name"] or "")
+        team = str(r["team"] or "")
+        pos = str(r["position"] or "")
+        ovr = str(r["overall"] or "")
+
+        haystack = normalize_text(f"{name} {team} {pos} {ovr}")
+        if current_norm and current_norm not in haystack:
+            continue
+
+        label = f"{name} • {pos} • {ovr} • {team}"
+        choices.append(app_commands.Choice(
+            name=label[:100],
+            value=str(r["id"])
+        ))
+
+        if len(choices) >= 25:
+            break
+
+    return choices[:25]
+
+# ============================================================
 
 @tree.command(name="scambio", description="Proponi uno scambio a un club occupato")
 @app_commands.describe(
@@ -8682,6 +8671,8 @@ async def offered_player_autocomplete(interaction: discord.Interaction, current:
     giocatore_richiesto=requested_player_autocomplete,
     mio_giocatore=offered_player_autocomplete
 )
+@app_commands.autocomplete(club=autocomplete_club_occupati)
+@app_commands.autocomplete(giocatore_richiesto=lambda interaction, current: autocomplete_giocatori_di_manager(interaction, current, interaction.namespace.club))
 async def scambio(
     interaction: discord.Interaction,
     club: str,
