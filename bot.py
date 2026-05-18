@@ -5246,19 +5246,33 @@ class AuctionPlayerSelectView(discord.ui.View):
 
 @tree.command(name="asta", description="Avvia un'asta guidata: campionato → squadra → giocatore libero")
 async def asta(interaction: discord.Interaction):
-    if AUCTION_CHANNEL_ID and str(interaction.channel_id) != str(AUCTION_CHANNEL_ID):
-        await interaction.response.send_message("❌ Puoi usare `/asta` solo nel canale aste.", ephemeral=True)
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception as e:
+        print(f"[ASTA] Defer fallito: {e}")
         return
 
-    if not is_market_open():
-        await interaction.response.send_message("🔒 Il mercato è chiuso. Lo staff deve aprirlo per avviare aste.", ephemeral=True)
-        return
+    try:
+        if AUCTION_CHANNEL_ID and str(interaction.channel_id) != str(AUCTION_CHANNEL_ID):
+            await interaction.followup.send("❌ Puoi usare `/asta` solo nel canale aste.", ephemeral=True)
+            return
 
-    await interaction.response.send_message(
-        "🔨 **Avvio asta guidata**\nScegli il campionato del giocatore libero:",
-        view=AuctionLeagueSelectView(page=0),
-        ephemeral=True
-    )
+        if not is_market_open():
+            await interaction.followup.send("🔒 Il mercato è chiuso. Lo staff deve aprirlo per avviare aste.", ephemeral=True)
+            return
+
+        await interaction.followup.send(
+            "🔨 **Avvio asta guidata**\nScegli il campionato del giocatore libero:",
+            view=AuctionLeagueSelectView(page=0),
+            ephemeral=True
+        )
+
+    except Exception as e:
+        print(f"[ASTA] Errore comando /asta: {e}")
+        try:
+            await interaction.followup.send(f"❌ Errore asta: `{e}`", ephemeral=True)
+        except Exception:
+            pass
 
 
 
@@ -8685,33 +8699,211 @@ async def autocomplete_miei_giocatori_o_crediti(interaction: discord.Interaction
 # Questi alias evitano crash se i decorator del comando /scambio
 # usano ancora i vecchi nomi funzione.
 
+# ================= SCAMBI AUTOCOMPLETE DEFINITIVO =================
+
 async def occupied_club_autocomplete(interaction: discord.Interaction, current: str):
-    return await autocomplete_club_occupati(interaction, current)
+    try:
+        current_norm = normalize_text(current)
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                c.name AS club_name,
+                c.league AS league,
+                c.assigned_to AS owner_id,
+                COALESCE(m.name, m.manager_name, s.discord_name, c.assigned_to) AS manager_name
+            FROM fc26_clubs c
+            LEFT JOIN managers m ON m.discord_id = c.assigned_to
+            LEFT JOIN signup_requests s ON s.discord_id = c.assigned_to AND s.status = 'accepted'
+            WHERE c.assigned_to IS NOT NULL
+              AND c.assigned_to <> ''
+            ORDER BY c.league ASC, c.name ASC
+        """)
+        rows = cur.fetchall()
+        conn.close()
+
+        choices = []
+        for r in rows:
+            club = str(r["club_name"] or "")
+            league = str(r["league"] or "")
+            owner_id = str(r["owner_id"] or "")
+            manager = str(r["manager_name"] or owner_id)
+
+            if owner_id == str(interaction.user.id):
+                continue
+
+            search = normalize_text(f"{club} {league} {manager} {owner_id}")
+            if current_norm and current_norm not in search:
+                continue
+
+            label = f"{club} • {manager}"
+            choices.append(app_commands.Choice(name=label[:100], value=owner_id))
+
+            if len(choices) >= 25:
+                break
+
+        return choices
+    except Exception as e:
+        print(f"[SCAMBIO AUTOCOMPLETE club] Errore: {e}")
+        return []
 
 
 async def requested_player_autocomplete(interaction: discord.Interaction, current: str):
     try:
-        manager_id = interaction.namespace.club
-    except Exception:
-        manager_id = None
-    return await autocomplete_giocatori_di_manager(interaction, current, manager_id)
+        owner_id = getattr(interaction.namespace, "club", None)
+        if not owner_id:
+            return []
+
+        current_norm = normalize_text(current)
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, name, team, position, overall
+            FROM players
+            WHERE owner_discord_id = %s
+            ORDER BY overall DESC NULLS LAST, name ASC
+        """, (str(owner_id),))
+        rows = cur.fetchall()
+        conn.close()
+
+        choices = []
+        for r in rows:
+            name = str(r["name"] or "")
+            team = str(r["team"] or "")
+            pos = str(r["position"] or "")
+            ovr = str(r["overall"] or "")
+
+            search = normalize_text(f"{name} {team} {pos} {ovr}")
+            if current_norm and current_norm not in search:
+                continue
+
+            label = f"{name} • {pos} • OVR {ovr} • {team}"
+            choices.append(app_commands.Choice(name=label[:100], value=str(r["id"])))
+
+            if len(choices) >= 25:
+                break
+
+        return choices
+    except Exception as e:
+        print(f"[SCAMBIO AUTOCOMPLETE richiesto] Errore: {e}")
+        return []
 
 
 async def offered_player_autocomplete(interaction: discord.Interaction, current: str):
-    return await autocomplete_miei_giocatori_o_crediti(interaction, current)
+    try:
+        current_norm = normalize_text(current)
 
-# =============================================================
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, name, team, position, overall
+            FROM players
+            WHERE owner_discord_id = %s
+            ORDER BY overall DESC NULLS LAST, name ASC
+        """, (str(interaction.user.id),))
+        rows = cur.fetchall()
+        conn.close()
+
+        choices = []
+        for r in rows:
+            name = str(r["name"] or "")
+            team = str(r["team"] or "")
+            pos = str(r["position"] or "")
+            ovr = str(r["overall"] or "")
+
+            search = normalize_text(f"{name} {team} {pos} {ovr}")
+            if current_norm and current_norm not in search:
+                continue
+
+            label = f"{name} • {pos} • OVR {ovr} • {team}"
+            choices.append(app_commands.Choice(name=label[:100], value=str(r["id"])))
+
+            if len(choices) >= 25:
+                break
+
+        return choices
+    except Exception as e:
+        print(f"[SCAMBIO AUTOCOMPLETE offerto] Errore: {e}")
+        return []
 
 
-# Alias compatibilità finale autocomplete scambi
-async def autocomplete_club_occupati_final(interaction: discord.Interaction, current: str):
+# Alias compatibilità
+async def autocomplete_club_occupati(interaction: discord.Interaction, current: str):
     return await occupied_club_autocomplete(interaction, current)
 
-async def autocomplete_giocatore_richiesto_final(interaction: discord.Interaction, current: str):
+async def autocomplete_giocatore_richiesto(interaction: discord.Interaction, current: str):
     return await requested_player_autocomplete(interaction, current)
 
-async def autocomplete_mio_giocatore_final(interaction: discord.Interaction, current: str):
+async def autocomplete_mio_giocatore(interaction: discord.Interaction, current: str):
     return await offered_player_autocomplete(interaction, current)
+
+async def autocomplete_giocatori_di_manager(interaction: discord.Interaction, current: str, manager_id: str):
+    class NS:
+        pass
+    old_ns = getattr(interaction, "namespace", None)
+    try:
+        interaction.namespace.club = manager_id
+    except Exception:
+        pass
+    return await requested_player_autocomplete(interaction, current)
+
+async def autocomplete_miei_giocatori_o_crediti(interaction: discord.Interaction, current: str):
+    return await offered_player_autocomplete(interaction, current)
+
+# ================================================================
+
+
+def ensure_manager_from_real_team(discord_id):
+    discord_id = str(discord_id)
+    conn = connect()
+    cur = conn.cursor()
+
+    for sql in [
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS name TEXT",
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS manager_name TEXT",
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS club_name TEXT",
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS budget INTEGER DEFAULT 500"
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception:
+            pass
+
+    cur.execute("""
+        SELECT
+            COALESCE(s.discord_name, %s) AS display_name,
+            c.name AS club_name,
+            COALESCE(m.budget, 500) AS budget
+        FROM fc26_clubs c
+        LEFT JOIN signup_requests s ON s.discord_id = c.assigned_to
+        LEFT JOIN managers m ON m.discord_id = c.assigned_to
+        WHERE c.assigned_to = %s
+        LIMIT 1
+    """, (discord_id, discord_id))
+    row = cur.fetchone()
+
+    if row:
+        display_name = row["display_name"] or discord_id
+        club_name = row["club_name"]
+        budget = safe_int(row["budget"], 500)
+
+        cur.execute("""
+            INSERT INTO managers (discord_id, name, manager_name, club_name, budget)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (discord_id) DO UPDATE SET
+                name = COALESCE(managers.name, EXCLUDED.name),
+                manager_name = COALESCE(managers.manager_name, EXCLUDED.manager_name),
+                club_name = COALESCE(managers.club_name, EXCLUDED.club_name),
+                budget = COALESCE(managers.budget, EXCLUDED.budget)
+        """, (discord_id, display_name, display_name, club_name, budget))
+        conn.commit()
+        conn.close()
+        return True
+
+    conn.close()
+    return False
 
 @tree.command(name="scambio", description="Proponi uno scambio a un club occupato")
 @app_commands.describe(
@@ -8725,8 +8917,6 @@ async def autocomplete_mio_giocatore_final(interaction: discord.Interaction, cur
     giocatore_richiesto=requested_player_autocomplete,
     mio_giocatore=offered_player_autocomplete
 )
-@app_commands.autocomplete(club=occupied_club_autocomplete)
-@app_commands.autocomplete(giocatore_richiesto=lambda interaction, current: autocomplete_giocatori_di_manager(interaction, current, interaction.namespace.club))
 async def scambio(
     interaction: discord.Interaction,
     club: str,
@@ -8734,6 +8924,13 @@ async def scambio(
     mio_giocatore: str = None,
     crediti: int = 0
 ):
+    try:
+        ensure_manager_from_real_team(interaction.user.id)
+        ensure_manager_from_real_team(club)
+    except Exception as e:
+        print(f"[SCAMBIO] Errore ensure manager real team: {e}")
+
+
     if not is_market_open():
         await interaction.response.send_message(
             "🔒 Il mercato è chiuso. Non puoi proporre scambi in questo momento.",
