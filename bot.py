@@ -4325,7 +4325,10 @@ async def on_ready():
     ensure_extra_tables()
     ensure_season_tables()
     ensure_activity_tables()
-    reset_auction_state()
+    try:
+        await asyncio.to_thread(reset_auction_state)
+    except Exception as e:
+        print(f"[ON_READY] reset_auction_state non bloccante fallito: {e}")
     bot.add_view(SignupStartView())
     bot.add_view(AuctionView())
 
@@ -8699,6 +8702,19 @@ async def autocomplete_miei_giocatori_o_crediti(interaction: discord.Interaction
 # Questi alias evitano crash se i decorator del comando /scambio
 # usano ancora i vecchi nomi funzione.
 
+
+def parse_scambio_club_value(value):
+    """
+    Campo /scambio club.
+    Valori supportati:
+    - "discord_id"
+    - "discord_id|Club • Manager"
+    """
+    raw = str(value or "").strip()
+    if "|" in raw:
+        return raw.split("|", 1)[0].strip()
+    return raw
+
 # ================= SCAMBI AUTOCOMPLETE DEFINITIVO =================
 
 async def occupied_club_autocomplete(interaction: discord.Interaction, current: str):
@@ -8737,8 +8753,12 @@ async def occupied_club_autocomplete(interaction: discord.Interaction, current: 
             if current_norm and current_norm not in search:
                 continue
 
+            # Discord mostra il VALUE nel campo dopo la scelta.
+            # Quindi mettiamo un valore leggibile ma parsabile:
+            # owner_id|Club • Manager
             label = f"{club} • {manager}"
-            choices.append(app_commands.Choice(name=label[:100], value=owner_id))
+            value = f"{owner_id}|{club} • {manager}"
+            choices.append(app_commands.Choice(name=label[:100], value=value[:100]))
 
             if len(choices) >= 25:
                 break
@@ -8751,7 +8771,8 @@ async def occupied_club_autocomplete(interaction: discord.Interaction, current: 
 
 async def requested_player_autocomplete(interaction: discord.Interaction, current: str):
     try:
-        owner_id = getattr(interaction.namespace, "club", None)
+        owner_raw = getattr(interaction.namespace, "club", None)
+        owner_id = parse_scambio_club_value(owner_raw)
         if not owner_id:
             return []
 
@@ -8924,9 +8945,12 @@ async def scambio(
     mio_giocatore: str = None,
     crediti: int = 0
 ):
+    target_manager_id = parse_scambio_club_value(club)
+
+
     try:
         ensure_manager_from_real_team(interaction.user.id)
-        ensure_manager_from_real_team(club)
+        ensure_manager_from_real_team(target_manager_id)
     except Exception as e:
         print(f"[SCAMBIO] Errore ensure manager real team: {e}")
 
