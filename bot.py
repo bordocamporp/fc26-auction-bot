@@ -8659,6 +8659,28 @@ async def autocomplete_miei_giocatori_o_crediti(interaction: discord.Interaction
 
 # ============================================================
 
+
+# ================= ALIAS AUTOCOMPLETE SCAMBI =================
+# Questi alias evitano crash se i decorator del comando /scambio
+# usano ancora i vecchi nomi funzione.
+
+async def occupied_club_autocomplete(interaction: discord.Interaction, current: str):
+    return await autocomplete_club_occupati(interaction, current)
+
+
+async def requested_player_autocomplete(interaction: discord.Interaction, current: str):
+    try:
+        manager_id = interaction.namespace.club
+    except Exception:
+        manager_id = None
+    return await autocomplete_giocatori_di_manager(interaction, current, manager_id)
+
+
+async def offered_player_autocomplete(interaction: discord.Interaction, current: str):
+    return await autocomplete_miei_giocatori_o_crediti(interaction, current)
+
+# =============================================================
+
 @tree.command(name="scambio", description="Proponi uno scambio a un club occupato")
 @app_commands.describe(
     club="Club occupato a cui proporre lo scambio",
