@@ -331,7 +331,7 @@ DEFAULT_BUDGET = 500
 MIN_RAISE = 10
 AUCTION_SECONDS = 45
 ANTI_SNIPE_THRESHOLD = 10
-ANTI_SNIPE_EXTENSION = 10
+ANTI_SNIPE_EXTENSION = 20
 MARKET_TAX = 5
 
 MAX_GK = 2
@@ -477,6 +477,49 @@ def role_label(group):
 def ensure_extra_tables():
     conn = connect()
     cur = conn.cursor()
+
+    # ================= ASTE: schema PostgreSQL/Supabase =================
+    try:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS auctions (
+            id SERIAL PRIMARY KEY,
+            player_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            highest_bid INTEGER DEFAULT 0,
+            highest_bidder_id TEXT,
+            channel_id TEXT,
+            message_id TEXT,
+            created_by TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            closed_at TIMESTAMP
+        )
+        """)
+    except Exception as e:
+        print(f"[DB] Errore creazione auctions: {e}")
+
+    for sql in [
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS player_id TEXT",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open'",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS highest_bid INTEGER DEFAULT 0",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS highest_bidder_id TEXT",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS channel_id TEXT",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS message_id TEXT",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS created_by TEXT",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP"
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception:
+            pass
+
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_auctions_status ON auctions(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_auctions_player ON auctions(player_id)")
+    except Exception:
+        pass
+    # ================================================================
+
 
     # Compatibilità PostgreSQL/Supabase: alcune versioni hanno manager_name invece di name.
     try:
@@ -841,6 +884,11 @@ def auction_embed(player, auction, remaining=None):
     recent = auction_last_bids.get(int(auction_id), [])
     recent_text = "\n".join(recent[-5:]) if recent else "Nessuna offerta ancora."
 
+    if remaining is None:
+        timer_text = f"{AUCTION_SECONDS}s"
+    else:
+        timer_text = f"⏳ **{remaining}s**"
+
     embed = discord.Embed(
         title="🔨 ASTA LIVE",
         description=f"**{player['name']}** è ora all'asta.",
@@ -852,14 +900,19 @@ def auction_embed(player, auction, remaining=None):
     embed.add_field(name="Overall", value=str(player["overall"]), inline=True)
     embed.add_field(name="Prezzo attuale", value=f"**{highest_bid}** crediti", inline=True)
     embed.add_field(name="Leader", value=leader, inline=True)
-    embed.add_field(name="Tempo", value=f"⏱️ {remaining}s" if remaining is not None else f"{AUCTION_SECONDS}s", inline=True)
+    embed.add_field(name="Timer", value=timer_text, inline=True)
     embed.add_field(name="Ultime offerte", value=recent_text, inline=False)
+    embed.add_field(
+        name="Anti-snipe",
+        value=f"Se arriva un'offerta sotto i **{ANTI_SNIPE_THRESHOLD}s**, il timer aumenta di **{ANTI_SNIPE_EXTENSION}s**.",
+        inline=False
+    )
     embed.add_field(
         name="Offerte",
         value="Usa i bottoni sotto: **+10**, **+50**, **All In** oppure **Offerta custom**.",
         inline=False
     )
-    embed.set_footer(text=f"ID asta: {auction_id} • ID giocatore: {player['id']} • Anti-snipe attivo")
+    embed.set_footer(text=f"ID asta: {auction_id} • ID giocatore: {player['id']} • FC26 Auction Bot")
     return embed
 
 
@@ -1354,9 +1407,51 @@ def generate_roster_graphic(discord_id, display_name):
     return out
 
 
+async def get_open_auction_for_message(message_id=None):
+    conn = connect()
+    cur = conn.cursor()
+
+    if message_id:
+        cur.execute("""
+            SELECT a.*, p.name AS player_name, p.id AS player_id, p.position AS player_position,
+                   p.team AS player_team, p.overall AS player_overall
+            FROM auctions a
+            JOIN players p ON p.id = a.player_id
+            WHERE a.status = 'open'
+              AND a.message_id = %s
+            LIMIT 1
+        """, (str(message_id),))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return row
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT a.*, p.name AS player_name, p.id AS player_id, p.position AS player_position,
+               p.team AS player_team, p.overall AS player_overall
+        FROM auctions a
+        JOIN players p ON p.id = a.player_id
+        WHERE a.status = 'open'
+        ORDER BY a.id DESC
+        LIMIT 1
+    """)
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
 async def place_bid(interaction: discord.Interaction, increment=None, all_in=False):
     if not is_market_open():
         await interaction.response.send_message("🔒 Il mercato è chiuso. Non puoi fare offerte in questo momento.", ephemeral=True)
+        return
+
+    message_id = str(interaction.message.id) if interaction.message else None
+    auction = await get_open_auction_for_message(message_id)
+
+    if not auction:
+        await interaction.response.send_message("Non c'è nessuna asta aperta su questo messaggio.", ephemeral=True)
         return
 
     conn = connect()
@@ -1367,21 +1462,12 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
 
     if not manager:
         conn.close()
-        await interaction.response.send_message("Prima usa `/registrami`.", ephemeral=True)
+        await interaction.response.send_message("Prima devi essere registrato/iscritto per partecipare alle aste.", ephemeral=True)
         return
 
-    cur.execute("""
-        SELECT a.*, p.name AS player_name, p.id AS player_id, p.position AS player_position
-        FROM auctions a
-        JOIN players p ON p.id = a.player_id
-        WHERE a.status = 'open'
-        LIMIT 1
-    """)
-    auction = cur.fetchone()
-
-    if not auction:
+    if str(auction.get("highest_bidder_id") or "") == str(interaction.user.id) and not all_in:
         conn.close()
-        await interaction.response.send_message("Non c'è nessuna asta aperta.", ephemeral=True)
+        await interaction.response.send_message("Sei già il miglior offerente.", ephemeral=True)
         return
 
     ok, group, current, limit = can_add_player_to_roster(interaction.user.id, auction["player_position"])
@@ -1395,7 +1481,12 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
 
     previous_bidder_id = auction["highest_bidder_id"]
     current_bid = safe_int(auction["highest_bid"])
-    new_bid = safe_int(manager["budget"]) if all_in else current_bid + safe_int(increment)
+    manager_budget = safe_int(manager["budget"])
+
+    if all_in:
+        new_bid = manager_budget
+    else:
+        new_bid = current_bid + safe_int(increment)
 
     if new_bid <= current_bid:
         conn.close()
@@ -1407,15 +1498,17 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
         await interaction.response.send_message(f"Devi rilanciare almeno di {MIN_RAISE} crediti.", ephemeral=True)
         return
 
-    if safe_int(manager["budget"]) < new_bid:
+    if manager_budget < new_bid:
         conn.close()
         await interaction.response.send_message("Budget insufficiente.", ephemeral=True)
         return
 
     cur.execute("""
         UPDATE auctions
-        SET highest_bid = %s, highest_bidder_id = %s
+        SET highest_bid = %s,
+            highest_bidder_id = %s
         WHERE id = %s
+          AND status = 'open'
     """, (new_bid, str(interaction.user.id), auction["id"]))
     conn.commit()
 
@@ -1452,8 +1545,8 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
 
     try:
         await interaction.message.edit(embed=embed, view=AuctionView())
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[ASTA] Errore update messaggio offerta: {e}")
 
     await interaction.response.send_message(
         f"🔥 Offerta registrata: **{new_bid}** crediti per **{auction['player_name']}**.",
@@ -4029,6 +4122,7 @@ async def on_ready():
     ensure_activity_tables()
     reset_auction_state()
     bot.add_view(SignupStartView())
+    bot.add_view(AuctionView())
 
     guild = get_guild()
 
@@ -4504,23 +4598,19 @@ async def card(interaction: discord.Interaction, player_id: str):
     await interaction.followup.send(embed=embed, file=file)
 
 
-@tree.command(name="asta", description="Avvia un'asta per un giocatore")
-@app_commands.describe(player_id="ID giocatore")
-async def asta(interaction: discord.Interaction, player_id: str):
+async def start_auction_for_player(interaction: discord.Interaction, player_id: str):
     if AUCTION_CHANNEL_ID and str(interaction.channel_id) != str(AUCTION_CHANNEL_ID):
-        await interaction.response.send_message("❌ Puoi avviare le aste solo nel canale aste.", delete_after=10)
+        await interaction.followup.send("❌ Puoi avviare le aste solo nel canale aste.", ephemeral=True)
         return
 
     if not is_market_open():
-        await interaction.response.send_message("🔒 Il mercato è chiuso. Lo staff deve aprirlo per avviare nuove aste.", ephemeral=True)
+        await interaction.followup.send("🔒 Il mercato è chiuso. Lo staff deve aprirlo per avviare nuove aste.", ephemeral=True)
         return
-
-    await interaction.response.defer()
 
     conn = connect()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM players WHERE id = %s", (player_id,))
+    cur.execute("SELECT * FROM players WHERE id = %s", (str(player_id),))
     player = cur.fetchone()
 
     if not player:
@@ -4538,11 +4628,11 @@ async def asta(interaction: discord.Interaction, player_id: str):
         await interaction.followup.send("Questo giocatore è in blacklist e non può andare all'asta.", ephemeral=True)
         return
 
-    cur.execute("SELECT * FROM auctions WHERE status = 'open'")
+    cur.execute("SELECT * FROM auctions WHERE status = 'open' LIMIT 1")
     open_auction = cur.fetchone()
     if open_auction:
         conn.close()
-        await interaction.followup.send("C'è già un'asta aperta. Chiudila prima con `/reset_asta`.", ephemeral=True)
+        await interaction.followup.send("C'è già un'asta aperta. Chiudila prima con `/chiudi_asta`.", ephemeral=True)
         return
 
     cur.execute("SELECT * FROM managers WHERE discord_id = %s", (str(interaction.user.id),))
@@ -4550,14 +4640,15 @@ async def asta(interaction: discord.Interaction, player_id: str):
 
     if not starter_manager:
         conn.close()
-        await interaction.followup.send("Prima usa `/registrami` per partecipare alle aste.", ephemeral=True)
+        await interaction.followup.send("Prima devi essere registrato/iscritto per aprire un'asta.", ephemeral=True)
         return
 
     base = base_price_from_overall(player["overall"])
 
+    # Chi apre l'asta è automaticamente primo offerente e deve avere almeno la base.
     if safe_int(starter_manager["budget"]) < base:
         conn.close()
-        await interaction.followup.send(f"Budget insufficiente per aprire l'asta. Servono almeno {base} crediti.", ephemeral=True)
+        await interaction.followup.send(f"Budget insufficiente per aprire l'asta. Servono almeno **{base}** crediti.", ephemeral=True)
         return
 
     ok, group, current, limit = can_add_player_to_roster(interaction.user.id, player["position"])
@@ -4570,10 +4661,12 @@ async def asta(interaction: discord.Interaction, player_id: str):
         return
 
     cur.execute("""
-        INSERT INTO auctions (player_id, status, highest_bid, highest_bidder_id, channel_id)
-        VALUES (%s, 'open', %s, %s, %s)
-    """, (player_id, base, str(interaction.user.id), str(interaction.channel_id)))
-    auction_id = cur.lastrowid
+        INSERT INTO auctions
+        (player_id, status, highest_bid, highest_bidder_id, channel_id, created_by, created_at)
+        VALUES (%s, 'open', %s, %s, %s, %s, CURRENT_TIMESTAMP)
+        RETURNING id
+    """, (str(player_id), base, str(interaction.user.id), str(interaction.channel_id), str(interaction.user.id)))
+    auction_id = cur.fetchone()["id"]
     conn.commit()
 
     record_bid(auction_id, str(player_id), str(interaction.user.id), interaction.user.display_name, base)
@@ -4584,7 +4677,7 @@ async def asta(interaction: discord.Interaction, player_id: str):
         FROM auctions a
         JOIN players p ON p.id = a.player_id
         WHERE a.id = %s
-    """, (auction_id, auction_id))
+    """, (auction_id,))
     auction_row = cur.fetchone()
     conn.close()
 
@@ -4603,7 +4696,8 @@ async def asta(interaction: discord.Interaction, player_id: str):
             auto_archive_duration=60
         )
         await auction_thread.send(f"Thread automatico per l'asta di **{player['name']}**.")
-    except Exception:
+    except Exception as e:
+        print(f"[ASTA] Thread non creato: {e}")
         auction_thread = None
 
     conn = connect()
@@ -4612,7 +4706,224 @@ async def asta(interaction: discord.Interaction, player_id: str):
     conn.commit()
     conn.close()
 
-    await run_auction_countdown(auction_thread or interaction.channel, auction_id, message)
+    try:
+        await send_staff_log(
+            interaction.guild,
+            "🔨 Asta avviata",
+            f"Giocatore: **{player['name']}** (`{player_id}`)\nBase: **{base} crediti**\nAperta da: {interaction.user.mention}",
+            user=interaction.user,
+            color=discord.Color.gold()
+        )
+    except Exception:
+        pass
+
+    await run_auction_countdown(auction_thread or interaction.channel, int(auction_id), message)
+
+
+class AuctionLeagueSelect(discord.ui.Select):
+    def __init__(self):
+        conn = connect()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT COALESCE(league, 'Senza campionato') AS league, COUNT(*) AS free_count
+                FROM players
+                WHERE owner_discord_id IS NULL OR owner_discord_id = ''
+                GROUP BY COALESCE(league, 'Senza campionato')
+                ORDER BY league ASC
+            """)
+            rows = cur.fetchall()
+        except Exception as e:
+            print(f"[ASTA MENU] Errore campionati: {e}")
+            rows = []
+        conn.close()
+
+        options = []
+        for r in rows[:25]:
+            league = str(r["league"] or "Senza campionato")
+            options.append(discord.SelectOption(
+                label=league[:100],
+                value=league[:100],
+                description=f"{r['free_count']} giocatori liberi"
+            ))
+
+        if not options:
+            options.append(discord.SelectOption(label="Nessun giocatore libero", value="__none__"))
+
+        super().__init__(
+            placeholder="1️⃣ Scegli il campionato...",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        league = self.values[0]
+        if league == "__none__":
+            await interaction.followup.send("❌ Nessun giocatore libero disponibile.", ephemeral=True)
+            return
+
+        await interaction.followup.send(
+            f"Campionato selezionato: **{league}**\nOra scegli la squadra:",
+            view=AuctionTeamSelectView(league),
+            ephemeral=True
+        )
+
+
+class AuctionLeagueSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(AuctionLeagueSelect())
+
+
+class AuctionTeamSelect(discord.ui.Select):
+    def __init__(self, league: str):
+        self.league = str(league)
+
+        conn = connect()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT COALESCE(team, 'Senza squadra') AS team, COUNT(*) AS free_count
+                FROM players
+                WHERE (owner_discord_id IS NULL OR owner_discord_id = '')
+                  AND COALESCE(league, 'Senza campionato') = %s
+                GROUP BY COALESCE(team, 'Senza squadra')
+                ORDER BY team ASC
+            """, (self.league,))
+            rows = cur.fetchall()
+        except Exception as e:
+            print(f"[ASTA MENU] Errore squadre: {e}")
+            rows = []
+        conn.close()
+
+        options = []
+        for r in rows[:25]:
+            team = str(r["team"] or "Senza squadra")
+            options.append(discord.SelectOption(
+                label=team[:100],
+                value=team[:100],
+                description=f"{r['free_count']} giocatori liberi"
+            ))
+
+        if not options:
+            options.append(discord.SelectOption(label="Nessuna squadra disponibile", value="__none__"))
+
+        super().__init__(
+            placeholder="2️⃣ Scegli la squadra...",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        team = self.values[0]
+        if team == "__none__":
+            await interaction.followup.send("❌ Nessuna squadra disponibile.", ephemeral=True)
+            return
+
+        await interaction.followup.send(
+            f"Squadra selezionata: **{team}**\nOra scegli il giocatore libero da mandare all'asta:",
+            view=AuctionPlayerSelectView(self.league, team),
+            ephemeral=True
+        )
+
+
+class AuctionTeamSelectView(discord.ui.View):
+    def __init__(self, league: str):
+        super().__init__(timeout=180)
+        self.add_item(AuctionTeamSelect(league))
+
+
+class AuctionPlayerSelect(discord.ui.Select):
+    def __init__(self, league: str, team: str):
+        self.league = str(league)
+        self.team = str(team)
+
+        conn = connect()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT id, name, position, overall
+                FROM players
+                WHERE (owner_discord_id IS NULL OR owner_discord_id = '')
+                  AND COALESCE(league, 'Senza campionato') = %s
+                  AND COALESCE(team, 'Senza squadra') = %s
+                ORDER BY overall DESC NULLS LAST, name ASC
+                LIMIT 25
+            """, (self.league, self.team))
+            rows = cur.fetchall()
+        except Exception as e:
+            print(f"[ASTA MENU] Errore giocatori: {e}")
+            rows = []
+        conn.close()
+
+        options = []
+        for r in rows:
+            base = base_price_from_overall(r["overall"])
+            label = f"{r['name']} • {r['position']} • OVR {r['overall']}"
+            options.append(discord.SelectOption(
+                label=label[:100],
+                value=str(r["id"]),
+                description=f"Base asta: {base} crediti"
+            ))
+
+        if not options:
+            options.append(discord.SelectOption(label="Nessun giocatore libero", value="__none__"))
+
+        super().__init__(
+            placeholder="3️⃣ Scegli il giocatore...",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
+
+        player_id = self.values[0]
+        if player_id == "__none__":
+            await interaction.followup.send("❌ Nessun giocatore libero in questa squadra.", ephemeral=True)
+            return
+
+        await start_auction_for_player(interaction, player_id)
+
+
+class AuctionPlayerSelectView(discord.ui.View):
+    def __init__(self, league: str, team: str):
+        super().__init__(timeout=180)
+        self.add_item(AuctionPlayerSelect(league, team))
+
+
+@tree.command(name="asta", description="Avvia un'asta guidata: campionato → squadra → giocatore libero")
+async def asta(interaction: discord.Interaction):
+    if AUCTION_CHANNEL_ID and str(interaction.channel_id) != str(AUCTION_CHANNEL_ID):
+        await interaction.response.send_message("❌ Puoi usare `/asta` solo nel canale aste.", ephemeral=True)
+        return
+
+    if not is_market_open():
+        await interaction.response.send_message("🔒 Il mercato è chiuso. Lo staff deve aprirlo per avviare aste.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        "🔨 **Avvio asta guidata**\nScegli il campionato del giocatore libero:",
+        view=AuctionLeagueSelectView(),
+        ephemeral=True
+    )
+
 
 
 async def run_auction_countdown(channel, auction_id: int, message):
@@ -4639,8 +4950,8 @@ async def run_auction_countdown(channel, auction_id: int, message):
         if remaining % 5 == 0 or remaining <= 10:
             try:
                 await message.edit(embed=auction_embed(row, row, remaining), view=AuctionView())
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[ASTA] Errore countdown edit: {e}")
 
         await asyncio.sleep(1)
         auction_timers[int(auction_id)] -= 1
@@ -4666,21 +4977,30 @@ async def close_auction(channel, auction_id: int, message=None):
         return
 
     if auction["highest_bidder_id"]:
-        cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (auction["highest_bidder_id"],))
+        cur.execute("SELECT * FROM managers WHERE discord_id = %s", (auction["highest_bidder_id"],))
         manager = cur.fetchone()
 
-        ok, group, current, limit = can_add_player_to_roster(auction["highest_bidder_id"], auction["player_position"])
+        ok, group, current, limit = can_add_player_to_roster(
+            auction["highest_bidder_id"],
+            auction["player_position"]
+        )
 
-        if manager and manager["budget"] >= auction["highest_bid"] and ok:
-            tax_amount = int((auction["highest_bid"] * MARKET_TAX) / 100)
-            final_price = int(auction["highest_bid"]) + tax_amount
+        tax_amount = int((safe_int(auction["highest_bid"]) * MARKET_TAX) / 100)
+        final_price = int(auction["highest_bid"]) + tax_amount
 
+        if manager and safe_int(manager["budget"]) >= final_price and ok:
             cur.execute(
                 "UPDATE managers SET budget = budget - %s WHERE discord_id = %s",
                 (final_price, auction["highest_bidder_id"])
             )
-            cur.execute("UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s", (auction["highest_bidder_id"], final_price, auction["player_id"]))
-            cur.execute("UPDATE auctions SET status = 'closed' WHERE id = %s", (auction_id,))
+            cur.execute(
+                "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s",
+                (auction["highest_bidder_id"], final_price, auction["player_id"])
+            )
+            cur.execute(
+                "UPDATE auctions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = %s",
+                (auction_id,)
+            )
             conn.commit()
             conn.close()
 
@@ -4693,9 +5013,10 @@ async def close_auction(channel, auction_id: int, message=None):
                 final_price,
                 source="auction"
             )
+
             await safe_dm(
                 auction["highest_bidder_id"],
-                f"🏆 Hai vinto l'asta di **{auction['player_name']}** per **{auction['highest_bid']}** crediti!"
+                f"🏆 Hai vinto l'asta di **{auction['player_name']}** per **{auction['highest_bid']}** crediti + tassa {tax_amount}. Totale: **{final_price}**."
             )
 
             embed = discord.Embed(
@@ -4724,13 +5045,53 @@ async def close_auction(channel, auction_id: int, message=None):
                     color=discord.Color.green()
                 )
                 log_embed.add_field(name="Prezzo", value=f"{auction['highest_bid']} crediti", inline=True)
+                log_embed.add_field(name="Tassa", value=f"{tax_amount} crediti", inline=True)
+                log_embed.add_field(name="Totale", value=f"{final_price} crediti", inline=True)
                 log_embed.add_field(name="ID giocatore", value=str(auction["player_id"]), inline=True)
                 await log_channel.send(embed=log_embed)
+
+            try:
+                await publish_transfer_news_if_important(
+                    channel.guild if hasattr(channel, "guild") else None,
+                    winner.display_name,
+                    auction["player_name"],
+                    final_price,
+                    0
+                )
+            except Exception:
+                pass
 
             auction_last_bids.pop(int(auction_id), None)
             return
 
-    cur.execute("UPDATE auctions SET status = 'closed' WHERE id = %s", (auction_id,))
+        # Miglior offerente non più valido
+        reason = "budget insufficiente per prezzo + tassa" if manager else "manager non trovato"
+        if not ok:
+            reason = f"limite rosa raggiunto per {role_label(group)} ({current}/{limit})"
+
+        cur.execute(
+            "UPDATE auctions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = %s",
+            (auction_id,)
+        )
+        conn.commit()
+        conn.close()
+
+        if message:
+            try:
+                await message.edit(view=None)
+            except Exception:
+                pass
+
+        embed = discord.Embed(
+            title="❌ ASTA ANNULLATA",
+            description=f"L'asta di **{auction['player_name']}** è stata chiusa senza assegnazione.\nMotivo: **{reason}**.",
+            color=discord.Color.red()
+        )
+        await channel.send(embed=embed)
+        auction_last_bids.pop(int(auction_id), None)
+        return
+
+    cur.execute("UPDATE auctions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = %s", (auction_id,))
     conn.commit()
     conn.close()
 
@@ -4747,6 +5108,72 @@ async def close_auction(channel, auction_id: int, message=None):
     )
     await channel.send(embed=embed)
     auction_last_bids.pop(int(auction_id), None)
+
+
+@tree.command(name="asta_info", description="Mostra l'asta attualmente aperta")
+async def asta_info(interaction: discord.Interaction):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT a.*, p.name AS player_name, p.team, p.position, p.overall
+        FROM auctions a
+        JOIN players p ON p.id = a.player_id
+        WHERE a.status = 'open'
+        ORDER BY a.id DESC
+        LIMIT 1
+    """)
+    auction = cur.fetchone()
+    conn.close()
+
+    if not auction:
+        await interaction.response.send_message("Non c'è nessuna asta aperta.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🔨 Asta attiva",
+        description=f"**{auction['player_name']}** — {auction['position']} — OVR {auction['overall']}",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="Offerta attuale", value=f"{auction['highest_bid']} crediti", inline=True)
+    embed.add_field(name="Leader", value=f"<@{auction['highest_bidder_id']}>" if auction["highest_bidder_id"] else "Nessuno", inline=True)
+    embed.add_field(name="Tempo stimato", value=f"{auction_timers.get(int(auction['id']), 'N/D')}s", inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="chiudi_asta", description="Staff: chiude subito l'asta aperta")
+async def chiudi_asta(interaction: discord.Interaction):
+    if not can_use_normal_staff(interaction.user):
+        await interaction.response.send_message("❌ Solo lo staff può chiudere manualmente un'asta.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT id, channel_id, message_id FROM auctions WHERE status = 'open' ORDER BY id DESC LIMIT 1")
+    auction = cur.fetchone()
+    conn.close()
+
+    if not auction:
+        await interaction.followup.send("Non c'è nessuna asta aperta.", ephemeral=True)
+        return
+
+    auction_id = int(auction["id"])
+    auction_timers[auction_id] = 0
+
+    channel = interaction.channel
+    message = None
+    try:
+        if auction.get("channel_id"):
+            channel = await bot.fetch_channel(int(auction["channel_id"]))
+        if auction.get("message_id"):
+            message = await channel.fetch_message(int(auction["message_id"]))
+    except Exception:
+        pass
+
+    await close_auction(channel, auction_id, message)
+    await interaction.followup.send("✅ Asta chiusa manualmente.", ephemeral=True)
 
 
 
