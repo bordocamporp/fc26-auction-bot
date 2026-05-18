@@ -1389,6 +1389,22 @@ async def safe_dm(user_id, message=None, embed=None):
         return False
 
 
+
+async def safe_dm_signup_result(user_id, title, description, color=None):
+    try:
+        user = await bot.fetch_user(int(user_id))
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=color or discord.Color.blue()
+        )
+        embed.set_footer(text="FC26 Iscrizioni")
+        await user.send(embed=embed)
+        return True
+    except Exception:
+        return False
+
+
 async def get_member_safe(guild, member_id):
     """Recupera un membro anche se non è nella cache Discord."""
     if not guild or not member_id:
@@ -3570,28 +3586,20 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
 
 
 
+
+SIGNUP_MENU_PAGE_SIZE = 25
+
+
 class SignupLeagueSelect(discord.ui.Select):
-    def __init__(self, request_id: int):
+    def __init__(self, request_id: int, rows, page=0):
         self.request_id = int(request_id)
+        self.rows = rows
+        self.page = int(page or 0)
 
+        page_rows = rows[self.page * SIGNUP_MENU_PAGE_SIZE:(self.page + 1) * SIGNUP_MENU_PAGE_SIZE]
         options = []
-        conn = connect()
-        cur = conn.cursor()
-        try:
-            cur.execute("""
-                SELECT league, COUNT(*) AS free_count
-                FROM fc26_clubs
-                WHERE assigned_to IS NULL OR assigned_to = ''
-                GROUP BY league
-                ORDER BY league ASC
-            """)
-            rows = cur.fetchall()
-        except Exception as e:
-            print(f"[SIGNUP LEAGUE SELECT] Errore caricamento campionati: {e}")
-            rows = []
-        conn.close()
 
-        for row in rows:
+        for row in page_rows:
             league_name = row.get("league") or "Altri"
             free_count = row.get("free_count") or 0
             options.append(discord.SelectOption(
@@ -3608,10 +3616,10 @@ class SignupLeagueSelect(discord.ui.Select):
             ))
 
         super().__init__(
-            placeholder="Scegli il campionato...",
+            placeholder=f"Scegli il campionato... pagina {self.page + 1}",
             min_values=1,
             max_values=1,
-            options=options[:25]
+            options=options
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -3631,40 +3639,63 @@ class SignupLeagueSelect(discord.ui.Select):
 
         await interaction.followup.send(
             f"Campionato selezionato: **{league}**\nOra scegli la squadra libera:",
-            view=SignupClubSelectView(self.request_id, league),
+            view=SignupClubSelectView(self.request_id, league, page=0),
             ephemeral=True
         )
 
 
 class SignupLeagueSelectView(discord.ui.View):
-    def __init__(self, request_id: int):
+    def __init__(self, request_id: int, page=0):
         super().__init__(timeout=180)
-        self.add_item(SignupLeagueSelect(request_id))
-
-
-class SignupClubSelect(discord.ui.Select):
-    def __init__(self, request_id: int, league: str):
         self.request_id = int(request_id)
-        self.league = str(league)
+        self.page = int(page or 0)
 
-        options = []
         conn = connect()
         cur = conn.cursor()
         try:
             cur.execute("""
-                SELECT name
+                SELECT league, COUNT(*) AS free_count
                 FROM fc26_clubs
-                WHERE league = %s
-                  AND (assigned_to IS NULL OR assigned_to = '')
-                ORDER BY name ASC
-            """, (self.league,))
-            rows = cur.fetchall()
+                WHERE assigned_to IS NULL OR assigned_to = ''
+                GROUP BY league
+                ORDER BY league ASC
+            """)
+            self.rows = cur.fetchall()
         except Exception as e:
-            print(f"[SIGNUP CLUB SELECT] Errore caricamento club: {e}")
-            rows = []
+            print(f"[SIGNUP LEAGUE SELECT] Errore caricamento campionati: {e}")
+            self.rows = []
         conn.close()
 
-        for row in rows:
+        self.max_page = max(0, (len(self.rows) - 1) // SIGNUP_MENU_PAGE_SIZE)
+        self.page = max(0, min(self.page, self.max_page))
+        self.add_item(SignupLeagueSelect(self.request_id, self.rows, self.page))
+
+    @discord.ui.button(label="⬅️ Indietro", style=discord.ButtonStyle.secondary)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=f"Modalità **Squadre reali** attiva.\nScegli prima il campionato:\nPagina **{max(0, self.page - 1) + 1}/{self.max_page + 1}**",
+            view=SignupLeagueSelectView(self.request_id, max(0, self.page - 1))
+        )
+
+    @discord.ui.button(label="Avanti ➡️", style=discord.ButtonStyle.primary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=f"Modalità **Squadre reali** attiva.\nScegli prima il campionato:\nPagina **{min(self.max_page, self.page + 1) + 1}/{self.max_page + 1}**",
+            view=SignupLeagueSelectView(self.request_id, min(self.max_page, self.page + 1))
+        )
+
+
+class SignupClubSelect(discord.ui.Select):
+    def __init__(self, request_id: int, league: str, rows, page=0):
+        self.request_id = int(request_id)
+        self.league = str(league)
+        self.rows = rows
+        self.page = int(page or 0)
+
+        page_rows = rows[self.page * SIGNUP_MENU_PAGE_SIZE:(self.page + 1) * SIGNUP_MENU_PAGE_SIZE]
+        options = []
+
+        for row in page_rows:
             club_name = row.get("name")
             if club_name:
                 options.append(discord.SelectOption(
@@ -3681,10 +3712,10 @@ class SignupClubSelect(discord.ui.Select):
             ))
 
         super().__init__(
-            placeholder="Scegli la squadra libera...",
+            placeholder=f"Scegli la squadra libera... pagina {self.page + 1}",
             min_values=1,
             max_values=1,
-            options=options[:25]
+            options=options
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -3743,7 +3774,6 @@ class SignupClubSelect(discord.ui.Select):
             await interaction.followup.send("❌ Questa squadra è già stata assegnata.", ephemeral=True)
             return
 
-        # Aggiorna richiesta e club
         cur.execute("""
             UPDATE signup_requests
             SET status = 'accepted',
@@ -3763,18 +3793,15 @@ class SignupClubSelect(discord.ui.Select):
         conn.commit()
         conn.close()
 
-        # Sync rosa reale + budget
         players_count, avg_ovr, budget, real_team_name = sync_real_team_roster_to_manager(discord_id, club_name)
 
         if players_count <= 0:
             await interaction.followup.send(
-                f"❌ Nessun giocatore trovato per **{club_name}** nella tabella `players.team`. "
-                "Controlla che il nome squadra nel database coincida con il club scelto.",
+                f"❌ Nessun giocatore trovato per **{club_name}** nella tabella `players.team`.",
                 ephemeral=True
             )
             return
 
-        # Ruoli
         try:
             member = await get_member_safe(interaction.guild, discord_id)
             if member:
@@ -3788,7 +3815,7 @@ class SignupClubSelect(discord.ui.Select):
             print(f"[SIGNUP CLUB SELECT] Errore ruoli: {e}")
 
         embed = discord.Embed(
-            title="✅ Iscrizione completata",
+            title="✅ Iscrizione accettata",
             description=f"<@{discord_id}> è stato registrato ufficialmente.",
             color=discord.Color.green()
         )
@@ -3811,6 +3838,19 @@ class SignupClubSelect(discord.ui.Select):
         except Exception:
             pass
 
+        await safe_dm_signup_result(
+            discord_id,
+            "✅ Iscrizione accettata",
+            (
+                f"La tua iscrizione a **FC26** è stata accettata.\n\n"
+                f"Club assegnato: **{club_name}**\n"
+                f"Campionato: **{self.league}**\n"
+                f"Budget: **{budget} crediti**\n"
+                f"Giocatori assegnati: **{players_count}**"
+            ),
+            discord.Color.green()
+        )
+
         try:
             await send_staff_log(
                 interaction.guild,
@@ -3829,9 +3869,45 @@ class SignupClubSelect(discord.ui.Select):
 
 
 class SignupClubSelectView(discord.ui.View):
-    def __init__(self, request_id: int, league: str):
+    def __init__(self, request_id: int, league: str, page=0):
         super().__init__(timeout=180)
-        self.add_item(SignupClubSelect(request_id, league))
+        self.request_id = int(request_id)
+        self.league = str(league)
+        self.page = int(page or 0)
+
+        conn = connect()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT name
+                FROM fc26_clubs
+                WHERE league = %s
+                  AND (assigned_to IS NULL OR assigned_to = '')
+                ORDER BY name ASC
+            """, (self.league,))
+            self.rows = cur.fetchall()
+        except Exception as e:
+            print(f"[SIGNUP CLUB SELECT] Errore caricamento club: {e}")
+            self.rows = []
+        conn.close()
+
+        self.max_page = max(0, (len(self.rows) - 1) // SIGNUP_MENU_PAGE_SIZE)
+        self.page = max(0, min(self.page, self.max_page))
+        self.add_item(SignupClubSelect(self.request_id, self.league, self.rows, self.page))
+
+    @discord.ui.button(label="⬅️ Indietro", style=discord.ButtonStyle.secondary)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=f"Campionato selezionato: **{self.league}**\nOra scegli la squadra libera:\nPagina **{max(0, self.page - 1) + 1}/{self.max_page + 1}**",
+            view=SignupClubSelectView(self.request_id, self.league, max(0, self.page - 1))
+        )
+
+    @discord.ui.button(label="Avanti ➡️", style=discord.ButtonStyle.primary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=f"Campionato selezionato: **{self.league}**\nOra scegli la squadra libera:\nPagina **{min(self.max_page, self.page + 1) + 1}/{self.max_page + 1}**",
+            view=SignupClubSelectView(self.request_id, self.league, min(self.max_page, self.page + 1))
+        )
 
 
 class SignupStaffView(discord.ui.View):
@@ -3919,7 +3995,7 @@ class SignupStaffView(discord.ui.View):
 
             await interaction.followup.send(
                 "Modalità **Squadre reali** attiva.\nScegli prima il campionato:",
-                view=SignupLeagueSelectView(self.request_id),
+                view=SignupLeagueSelectView(self.request_id, page=0),
                 ephemeral=True
             )
             return
@@ -3966,6 +4042,13 @@ class SignupStaffView(discord.ui.View):
                 await accept_channel.send(embed=embed)
         except Exception:
             pass
+
+        await safe_dm_signup_result(
+            discord_id,
+            "✅ Iscrizione accettata",
+            "La tua iscrizione a **FC26** è stata accettata dallo staff.",
+            discord.Color.green()
+        )
 
         await interaction.followup.send("✅ Richiesta accettata.", ephemeral=True)
 
@@ -4023,6 +4106,13 @@ class SignupStaffView(discord.ui.View):
                 await reject_channel.send(embed=embed)
         except Exception:
             pass
+
+        await safe_dm_signup_result(
+            discord_id,
+            "❌ Iscrizione rifiutata",
+            "La tua iscrizione a **FC26** è stata rifiutata dallo staff.",
+            discord.Color.red()
+        )
 
         await interaction.followup.send("❌ Richiesta rifiutata.", ephemeral=True)
 
@@ -4849,26 +4939,26 @@ async def start_auction_for_player(interaction: discord.Interaction, player_id: 
     await run_auction_countdown(auction_thread or interaction.channel, int(auction_id), message)
 
 
-class AuctionLeagueSelect(discord.ui.Select):
-    def __init__(self):
-        conn = connect()
-        cur = conn.cursor()
-        try:
-            cur.execute("""
-                SELECT COALESCE(league, 'Senza campionato') AS league, COUNT(*) AS free_count
-                FROM players
-                WHERE owner_discord_id IS NULL OR owner_discord_id = ''
-                GROUP BY COALESCE(league, 'Senza campionato')
-                ORDER BY league ASC
-            """)
-            rows = cur.fetchall()
-        except Exception as e:
-            print(f"[ASTA MENU] Errore campionati: {e}")
-            rows = []
-        conn.close()
 
+AUCTION_MENU_PAGE_SIZE = 25
+
+
+def chunk_options(rows, page=0, size=AUCTION_MENU_PAGE_SIZE):
+    page = max(0, int(page or 0))
+    start = page * size
+    end = start + size
+    return rows[start:end]
+
+
+class AuctionLeagueSelect(discord.ui.Select):
+    def __init__(self, rows, page=0):
+        self.rows = rows
+        self.page = int(page or 0)
+
+        page_rows = chunk_options(rows, self.page)
         options = []
-        for r in rows[:25]:
+
+        for r in page_rows:
             league = str(r["league"] or "Senza campionato")
             options.append(discord.SelectOption(
                 label=league[:100],
@@ -4880,7 +4970,7 @@ class AuctionLeagueSelect(discord.ui.Select):
             options.append(discord.SelectOption(label="Nessun giocatore libero", value="__none__"))
 
         super().__init__(
-            placeholder="1️⃣ Scegli il campionato...",
+            placeholder=f"1️⃣ Scegli il campionato... pagina {self.page + 1}",
             min_values=1,
             max_values=1,
             options=options
@@ -4899,40 +4989,68 @@ class AuctionLeagueSelect(discord.ui.Select):
 
         await interaction.followup.send(
             f"Campionato selezionato: **{league}**\nOra scegli la squadra:",
-            view=AuctionTeamSelectView(league),
+            view=AuctionTeamSelectView(league, page=0),
             ephemeral=True
         )
 
 
 class AuctionLeagueSelectView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, page=0):
         super().__init__(timeout=180)
-        self.add_item(AuctionLeagueSelect())
-
-
-class AuctionTeamSelect(discord.ui.Select):
-    def __init__(self, league: str):
-        self.league = str(league)
+        self.page = int(page or 0)
 
         conn = connect()
         cur = conn.cursor()
         try:
             cur.execute("""
-                SELECT COALESCE(team, 'Senza squadra') AS team, COUNT(*) AS free_count
+                SELECT COALESCE(league, 'Senza campionato') AS league, COUNT(*) AS free_count
                 FROM players
-                WHERE (owner_discord_id IS NULL OR owner_discord_id = '')
-                  AND COALESCE(league, 'Senza campionato') = %s
-                GROUP BY COALESCE(team, 'Senza squadra')
-                ORDER BY team ASC
-            """, (self.league,))
-            rows = cur.fetchall()
+                WHERE owner_discord_id IS NULL OR owner_discord_id = ''
+                GROUP BY COALESCE(league, 'Senza campionato')
+                ORDER BY league ASC
+            """)
+            self.rows = cur.fetchall()
         except Exception as e:
-            print(f"[ASTA MENU] Errore squadre: {e}")
-            rows = []
+            print(f"[ASTA MENU] Errore campionati: {e}")
+            self.rows = []
         conn.close()
 
+        self.max_page = max(0, (len(self.rows) - 1) // AUCTION_MENU_PAGE_SIZE)
+        self.page = max(0, min(self.page, self.max_page))
+
+        self.add_item(AuctionLeagueSelect(self.rows, self.page))
+
+    @discord.ui.button(label="⬅️ Indietro", style=discord.ButtonStyle.secondary)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.edit_message(
+                content=f"🔨 **Avvio asta guidata**\nScegli il campionato del giocatore libero:\nPagina **{max(0, self.page - 1) + 1}/{self.max_page + 1}**",
+                view=AuctionLeagueSelectView(max(0, self.page - 1))
+            )
+        except Exception as e:
+            print(f"[ASTA MENU] Errore pagina precedente campionati: {e}")
+
+    @discord.ui.button(label="Avanti ➡️", style=discord.ButtonStyle.primary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.edit_message(
+                content=f"🔨 **Avvio asta guidata**\nScegli il campionato del giocatore libero:\nPagina **{min(self.max_page, self.page + 1) + 1}/{self.max_page + 1}**",
+                view=AuctionLeagueSelectView(min(self.max_page, self.page + 1))
+            )
+        except Exception as e:
+            print(f"[ASTA MENU] Errore pagina successiva campionati: {e}")
+
+
+class AuctionTeamSelect(discord.ui.Select):
+    def __init__(self, league: str, rows, page=0):
+        self.league = str(league)
+        self.rows = rows
+        self.page = int(page or 0)
+
+        page_rows = chunk_options(rows, self.page)
         options = []
-        for r in rows[:25]:
+
+        for r in page_rows:
             team = str(r["team"] or "Senza squadra")
             options.append(discord.SelectOption(
                 label=team[:100],
@@ -4944,7 +5062,7 @@ class AuctionTeamSelect(discord.ui.Select):
             options.append(discord.SelectOption(label="Nessuna squadra disponibile", value="__none__"))
 
         super().__init__(
-            placeholder="2️⃣ Scegli la squadra...",
+            placeholder=f"2️⃣ Scegli la squadra... pagina {self.page + 1}",
             min_values=1,
             max_values=1,
             options=options
@@ -4963,42 +5081,65 @@ class AuctionTeamSelect(discord.ui.Select):
 
         await interaction.followup.send(
             f"Squadra selezionata: **{team}**\nOra scegli il giocatore libero da mandare all'asta:",
-            view=AuctionPlayerSelectView(self.league, team),
+            view=AuctionPlayerSelectView(self.league, team, page=0),
             ephemeral=True
         )
 
 
 class AuctionTeamSelectView(discord.ui.View):
-    def __init__(self, league: str):
+    def __init__(self, league: str, page=0):
         super().__init__(timeout=180)
-        self.add_item(AuctionTeamSelect(league))
-
-
-class AuctionPlayerSelect(discord.ui.Select):
-    def __init__(self, league: str, team: str):
         self.league = str(league)
-        self.team = str(team)
+        self.page = int(page or 0)
 
         conn = connect()
         cur = conn.cursor()
         try:
             cur.execute("""
-                SELECT id, name, position, overall
+                SELECT COALESCE(team, 'Senza squadra') AS team, COUNT(*) AS free_count
                 FROM players
                 WHERE (owner_discord_id IS NULL OR owner_discord_id = '')
                   AND COALESCE(league, 'Senza campionato') = %s
-                  AND COALESCE(team, 'Senza squadra') = %s
-                ORDER BY overall DESC NULLS LAST, name ASC
-                LIMIT 25
-            """, (self.league, self.team))
-            rows = cur.fetchall()
+                GROUP BY COALESCE(team, 'Senza squadra')
+                ORDER BY team ASC
+            """, (self.league,))
+            self.rows = cur.fetchall()
         except Exception as e:
-            print(f"[ASTA MENU] Errore giocatori: {e}")
-            rows = []
+            print(f"[ASTA MENU] Errore squadre: {e}")
+            self.rows = []
         conn.close()
 
+        self.max_page = max(0, (len(self.rows) - 1) // AUCTION_MENU_PAGE_SIZE)
+        self.page = max(0, min(self.page, self.max_page))
+
+        self.add_item(AuctionTeamSelect(self.league, self.rows, self.page))
+
+    @discord.ui.button(label="⬅️ Indietro", style=discord.ButtonStyle.secondary)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=f"Campionato selezionato: **{self.league}**\nOra scegli la squadra:\nPagina **{max(0, self.page - 1) + 1}/{self.max_page + 1}**",
+            view=AuctionTeamSelectView(self.league, max(0, self.page - 1))
+        )
+
+    @discord.ui.button(label="Avanti ➡️", style=discord.ButtonStyle.primary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=f"Campionato selezionato: **{self.league}**\nOra scegli la squadra:\nPagina **{min(self.max_page, self.page + 1) + 1}/{self.max_page + 1}**",
+            view=AuctionTeamSelectView(self.league, min(self.max_page, self.page + 1))
+        )
+
+
+class AuctionPlayerSelect(discord.ui.Select):
+    def __init__(self, league: str, team: str, rows, page=0):
+        self.league = str(league)
+        self.team = str(team)
+        self.rows = rows
+        self.page = int(page or 0)
+
+        page_rows = chunk_options(rows, self.page)
         options = []
-        for r in rows:
+
+        for r in page_rows:
             base = base_price_from_overall(r["overall"])
             label = f"{r['name']} • {r['position']} • OVR {r['overall']}"
             options.append(discord.SelectOption(
@@ -5011,7 +5152,7 @@ class AuctionPlayerSelect(discord.ui.Select):
             options.append(discord.SelectOption(label="Nessun giocatore libero", value="__none__"))
 
         super().__init__(
-            placeholder="3️⃣ Scegli il giocatore...",
+            placeholder=f"3️⃣ Scegli il giocatore... pagina {self.page + 1}",
             min_values=1,
             max_values=1,
             options=options
@@ -5032,9 +5173,47 @@ class AuctionPlayerSelect(discord.ui.Select):
 
 
 class AuctionPlayerSelectView(discord.ui.View):
-    def __init__(self, league: str, team: str):
+    def __init__(self, league: str, team: str, page=0):
         super().__init__(timeout=180)
-        self.add_item(AuctionPlayerSelect(league, team))
+        self.league = str(league)
+        self.team = str(team)
+        self.page = int(page or 0)
+
+        conn = connect()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT id, name, position, overall
+                FROM players
+                WHERE (owner_discord_id IS NULL OR owner_discord_id = '')
+                  AND COALESCE(league, 'Senza campionato') = %s
+                  AND COALESCE(team, 'Senza squadra') = %s
+                ORDER BY overall DESC NULLS LAST, name ASC
+            """, (self.league, self.team))
+            self.rows = cur.fetchall()
+        except Exception as e:
+            print(f"[ASTA MENU] Errore giocatori: {e}")
+            self.rows = []
+        conn.close()
+
+        self.max_page = max(0, (len(self.rows) - 1) // AUCTION_MENU_PAGE_SIZE)
+        self.page = max(0, min(self.page, self.max_page))
+
+        self.add_item(AuctionPlayerSelect(self.league, self.team, self.rows, self.page))
+
+    @discord.ui.button(label="⬅️ Indietro", style=discord.ButtonStyle.secondary)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=f"Squadra selezionata: **{self.team}**\nOra scegli il giocatore libero da mandare all'asta:\nPagina **{max(0, self.page - 1) + 1}/{self.max_page + 1}**",
+            view=AuctionPlayerSelectView(self.league, self.team, max(0, self.page - 1))
+        )
+
+    @discord.ui.button(label="Avanti ➡️", style=discord.ButtonStyle.primary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=f"Squadra selezionata: **{self.team}**\nOra scegli il giocatore libero da mandare all'asta:\nPagina **{min(self.max_page, self.page + 1) + 1}/{self.max_page + 1}**",
+            view=AuctionPlayerSelectView(self.league, self.team, min(self.max_page, self.page + 1))
+        )
 
 
 @tree.command(name="asta", description="Avvia un'asta guidata: campionato → squadra → giocatore libero")
@@ -5049,7 +5228,7 @@ async def asta(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         "🔨 **Avvio asta guidata**\nScegli il campionato del giocatore libero:",
-        view=AuctionLeagueSelectView(),
+        view=AuctionLeagueSelectView(page=0),
         ephemeral=True
     )
 
