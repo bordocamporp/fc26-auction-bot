@@ -4321,10 +4321,22 @@ class SignupStartView(discord.ui.View):
 
 @bot.event
 async def on_ready():
-    init_db()
-    ensure_extra_tables()
-    ensure_season_tables()
-    ensure_activity_tables()
+    try:
+        await asyncio.to_thread(init_db)
+    except Exception as e:
+        print(f"[ON_READY] init_db non bloccante fallito: {e}")
+    try:
+        await asyncio.to_thread(ensure_extra_tables)
+    except Exception as e:
+        print(f"[ON_READY] ensure_extra_tables non bloccante fallito: {e}")
+    try:
+        await asyncio.to_thread(ensure_season_tables)
+    except Exception as e:
+        print(f"[ON_READY] ensure_season_tables non bloccante fallito: {e}")
+    try:
+        await asyncio.to_thread(ensure_activity_tables)
+    except Exception as e:
+        print(f"[ON_READY] ensure_activity_tables non bloccante fallito: {e}")
     try:
         await asyncio.to_thread(reset_auction_state)
     except Exception as e:
