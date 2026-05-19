@@ -2417,6 +2417,9 @@ def ensure_activity_tables():
         "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS last_match_played TIMESTAMP",
         "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS last_response TIMESTAMP",
         "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS warnings INTEGER DEFAULT 0",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS warned_discord INTEGER DEFAULT 0",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS warned_match INTEGER DEFAULT 0",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS warned_response INTEGER DEFAULT 0",
         "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
         "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
     ]:
@@ -2456,9 +2459,6 @@ def ensure_activity_tables():
 def update_player_activity(discord_id, activity_type="discord"):
     ensure_activity_tables()
 
-    conn = connect()
-    cur = conn.cursor()
-
     field = {
         "discord": "last_discord_activity",
         "match": "last_match_played",
@@ -2471,52 +2471,53 @@ def update_player_activity(discord_id, activity_type="discord"):
         "response": "warned_response"
     }.get(activity_type, "warned_discord")
 
-    cur.execute(f"""
-        INSERT INTO player_activity (discord_id, {field}, {warned_field})
-        VALUES (?, CURRENT_TIMESTAMP, 0)
-        ON CONFLICT (discord_id) DO NOTHING
-        ON CONFLICT(discord_id)
-        DO UPDATE SET {field} = CURRENT_TIMESTAMP, {warned_field} = 0
-    """, (str(discord_id),))
-
-    conn.commit()
-    conn.close()
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        cur.execute(f"""
+            INSERT INTO player_activity (discord_id, {field}, {warned_field}, created_at)
+            VALUES (%s, CURRENT_TIMESTAMP, 0, CURRENT_TIMESTAMP)
+            ON CONFLICT (discord_id)
+            DO UPDATE SET {field} = CURRENT_TIMESTAMP, {warned_field} = 0
+        """, (str(discord_id),))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[ATTIVITA] Errore update_player_activity: {e}")
+    finally:
+        conn.close()
 
 
 def ensure_registered_players_in_activity():
     """
-    Inserisce automaticamente nella tabella attività tutti i manager/iscritti,
-    così vengono controllati anche se non hanno mai scritto o giocato.
+    Inserisce automaticamente nella tabella attività tutti i manager/iscritti.
+    Versione PostgreSQL/Supabase sicura: ogni errore fa rollback e non lascia
+    la transazione in stato aborted.
     """
     ensure_activity_tables()
 
     conn = connect()
     cur = conn.cursor()
-
-    ids = set()
-
     try:
-        cur.execute("SELECT discord_id FROM managers")
-        ids.update(str(r["discord_id"]) for r in cur.fetchall() if r["discord_id"])
-    except Exception:
-        pass
-
-    try:
-        cur.execute("SELECT discord_id FROM signup_requests WHERE status = 'accepted'")
-        ids.update(str(r["discord_id"]) for r in cur.fetchall() if r["discord_id"])
-    except Exception:
-        pass
-
-    for discord_id in ids:
         cur.execute("""
             INSERT INTO player_activity
-            (discord_id, last_discord_activity, last_match_played, last_response, created_at)
-            VALUES (%s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        ON CONFLICT (discord_id) DO NOTHING
-        """, (discord_id,))
-
-    conn.commit()
-    conn.close()
+                (discord_id, last_discord_activity, last_match_played, last_response, created_at)
+            SELECT x.discord_id, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            FROM (
+                SELECT discord_id FROM managers WHERE discord_id IS NOT NULL AND discord_id <> ''
+                UNION
+                SELECT discord_id FROM signup_requests WHERE discord_id IS NOT NULL AND discord_id <> '' AND status = 'accepted'
+                UNION
+                SELECT assigned_to AS discord_id FROM fc26_clubs WHERE assigned_to IS NOT NULL AND assigned_to <> ''
+            ) AS x
+            ON CONFLICT (discord_id) DO NOTHING
+        """)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[ATTIVITA] Errore ensure_registered_players_in_activity: {e}")
+    finally:
+        conn.close()
 
 
 def mark_match_played(discord_id):
@@ -2564,12 +2565,16 @@ async def send_inactivity_warning(guild, member, reason, field):
     }.get(field)
 
     if warned_field:
-        cur.execute(f"""
-            UPDATE player_activity
-            SET {warned_field} = 1
-            WHERE discord_id = ?
-        """, (str(member.id),))
-        conn.commit()
+        try:
+            cur.execute(f"""
+                UPDATE player_activity
+                SET {warned_field} = 1
+                WHERE discord_id = %s
+            """, (str(member.id),))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"[ATTIVITA] Errore aggiornamento warning: {e}")
 
     conn.close()
     return True
@@ -2582,7 +2587,8 @@ def _parse_sqlite_datetime(value):
     raw = str(value).replace("Z", "").strip()
 
     try:
-        return datetime.fromisoformat(raw)
+        dt = datetime.fromisoformat(raw)
+        return dt.replace(tzinfo=None) if getattr(dt, "tzinfo", None) else dt
     except Exception:
         pass
 
@@ -2597,16 +2603,9 @@ async def check_player_inactivity():
 
     while not bot.is_closed():
         try:
-            ensure_registered_players_in_activity()
+            rows = await asyncio.to_thread(_fetch_all_player_activity_rows)
 
-            conn = connect()
-            cur = conn.cursor()
-
-            cur.execute("SELECT * FROM player_activity")
-            rows = cur.fetchall()
-            conn.close()
-
-            now = datetime.now(UTC)
+            now = datetime.now()
 
             for row in rows:
                 discord_id = str(row["discord_id"])
@@ -2713,15 +2712,9 @@ async def controllo_inattivi(interaction: discord.Interaction):
 
     # Esegue un controllo singolo senza aspettare il loop.
     try:
-        ensure_registered_players_in_activity()
+        rows = await asyncio.to_thread(_fetch_all_player_activity_rows)
 
-        conn = connect()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM player_activity")
-        rows = cur.fetchall()
-        conn.close()
-
-        now = datetime.now(UTC)
+        now = datetime.now()
         sent = 0
 
         for row in rows:
@@ -10883,31 +10876,62 @@ async def publish_website_signup_request_to_discord(req):
     return True
 
 
+def _fetch_pending_website_signup_requests():
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT *
+            FROM signup_requests
+            WHERE status = 'pending'
+              AND (staff_message_id IS NULL OR staff_message_id = '')
+            ORDER BY id ASC
+            LIMIT 10
+        """)
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def _fetch_pending_website_signup_actions():
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT *
+            FROM signup_staff_actions
+            WHERE processed = false
+            ORDER BY id ASC
+            LIMIT 10
+        """)
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def _fetch_all_player_activity_rows():
+    ensure_registered_players_in_activity()
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM player_activity")
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
 async def process_website_signup_requests_loop():
     await bot.wait_until_ready()
     await asyncio.to_thread(ensure_website_signup_sync_tables)
 
     while not bot.is_closed():
         try:
-            conn = connect()
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT *
-                FROM signup_requests
-                WHERE status = 'pending'
-                  AND (staff_message_id IS NULL OR staff_message_id = '')
-                ORDER BY id ASC
-                LIMIT 10
-            """)
-            rows = cur.fetchall()
-            conn.close()
-
+            rows = await asyncio.to_thread(_fetch_pending_website_signup_requests)
             for row in rows:
                 try:
                     await publish_website_signup_request_to_discord(row)
                 except Exception as e:
                     print(f"[WEBSITE REQUEST SYNC] Errore pubblicazione richiesta #{row.get('id')}: {e}")
-
         except Exception as e:
             print(f"[WEBSITE REQUEST LOOP] Errore: {e}")
 
@@ -10920,21 +10944,12 @@ async def process_website_signup_actions_loop():
 
     while not bot.is_closed():
         try:
-            conn = connect()
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT *
-                FROM signup_staff_actions
-                WHERE processed = false
-                ORDER BY id ASC
-                LIMIT 10
-            """)
-            rows = cur.fetchall()
-            conn.close()
-
+            rows = await asyncio.to_thread(_fetch_pending_website_signup_actions)
             for row in rows:
-                await process_website_signup_action(row)
-
+                try:
+                    await process_website_signup_action(row)
+                except Exception as e:
+                    print(f"[WEBSITE SIGNUP ACTION LOOP] Errore singola azione #{row.get('id')}: {e}")
         except Exception as e:
             print(f"[WEBSITE SIGNUP ACTION LOOP] Errore: {e}")
 
