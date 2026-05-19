@@ -3155,7 +3155,7 @@ async def assegna_club(interaction: discord.Interaction, utente: discord.Member,
 
     club_row = get_club_row_by_name(club)
     if not club_row:
-        await interaction.response.send_message("❌ Club non trovato. Controlla il nome o aggiungilo in LEAGUE_CLUBS.", ephemeral=True)
+        await interaction.response.send_message("❌ Club non trovato nel database fc26_clubs.", ephemeral=True)
         return
     if club_row["assigned_to"]:
         await interaction.response.send_message("❌ Questo club è già stato assegnato.", ephemeral=True)
@@ -4339,6 +4339,226 @@ class SignupStartView(discord.ui.View):
                 pass
 
 
+
+
+# ===========================================================
+# BORDO CAMPO - SYNC DATABASE UNICO FC26
+# Usa Supabase come unica fonte dati:
+# - players_fc26 = dataset completo importato dal sito
+# - players = tabella operativa usata dal bot aste/rose/mercato
+# - fc26_clubs = club generati dal dataset completo
+# ===========================================================
+
+def sync_fc26_dataset_to_bot_tables():
+    """
+    Sincronizza il dataset completo FC26 importato in Supabase.
+
+    Il bot storicamente usa la tabella `players` per aste, rose e mercato.
+    Il sito importa il CSV completo in `players_fc26`.
+
+    Questa funzione copia/aggiorna i dati principali da `players_fc26` a `players`
+    senza cancellare owner_discord_id e sold_price già presenti.
+    Poi aggiorna `fc26_clubs` con tutti i club reali presenti nel dataset.
+    """
+    conn = connect()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT to_regclass('public.players_fc26') AS table_name")
+        row = cur.fetchone()
+        if not row or not row.get("table_name"):
+            print("[FC26 SYNC] Tabella players_fc26 non trovata. Importa prima il CSV sul sito.")
+            conn.close()
+            return
+
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'players_fc26'
+        """)
+        available_columns = {str(r["column_name"]) for r in cur.fetchall()}
+
+        def pick(*names):
+            for name in names:
+                if name in available_columns:
+                    return name
+            return None
+
+        column_map = {
+            "id": pick("id", "ID"),
+            "name": pick("name", "Name"),
+            "team": pick("team", "Team", "club", "Club"),
+            "league": pick("league", "League"),
+            "position": pick("position", "Position"),
+            "overall": pick("overall", "OVR", "ovr"),
+            "pace": pick("pace", "pac", "PAC"),
+            "shooting": pick("shooting", "sho", "SHO"),
+            "passing": pick("passing", "pas", "PAS"),
+            "dribbling": pick("dribbling", "dri", "DRI"),
+            "defending": pick("defending", "def", "DEF"),
+            "physical": pick("physical", "phy", "PHY"),
+            "nation": pick("nation", "Nation"),
+            "age": pick("age", "Age"),
+            "weak_foot": pick("weak_foot", "Weak foot", "weak foot"),
+            "skill_moves": pick("skill_moves", "Skill moves", "skill moves"),
+        }
+
+        required = ["id", "name"]
+        missing_required = [key for key in required if not column_map.get(key)]
+        if missing_required:
+            print(f"[FC26 SYNC] Colonne obbligatorie mancanti in players_fc26: {missing_required}")
+            conn.close()
+            return
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS players (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                team TEXT,
+                league TEXT,
+                position TEXT,
+                overall INTEGER,
+                pace INTEGER,
+                shooting INTEGER,
+                passing INTEGER,
+                dribbling INTEGER,
+                defending INTEGER,
+                physical INTEGER,
+                nation TEXT,
+                age INTEGER,
+                weak_foot INTEGER,
+                skill_moves INTEGER,
+                owner_discord_id TEXT,
+                sold_price INTEGER
+            )
+        """)
+
+        for sql in [
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS name TEXT",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS team TEXT",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS league TEXT",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS position TEXT",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS overall INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS pace INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS shooting INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS passing INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS dribbling INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS defending INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS physical INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS nation TEXT",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS age INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS weak_foot INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS skill_moves INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS owner_discord_id TEXT",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS sold_price INTEGER",
+            "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS league TEXT",
+            "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_to TEXT",
+            "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP",
+            "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_id TEXT",
+            "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_name TEXT",
+        ]:
+            try:
+                cur.execute(sql)
+            except Exception:
+                pass
+
+        def expr(key, default="NULL"):
+            col = column_map.get(key)
+            if not col:
+                return default
+            return f'"{col}"'
+
+        # Copia/aggiorna tutti i giocatori del dataset completo nella tabella operativa del bot.
+        # Non sovrascrive owner_discord_id e sold_price, così le rose già assegnate restano valide.
+        cur.execute(f"""
+            INSERT INTO players (
+                id, name, team, league, position, overall,
+                pace, shooting, passing, dribbling, defending, physical,
+                nation, age, weak_foot, skill_moves
+            )
+            SELECT
+                {expr('id')}::text AS id,
+                {expr('name')}::text AS name,
+                {expr('team')}::text AS team,
+                {expr('league')}::text AS league,
+                {expr('position')}::text AS position,
+                NULLIF({expr('overall', "NULL")}::text, '')::integer AS overall,
+                NULLIF({expr('pace', "NULL")}::text, '')::integer AS pace,
+                NULLIF({expr('shooting', "NULL")}::text, '')::integer AS shooting,
+                NULLIF({expr('passing', "NULL")}::text, '')::integer AS passing,
+                NULLIF({expr('dribbling', "NULL")}::text, '')::integer AS dribbling,
+                NULLIF({expr('defending', "NULL")}::text, '')::integer AS defending,
+                NULLIF({expr('physical', "NULL")}::text, '')::integer AS physical,
+                {expr('nation')}::text AS nation,
+                NULLIF({expr('age', "NULL")}::text, '')::integer AS age,
+                NULLIF({expr('weak_foot', "NULL")}::text, '')::integer AS weak_foot,
+                NULLIF({expr('skill_moves', "NULL")}::text, '')::integer AS skill_moves
+            FROM players_fc26
+            WHERE {expr('id')} IS NOT NULL
+            ON CONFLICT (id) DO UPDATE SET
+                name = EXCLUDED.name,
+                team = EXCLUDED.team,
+                league = EXCLUDED.league,
+                position = EXCLUDED.position,
+                overall = EXCLUDED.overall,
+                pace = EXCLUDED.pace,
+                shooting = EXCLUDED.shooting,
+                passing = EXCLUDED.passing,
+                dribbling = EXCLUDED.dribbling,
+                defending = EXCLUDED.defending,
+                physical = EXCLUDED.physical,
+                nation = EXCLUDED.nation,
+                age = EXCLUDED.age,
+                weak_foot = EXCLUDED.weak_foot,
+                skill_moves = EXCLUDED.skill_moves
+        """)
+
+        team_col = column_map.get("team")
+        league_col = column_map.get("league")
+        if team_col:
+            if league_col:
+                cur.execute(f"""
+                    INSERT INTO fc26_clubs (name, league)
+                    SELECT
+                        "{team_col}"::text AS name,
+                        MIN("{league_col}"::text) AS league
+                    FROM players_fc26
+                    WHERE "{team_col}" IS NOT NULL
+                      AND TRIM("{team_col}"::text) <> ''
+                    GROUP BY "{team_col}"
+                    ON CONFLICT (name) DO UPDATE SET
+                        league = COALESCE(EXCLUDED.league, fc26_clubs.league)
+                """)
+            else:
+                cur.execute(f"""
+                    INSERT INTO fc26_clubs (name)
+                    SELECT DISTINCT "{team_col}"::text AS name
+                    FROM players_fc26
+                    WHERE "{team_col}" IS NOT NULL
+                      AND TRIM("{team_col}"::text) <> ''
+                    ON CONFLICT (name) DO NOTHING
+                """)
+
+        conn.commit()
+
+        cur.execute("SELECT COUNT(*) AS total FROM players")
+        total_players = cur.fetchone()["total"]
+        cur.execute("SELECT COUNT(*) AS total FROM fc26_clubs")
+        total_clubs = cur.fetchone()["total"]
+        print(f"[FC26 SYNC] Sincronizzazione completata: {total_players} giocatori, {total_clubs} club.")
+
+    except Exception as e:
+        conn.rollback()
+        print(f"[FC26 SYNC] Errore sincronizzazione dataset FC26: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+# ===========================================================
+
 @bot.event
 async def on_ready():
     try:
@@ -4349,6 +4569,11 @@ async def on_ready():
         await asyncio.to_thread(ensure_extra_tables)
     except Exception as e:
         print(f"[ON_READY] ensure_extra_tables non bloccante fallito: {e}")
+
+    try:
+        await asyncio.to_thread(sync_fc26_dataset_to_bot_tables)
+    except Exception as e:
+        print(f"[ON_READY] sync_fc26_dataset_to_bot_tables fallito: {e}")
     try:
         await asyncio.to_thread(ensure_season_tables)
     except Exception as e:
