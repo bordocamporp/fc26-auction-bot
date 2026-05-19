@@ -10132,53 +10132,146 @@ async def aggiorna_budget_reali(interaction: discord.Interaction):
 # ===========================================================
 
 def ensure_website_signup_sync_tables():
+    """
+    Crea/aggiorna le tabelle usate dalla sincronizzazione sito <-> Discord.
+    Fix importante per PostgreSQL/Supabase:
+    se una ALTER TABLE fallisce, la transazione diventa "aborted".
+    Per questo ogni comando usa SAVEPOINT + ROLLBACK TO SAVEPOINT.
+    """
     conn = connect()
     cur = conn.cursor()
 
-    for sql in [
-        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_message_id TEXT",
-        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_channel_id TEXT",
-        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS signup_source TEXT DEFAULT 'discord'",
-        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'discord'",
-        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS ea_id TEXT",
-        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS preferred_clubs TEXT",
-        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_by TEXT",
-        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_at TIMESTAMP",
-        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_name TEXT",
-        "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_to TEXT",
-        "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP",
-        "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_id TEXT",
-        "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_name TEXT",
-        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS name TEXT",
-        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS manager_name TEXT",
-        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS club_name TEXT",
-        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS budget INTEGER DEFAULT 500",
-        "ALTER TABLE players ADD COLUMN IF NOT EXISTS owner_discord_id TEXT",
-        "ALTER TABLE players ADD COLUMN IF NOT EXISTS sold_price INTEGER",
-    ]:
+    def run_migration(sql, label=None):
+        sp_name = "sp_migration"
         try:
+            cur.execute(f"SAVEPOINT {sp_name}")
             cur.execute(sql)
+            cur.execute(f"RELEASE SAVEPOINT {sp_name}")
+            return True
         except Exception as e:
-            print(f"[WEBSITE SYNC] Migrazione ignorata: {e}")
+            try:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                cur.execute(f"RELEASE SAVEPOINT {sp_name}")
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            print(f"[WEBSITE SYNC] Migrazione ignorata{f' ({label})' if label else ''}: {e}")
+            return False
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS signup_staff_actions (
-          id SERIAL PRIMARY KEY,
-          request_id BIGINT NOT NULL,
-          action TEXT NOT NULL,
-          club_name TEXT,
-          handled_by TEXT,
-          handled_by_name TEXT,
-          source TEXT DEFAULT 'website',
-          processed BOOLEAN DEFAULT false,
-          processed_at TIMESTAMP,
-          error TEXT,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+    try:
+        # Tabelle base se non esistono ancora.
+        run_migration("""
+            CREATE TABLE IF NOT EXISTS signup_requests (
+                id SERIAL PRIMARY KEY,
+                discord_id TEXT,
+                discord_name TEXT,
+                real_name TEXT,
+                age TEXT,
+                platform TEXT,
+                game_id TEXT,
+                club_preferences TEXT,
+                status TEXT DEFAULT 'pending',
+                club_name TEXT,
+                handled_by TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                handled_at TIMESTAMP
+            )
+        """, "create signup_requests")
 
-    conn.commit()
-    conn.close()
+        run_migration("""
+            CREATE TABLE IF NOT EXISTS fc26_clubs (
+                name TEXT PRIMARY KEY,
+                league TEXT,
+                assigned_to TEXT,
+                assigned_at TIMESTAMP,
+                previous_owner_id TEXT,
+                previous_owner_name TEXT
+            )
+        """, "create fc26_clubs")
+
+        run_migration("""
+            CREATE TABLE IF NOT EXISTS managers (
+                id SERIAL PRIMARY KEY,
+                discord_id TEXT,
+                name TEXT,
+                manager_name TEXT,
+                club_name TEXT,
+                budget INTEGER DEFAULT 500
+            )
+        """, "create managers")
+
+        # Colonne necessarie. Ogni ALTER è isolata: se fallisce non sporca la transazione.
+        migrations = [
+            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_message_id TEXT", "signup_requests.staff_message_id"),
+            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_channel_id TEXT", "signup_requests.staff_channel_id"),
+            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS signup_source TEXT DEFAULT 'discord'", "signup_requests.signup_source"),
+            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'discord'", "signup_requests.source"),
+            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS ea_id TEXT", "signup_requests.ea_id"),
+            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS preferred_clubs TEXT", "signup_requests.preferred_clubs"),
+            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_preferences TEXT", "signup_requests.club_preferences"),
+            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_by TEXT", "signup_requests.handled_by"),
+            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_at TIMESTAMP", "signup_requests.handled_at"),
+            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_name TEXT", "signup_requests.club_name"),
+            ("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS league TEXT", "fc26_clubs.league"),
+            ("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_to TEXT", "fc26_clubs.assigned_to"),
+            ("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP", "fc26_clubs.assigned_at"),
+            ("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_id TEXT", "fc26_clubs.previous_owner_id"),
+            ("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_name TEXT", "fc26_clubs.previous_owner_name"),
+            ("ALTER TABLE managers ADD COLUMN IF NOT EXISTS discord_id TEXT", "managers.discord_id"),
+            ("ALTER TABLE managers ADD COLUMN IF NOT EXISTS name TEXT", "managers.name"),
+            ("ALTER TABLE managers ADD COLUMN IF NOT EXISTS manager_name TEXT", "managers.manager_name"),
+            ("ALTER TABLE managers ADD COLUMN IF NOT EXISTS club_name TEXT", "managers.club_name"),
+            ("ALTER TABLE managers ADD COLUMN IF NOT EXISTS budget INTEGER DEFAULT 500", "managers.budget"),
+            ("ALTER TABLE players ADD COLUMN IF NOT EXISTS owner_discord_id TEXT", "players.owner_discord_id"),
+            ("ALTER TABLE players ADD COLUMN IF NOT EXISTS sold_price INTEGER", "players.sold_price"),
+        ]
+        for sql, label in migrations:
+            run_migration(sql, label)
+
+        run_migration("""
+            CREATE TABLE IF NOT EXISTS signup_staff_actions (
+              id SERIAL PRIMARY KEY,
+              request_id BIGINT NOT NULL,
+              action TEXT NOT NULL,
+              club_name TEXT,
+              handled_by TEXT,
+              handled_by_name TEXT,
+              source TEXT DEFAULT 'website',
+              processed BOOLEAN DEFAULT false,
+              processed_at TIMESTAMP,
+              error TEXT,
+              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """, "create signup_staff_actions")
+
+        # Colonne extra anche se la tabella esisteva già con schema incompleto.
+        action_migrations = [
+            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS request_id BIGINT", "signup_staff_actions.request_id"),
+            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS action TEXT", "signup_staff_actions.action"),
+            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS club_name TEXT", "signup_staff_actions.club_name"),
+            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS handled_by TEXT", "signup_staff_actions.handled_by"),
+            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS handled_by_name TEXT", "signup_staff_actions.handled_by_name"),
+            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'website'", "signup_staff_actions.source"),
+            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS processed BOOLEAN DEFAULT false", "signup_staff_actions.processed"),
+            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS processed_at TIMESTAMP", "signup_staff_actions.processed_at"),
+            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS error TEXT", "signup_staff_actions.error"),
+            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP", "signup_staff_actions.created_at"),
+        ]
+        for sql, label in action_migrations:
+            run_migration(sql, label)
+
+        run_migration("CREATE INDEX IF NOT EXISTS idx_signup_staff_actions_processed ON signup_staff_actions(processed)", "index signup_staff_actions.processed")
+        run_migration("CREATE INDEX IF NOT EXISTS idx_signup_requests_status ON signup_requests(status)", "index signup_requests.status")
+
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        print(f"[WEBSITE SYNC] Errore migrazione tabelle: {e}")
+    finally:
+        conn.close()
 
 
 async def register_pending_signup_views():
