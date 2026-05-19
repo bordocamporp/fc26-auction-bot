@@ -4,7 +4,7 @@ import random
 import unicodedata
 import shutil
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, UTC
 from PIL import Image, ImageDraw, ImageFont
 import discord
 from discord.ext import commands
@@ -415,27 +415,39 @@ def safe_int(value, default=0):
 
 
 async def safe_send(interaction: discord.Interaction, *args, **kwargs):
-    """Invia una risposta Discord senza creare ricorsione.
+    """Invia una risposta Discord in modo sicuro.
 
-    Non sostituire mai interaction.response.send_message con questa funzione.
-    Usala solo così: await safe_send(interaction, "testo", ephemeral=True)
+    Regole:
+    - non sostituire mai interaction.response.send_message con questa funzione;
+    - usala solo con: await safe_send(interaction, ...);
+    - se il comando è già stato deferito, usa automaticamente followup.
     """
     try:
         if interaction.response.is_done():
             return await interaction.followup.send(*args, **kwargs)
         return await interaction.response.send_message(*args, **kwargs)
+    except discord.NotFound as e:
+        # 10062 Unknown interaction: Discord ha invalidato l'interazione perché
+        # il comando non ha risposto/deferito entro circa 3 secondi.
+        print(f"[SAFE SEND NOTFOUND] Interazione scaduta o sconosciuta: {e}")
+    except discord.HTTPException as e:
+        print(f"[SAFE SEND HTTP ERROR] {e}")
     except Exception as e:
-        print(f"[SAFE SEND ERROR] {e}")
-        return None
+        print(f"[SAFE SEND ERROR] {type(e).__name__}: {e}")
+    return None
 
 
 async def safe_defer(interaction: discord.Interaction, *, ephemeral=False, thinking=False):
-    """Esegue defer una sola volta; evita doppie risposte e ricorsione."""
+    """Esegue defer una sola volta; evita Unknown Interaction, doppie risposte e ricorsione."""
     try:
         if not interaction.response.is_done():
             return await interaction.response.defer(ephemeral=ephemeral, thinking=thinking)
+    except discord.NotFound as e:
+        print(f"[SAFE DEFER NOTFOUND] Interazione già scaduta: {e}")
+    except discord.HTTPException as e:
+        print(f"[SAFE DEFER HTTP ERROR] {e}")
     except Exception as e:
-        print(f"[SAFE DEFER ERROR] {e}")
+        print(f"[SAFE DEFER ERROR] {type(e).__name__}: {e}")
     return None
 
 
@@ -2594,7 +2606,7 @@ async def check_player_inactivity():
             rows = cur.fetchall()
             conn.close()
 
-            now = datetime.utcnow()
+            now = datetime.now(UTC)
 
             for row in rows:
                 discord_id = str(row["discord_id"])
@@ -2697,7 +2709,7 @@ async def controllo_inattivi(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True, thinking=True)
 
     # Esegue un controllo singolo senza aspettare il loop.
     try:
@@ -2709,7 +2721,7 @@ async def controllo_inattivi(interaction: discord.Interaction):
         rows = cur.fetchall()
         conn.close()
 
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         sent = 0
 
         for row in rows:
@@ -2956,7 +2968,7 @@ class EndSeasonView(discord.ui.View):
             await interaction.response.send_message("❌ Solo lo staff può avviare la nuova stagione.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True, thinking=True)
 
         close_active_season()
         season_id, notes = await generate_new_season_competitions(interaction, with_europe=True)
@@ -3084,7 +3096,7 @@ class NewLeagueNameModal(discord.ui.Modal, title="Crea nuovo campionato"):
             await interaction.response.send_message("❌ Solo lo staff può creare campionati.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True, thinking=True)
         await create_backup_before_sensitive_action("nuovi_campionati")
 
         new_name = str(self.league_name.value).strip()
@@ -3155,7 +3167,7 @@ async def fine_stagione(interaction: discord.Interaction):
 @tree.command(name="setup_iscrizioni", description="Staff: pubblica il pannello richiesta iscrizione FC26")
 async def setup_iscrizioni(interaction: discord.Interaction):
     try:
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True, thinking=True)
     except Exception as e:
         print(f"[SETUP ISCRIZIONI] Defer fallito: {e}")
         return
@@ -3266,7 +3278,7 @@ async def libera_club(interaction: discord.Interaction, utente: discord.Member):
         await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True, thinking=True)
 
     conn = connect()
     cur = conn.cursor()
@@ -3343,7 +3355,7 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
     async def on_submit(self, interaction: discord.Interaction):
         # Risposta immediata al modal: evita "Unknown interaction" / "Qualcosa è andato storto".
         try:
-            await interaction.response.defer(ephemeral=True)
+            await safe_defer(interaction, ephemeral=True, thinking=True)
         except Exception as e:
             print(f"[SIGNUP MODAL] Defer fallito: {e}")
             return
@@ -3759,7 +3771,7 @@ class SignupLeagueSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         try:
-            await interaction.response.defer(ephemeral=True)
+            await safe_defer(interaction, ephemeral=True, thinking=True)
         except Exception:
             pass
 
@@ -3855,7 +3867,7 @@ class SignupClubSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         try:
-            await interaction.response.defer(ephemeral=True)
+            await safe_defer(interaction, ephemeral=True, thinking=True)
         except Exception:
             pass
 
@@ -4092,7 +4104,7 @@ class SignupStaffView(discord.ui.View):
     @discord.ui.button(label="Accetta", style=discord.ButtonStyle.success, custom_id="signup_staff_accept")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
-            await interaction.response.defer(ephemeral=True)
+            await safe_defer(interaction, ephemeral=True, thinking=True)
         except Exception:
             pass
 
@@ -4188,7 +4200,7 @@ class SignupStaffView(discord.ui.View):
     @discord.ui.button(label="Rifiuta", style=discord.ButtonStyle.danger, custom_id="signup_staff_reject")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
-            await interaction.response.defer(ephemeral=True)
+            await safe_defer(interaction, ephemeral=True, thinking=True)
         except Exception:
             pass
 
@@ -4687,6 +4699,24 @@ async def sync_pending_signup_roles_loop():
         await asyncio.sleep(15)
 
 
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error):
+    """Logga e risponde agli errori degli slash command senza far scadere l'interazione."""
+    original_error = getattr(error, "original", error)
+    print(f"[SLASH ERROR] Comando={getattr(interaction.command, 'name', 'sconosciuto')} Errore={type(original_error).__name__}: {original_error!r}")
+
+    message = f"❌ Errore comando: `{type(original_error).__name__}`"
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.NotFound as e:
+        print(f"[SLASH ERROR RESPONSE NOTFOUND] Interazione scaduta: {e}")
+    except Exception as e:
+        print(f"[SLASH ERROR RESPONSE FAILED] {type(e).__name__}: {e}")
+
+
 @bot.event
 async def on_ready():
     try:
@@ -4772,7 +4802,7 @@ class SquadraRealeModal(discord.ui.Modal, title="Assegna squadra reale"):
             await interaction.response.send_message("❌ Solo lo staff può completare questa registrazione.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True, thinking=True)
 
         guild = interaction.guild
         member = await get_member_safe(guild, self.member_id)
@@ -5067,8 +5097,12 @@ class MarketToggleButton(discord.ui.Button):
 
 @tree.command(name="mercato_stato", description="Staff: mostra lo stato mercato e permette di aprirlo/chiuderlo")
 async def mercato_stato(interaction: discord.Interaction):
+    # Defer immediato: evita discord.errors.NotFound 10062 Unknown interaction
+    # quando Supabase o Railway impiegano più di 3 secondi a rispondere.
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
     if not is_admin(interaction):
-        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        await safe_send(interaction, "❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
     opened = is_market_open()
@@ -5086,17 +5120,20 @@ async def mercato_stato(interaction: discord.Interaction):
             color=discord.Color.red()
         )
 
-    await interaction.response.send_message(embed=embed, view=MarketStatusView(), ephemeral=True)
+    await safe_send(interaction, embed=embed, view=MarketStatusView(), ephemeral=True)
 
 
 @tree.command(name="stato_mercato", description="Mostra se il mercato è aperto o chiuso")
 async def stato_mercato(interaction: discord.Interaction):
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    opened = is_market_open()
     embed = discord.Embed(
         title="📊 Stato mercato",
         description=f"Il mercato è: **{market_status_label()}**",
-        color=discord.Color.green() if is_market_open() else discord.Color.red()
+        color=discord.Color.green() if opened else discord.Color.red()
     )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await safe_send(interaction, embed=embed, ephemeral=True)
 
 
 
@@ -5416,7 +5453,7 @@ class AuctionLeagueSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         try:
-            await interaction.response.defer(ephemeral=True)
+            await safe_defer(interaction, ephemeral=True, thinking=True)
         except Exception:
             pass
 
@@ -5508,7 +5545,7 @@ class AuctionTeamSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         try:
-            await interaction.response.defer(ephemeral=True)
+            await safe_defer(interaction, ephemeral=True, thinking=True)
         except Exception:
             pass
 
@@ -5657,7 +5694,7 @@ class AuctionPlayerSelectView(discord.ui.View):
 @tree.command(name="asta", description="Avvia un'asta guidata: campionato → squadra → giocatore libero")
 async def asta(interaction: discord.Interaction):
     try:
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True, thinking=True)
     except Exception as e:
         print(f"[ASTA] Defer fallito: {e}")
         return
@@ -6042,7 +6079,7 @@ async def chiudi_asta(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Solo lo staff può chiudere manualmente un'asta.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True, thinking=True)
 
     conn = connect()
     cur = conn.cursor()
@@ -6239,7 +6276,7 @@ async def rosa(interaction: discord.Interaction):
 @tree.command(name="mercato", description="Mostra giocatori liberi filtrabili")
 @app_commands.describe(ruolo="Ruolo, es. ST, CM, CB", overall_min="Overall minimo", overall_max="Overall massimo")
 async def mercato(interaction: discord.Interaction, ruolo: str = None, overall_min: int = 0, overall_max: int = 99):
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True, thinking=True)
 
     conn = connect()
     cur = conn.cursor()
@@ -7118,7 +7155,7 @@ async def diagnostica_squadra(interaction: discord.Interaction, nome: str):
 @tree.command(name="lista_squadre", description="Mostra le squadre reali disponibili")
 @app_commands.describe(nome="Filtro nome squadra, opzionale")
 async def lista_squadre(interaction: discord.Interaction, nome: str = None):
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True, thinking=True)
 
     conn = connect()
     cur = conn.cursor()
@@ -7709,7 +7746,7 @@ async def reset_campionato(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Solo gli admin possono resettare il campionato.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True, thinking=True)
 
     await create_backup_before_sensitive_action("generazione_campionato")
 
@@ -8719,7 +8756,7 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
         await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True, thinking=True)
 
     club_name = str(squadra).strip()
     players, avg_ovr, budget = get_team_stats_reale(club_name, include_owned_by=str(utente.id))
@@ -8868,7 +8905,7 @@ async def mia_squadra(interaction: discord.Interaction):
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True, thinking=True)
 
     conn = connect()
     cur = conn.cursor()
@@ -9756,7 +9793,7 @@ async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str]
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True, thinking=True)
 
     conn = connect()
     cur = conn.cursor()
@@ -9870,7 +9907,7 @@ async def aggiorna_budget_reali(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True, thinking=True)
 
     conn = connect()
     cur = conn.cursor()
