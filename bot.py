@@ -1421,6 +1421,66 @@ async def get_member_safe(guild, member_id):
         return None
 
 
+
+# ================= BORDO CAMPO - GESTIONE RUOLI ISCRIZIONE =================
+BASE_ROLE_ID = REQUEST_ROLE_ID                 # 1495072035624325130
+PRE_SIGNUP_ROLE_ID = SIGNUP_PENDING_ROLE_ID    # 1505180973208440954
+REGISTERED_ROLE_ID = SIGNUP_REGISTERED_ROLE_ID # 1505181066695016619
+
+
+async def apply_signup_role_pending(guild, member, reason="Richiesta iscrizione FC26"):
+    """Quando un player fa richiesta: aggiunge PRE ISCRITTO e lascia il ruolo base."""
+    if not guild or not member:
+        return
+
+    try:
+        pre_role = guild.get_role(int(PRE_SIGNUP_ROLE_ID))
+
+        if pre_role and pre_role not in getattr(member, "roles", []):
+            await member.add_roles(pre_role, reason=reason)
+    except Exception as e:
+        print(f"[SIGNUP ROLES] Errore pending: {e}")
+
+
+async def apply_signup_role_accepted(guild, member, reason="Iscrizione FC26 accettata"):
+    """Quando viene accettato: aggiunge ISCRITTO FC26 e rimuove BASE + PRE ISCRITTO."""
+    if not guild or not member:
+        return
+
+    try:
+        base_role = guild.get_role(int(BASE_ROLE_ID))
+        pre_role = guild.get_role(int(PRE_SIGNUP_ROLE_ID))
+        registered_role = guild.get_role(int(REGISTERED_ROLE_ID))
+
+        roles_to_remove = [
+            role for role in (base_role, pre_role)
+            if role and role in getattr(member, "roles", [])
+        ]
+
+        if roles_to_remove:
+            await member.remove_roles(*roles_to_remove, reason=reason)
+
+        if registered_role and registered_role not in getattr(member, "roles", []):
+            await member.add_roles(registered_role, reason=reason)
+    except Exception as e:
+        print(f"[SIGNUP ROLES] Errore accepted: {e}")
+
+
+async def apply_signup_role_rejected(guild, member, reason="Iscrizione FC26 rifiutata"):
+    """Quando viene rifiutato: rimuove PRE ISCRITTO e lascia il ruolo base."""
+    if not guild or not member:
+        return
+
+    try:
+        pre_role = guild.get_role(int(PRE_SIGNUP_ROLE_ID))
+
+        if pre_role and pre_role in getattr(member, "roles", []):
+            await member.remove_roles(pre_role, reason=reason)
+    except Exception as e:
+        print(f"[SIGNUP ROLES] Errore rejected: {e}")
+
+# ========================================================================
+
 def _font(size=24, bold=False):
     candidates = [
         "arialbd.ttf" if bold else "arial.ttf",
@@ -3357,11 +3417,13 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
             conn.close()
 
             try:
-                role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
-                if role:
-                    await interaction.user.add_roles(role)
+                await apply_signup_role_pending(
+                    interaction.guild,
+                    interaction.user,
+                    reason="Richiesta iscrizione FC26"
+                )
             except Exception as e:
-                print(f"[SIGNUP MODAL] Errore ruolo pending: {e}")
+                print(f"[SIGNUP MODAL] Errore ruolo PRE-ISCRITTO: {e}")
 
             try:
                 staff_channel = interaction.guild.get_channel(int(SIGNUP_STAFF_CHANNEL_ID))
@@ -3853,14 +3915,13 @@ class SignupClubSelect(discord.ui.Select):
         try:
             member = await get_member_safe(interaction.guild, discord_id)
             if member:
-                pending_role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
-                registered_role = interaction.guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
-                if pending_role:
-                    await member.remove_roles(pending_role)
-                if registered_role:
-                    await member.add_roles(registered_role)
+                await apply_signup_role_accepted(
+                    interaction.guild,
+                    member,
+                    reason="Iscrizione FC26 accettata con club"
+                )
         except Exception as e:
-            print(f"[SIGNUP CLUB SELECT] Errore ruoli: {e}")
+            print(f"[SIGNUP CLUB SELECT] Errore ruoli accepted: {e}")
 
         embed = discord.Embed(
             title="✅ Iscrizione accettata",
@@ -4060,12 +4121,11 @@ class SignupStaffView(discord.ui.View):
 
         if member:
             try:
-                pending_role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
-                registered_role = interaction.guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
-                if pending_role:
-                    await member.remove_roles(pending_role)
-                if registered_role:
-                    await member.add_roles(registered_role)
+                await apply_signup_role_accepted(
+                    interaction.guild,
+                    member,
+                    reason="Iscrizione FC26 accettata"
+                )
             except Exception as e:
                 print(f"[SIGNUP STAFF] Errore ruoli accetta: {e}")
 
@@ -4127,9 +4187,11 @@ class SignupStaffView(discord.ui.View):
         try:
             member = await get_member_safe(interaction.guild, discord_id)
             if member:
-                pending_role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
-                if pending_role:
-                    await member.remove_roles(pending_role)
+                await apply_signup_role_rejected(
+                    interaction.guild,
+                    member,
+                    reason="Iscrizione FC26 rifiutata"
+                )
         except Exception as e:
             print(f"[SIGNUP STAFF] Errore ruoli rifiuta: {e}")
 
@@ -4559,6 +4621,46 @@ def sync_fc26_dataset_to_bot_tables():
 
 # ===========================================================
 
+
+async def sync_pending_signup_roles_loop():
+    """Assegna automaticamente PRE ISCRITTO anche alle richieste create dal sito."""
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        try:
+            guild = bot.get_guild(int(GUILD_ID))
+
+            if guild:
+                conn = connect()
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT id, discord_id
+                    FROM signup_requests
+                    WHERE status = 'pending'
+                      AND discord_id IS NOT NULL
+                    ORDER BY id DESC
+                    LIMIT 50
+                """)
+                rows = cur.fetchall()
+                conn.close()
+
+                for row in rows:
+                    discord_id = str(row.get("discord_id"))
+                    member = await get_member_safe(guild, discord_id)
+
+                    if member:
+                        await apply_signup_role_pending(
+                            guild,
+                            member,
+                            reason="Richiesta iscrizione FC26 da sito/Discord"
+                        )
+
+        except Exception as e:
+            print(f"[SIGNUP ROLES] Errore sync pending: {e}")
+
+        await asyncio.sleep(15)
+
+
 @bot.event
 async def on_ready():
     try:
@@ -4600,6 +4702,11 @@ async def on_ready():
         bot.loop.create_task(process_website_signup_actions_loop())
     except Exception as e:
         print(f"[ON_READY] process_website_signup_actions_loop non avviato: {e}")
+
+    try:
+        bot.loop.create_task(sync_pending_signup_roles_loop())
+    except Exception as e:
+        print(f"[ON_READY] sync_pending_signup_roles_loop non avviato: {e}")
 
     guild = get_guild()
 
@@ -10119,14 +10226,11 @@ async def apply_signup_accept_from_website(req, request_id, club_name, handled_b
 
     if guild and member:
         try:
-            pending_role = guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
-            registered_role = guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
-
-            if pending_role:
-                await member.remove_roles(pending_role, reason="Iscrizione accettata dal sito")
-
-            if registered_role:
-                await member.add_roles(registered_role, reason="Iscrizione accettata dal sito")
+            await apply_signup_role_accepted(
+                guild,
+                member,
+                reason="Iscrizione accettata dal sito"
+            )
         except Exception as e:
             print(f"[WEBSITE SYNC] Errore ruoli accepted: {e}")
 
@@ -10162,9 +10266,11 @@ async def apply_signup_reject_from_website(req, request_id, handled_by, handled_
 
     if guild and member:
         try:
-            pending_role = guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
-            if pending_role:
-                await member.remove_roles(pending_role, reason="Iscrizione rifiutata dal sito")
+            await apply_signup_role_rejected(
+                guild,
+                member,
+                reason="Iscrizione rifiutata dal sito"
+            )
         except Exception as e:
             print(f"[WEBSITE SYNC] Errore ruoli rejected: {e}")
 
