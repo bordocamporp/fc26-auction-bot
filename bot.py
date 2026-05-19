@@ -347,32 +347,6 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-
-# ================= SAFE INTERACTION RESPONSE HELPERS =================
-async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True, thinking: bool = True):
-    """Evita Unknown interaction: risponde subito ai comandi lenti."""
-    try:
-        if not interaction.response.is_done():
-            await safe_defer(interaction, ephemeral=ephemeral, thinking=thinking)
-    except Exception as e:
-        print(f"[SAFE DEFER] {e}")
-
-
-async def safe_send(interaction: discord.Interaction, *args, **kwargs):
-    """Invia risposta o followup in base allo stato dell'interazione."""
-    try:
-        if interaction.response.is_done():
-            return await interaction.followup.send(*args, **kwargs)
-        return await safe_send(interaction, *args, **kwargs)
-    except discord.NotFound:
-        # Interazione scaduta: non mandare in crash il comando.
-        print("[SAFE SEND] Interazione scaduta / Unknown interaction")
-        return None
-    except Exception as e:
-        print(f"[SAFE SEND] {e}")
-        return None
-# ====================================================================
-
 auction_timers = {}
 auction_last_bids = {}
 
@@ -438,6 +412,31 @@ def safe_int(value, default=0):
         return int(float(value))
     except Exception:
         return default
+
+
+async def safe_send(interaction: discord.Interaction, *args, **kwargs):
+    """Invia una risposta Discord senza creare ricorsione.
+
+    Non sostituire mai interaction.response.send_message con questa funzione.
+    Usala solo così: await safe_send(interaction, "testo", ephemeral=True)
+    """
+    try:
+        if interaction.response.is_done():
+            return await interaction.followup.send(*args, **kwargs)
+        return await interaction.response.send_message(*args, **kwargs)
+    except Exception as e:
+        print(f"[SAFE SEND ERROR] {e}")
+        return None
+
+
+async def safe_defer(interaction: discord.Interaction, *, ephemeral=False, thinking=False):
+    """Esegue defer una sola volta; evita doppie risposte e ricorsione."""
+    try:
+        if not interaction.response.is_done():
+            return await interaction.response.defer(ephemeral=ephemeral, thinking=thinking)
+    except Exception as e:
+        print(f"[SAFE DEFER ERROR] {e}")
+    return None
 
 
 def base_price_from_overall(overall):
@@ -1617,14 +1616,14 @@ async def get_open_auction_for_message(message_id=None):
 
 async def place_bid(interaction: discord.Interaction, increment=None, all_in=False):
     if not is_market_open():
-        await safe_send(interaction, "🔒 Il mercato è chiuso. Non puoi fare offerte in questo momento.", ephemeral=True)
+        await interaction.response.send_message("🔒 Il mercato è chiuso. Non puoi fare offerte in questo momento.", ephemeral=True)
         return
 
     message_id = str(interaction.message.id) if interaction.message else None
     auction = await get_open_auction_for_message(message_id)
 
     if not auction:
-        await safe_send(interaction, "Non c'è nessuna asta aperta su questo messaggio.", ephemeral=True)
+        await interaction.response.send_message("Non c'è nessuna asta aperta su questo messaggio.", ephemeral=True)
         return
 
     conn = connect()
@@ -1635,18 +1634,18 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
 
     if not manager:
         conn.close()
-        await safe_send(interaction, "Prima devi essere registrato/iscritto per partecipare alle aste.", ephemeral=True)
+        await interaction.response.send_message("Prima devi essere registrato/iscritto per partecipare alle aste.", ephemeral=True)
         return
 
     if str(auction.get("highest_bidder_id") or "") == str(interaction.user.id) and not all_in:
         conn.close()
-        await safe_send(interaction, "Sei già il miglior offerente.", ephemeral=True)
+        await interaction.response.send_message("Sei già il miglior offerente.", ephemeral=True)
         return
 
     ok, group, current, limit = can_add_player_to_roster(interaction.user.id, auction["player_position"])
     if not ok:
         conn.close()
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             f"Non puoi offrire: hai già raggiunto il limite per {role_label(group)} ({current}/{limit}).",
             ephemeral=True
         )
@@ -1663,17 +1662,17 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
 
     if new_bid <= current_bid:
         conn.close()
-        await safe_send(interaction, "L'offerta deve superare quella attuale.", ephemeral=True)
+        await interaction.response.send_message("L'offerta deve superare quella attuale.", ephemeral=True)
         return
 
     if new_bid < current_bid + MIN_RAISE:
         conn.close()
-        await safe_send(interaction, f"Devi rilanciare almeno di {MIN_RAISE} crediti.", ephemeral=True)
+        await interaction.response.send_message(f"Devi rilanciare almeno di {MIN_RAISE} crediti.", ephemeral=True)
         return
 
     if manager_budget < new_bid:
         conn.close()
-        await safe_send(interaction, "Budget insufficiente.", ephemeral=True)
+        await interaction.response.send_message("Budget insufficiente.", ephemeral=True)
         return
 
     cur.execute("""
@@ -1737,7 +1736,7 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
     except Exception as e:
         print(f"[ASTA] Errore update messaggio offerta: {e}")
 
-    await safe_send(interaction, 
+    await interaction.response.send_message(
         f"🔥 Offerta registrata: **{new_bid}** crediti per **{auction['player_name']}**.",
         ephemeral=True
     )
@@ -1755,17 +1754,17 @@ class CustomBidModal(discord.ui.Modal, title="Offerta personalizzata"):
         raw = str(self.amount.value).strip()
 
         if not raw.isdigit():
-            await safe_send(interaction, "Inserisci solo numeri interi.", ephemeral=True)
+            await interaction.response.send_message("Inserisci solo numeri interi.", ephemeral=True)
             return
 
         increment = int(raw)
 
         if increment <= 0:
-            await safe_send(interaction, "Il rilancio deve essere maggiore di 0.", ephemeral=True)
+            await interaction.response.send_message("Il rilancio deve essere maggiore di 0.", ephemeral=True)
             return
 
         if increment % 10 != 0:
-            await safe_send(interaction, "Il rilancio personalizzato deve essere multiplo di 10.", ephemeral=True)
+            await interaction.response.send_message("Il rilancio personalizzato deve essere multiplo di 10.", ephemeral=True)
             return
 
         await place_bid(interaction, increment=increment)
@@ -1889,7 +1888,7 @@ class ConfirmDangerView(discord.ui.View):
     @discord.ui.button(label="Conferma", style=discord.ButtonStyle.danger, emoji="⚠️")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not can_use_dangerous_commands(interaction.user):
-            await safe_send(interaction, "❌ Non hai i permessi per confermare questa azione.", ephemeral=True)
+            await interaction.response.send_message("❌ Non hai i permessi per confermare questa azione.", ephemeral=True)
             return
 
         await self.callback_func(interaction)
@@ -1920,7 +1919,7 @@ class ConfirmDangerView(discord.ui.View):
 
 async def ask_danger_confirmation(interaction, action_name, description, callback_func):
     if not can_use_dangerous_commands(interaction.user):
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             "❌ Non hai i permessi per usare questa azione critica.",
             ephemeral=True
         )
@@ -1932,7 +1931,7 @@ async def ask_danger_confirmation(interaction, action_name, description, callbac
         color=discord.Color.orange()
     )
 
-    await safe_send(interaction, 
+    await interaction.response.send_message(
         embed=embed,
         view=ConfirmDangerView(action_name, callback_func),
         ephemeral=True
@@ -2015,7 +2014,6 @@ async def create_backup_before_sensitive_action(reason):
 
 @tree.command(name="backup_now", description="Owner staff: crea subito un backup del database")
 async def backup_now(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     async def do_backup(confirm_interaction: discord.Interaction):
         path, error = create_database_backup("manuale")
 
@@ -2058,15 +2056,14 @@ async def backup_now(interaction: discord.Interaction):
 
 @tree.command(name="backup_list", description="Staff: mostra gli ultimi backup disponibili")
 async def backup_list(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not can_use_dangerous_commands(interaction.user):
-        await safe_send(interaction, "❌ Solo lo staff autorizzato può vedere i backup.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff autorizzato può vedere i backup.", ephemeral=True)
         return
 
     backups = list_database_backups()
 
     if not backups:
-        await safe_send(interaction, "Nessun backup disponibile.", ephemeral=True)
+        await interaction.response.send_message("Nessun backup disponibile.", ephemeral=True)
         return
 
     lines = []
@@ -2074,7 +2071,7 @@ async def backup_list(interaction: discord.Interaction):
         size_mb = backup.stat().st_size / (1024 * 1024)
         lines.append(f"**{idx}.** `{backup.name}` — {size_mb:.2f} MB")
 
-    await safe_send(interaction, 
+    await interaction.response.send_message(
         "📦 **Backup disponibili**\n\n" + "\n".join(lines),
         ephemeral=True
     )
@@ -2100,18 +2097,18 @@ class RestoreBackupSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if not is_admin(interaction):
-            await safe_send(interaction, "❌ Solo lo staff può ripristinare backup.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può ripristinare backup.", ephemeral=True)
             return
 
         selected = BACKUP_DIR / self.values[0]
         db_path = get_database_path()
 
         if not selected.exists():
-            await safe_send(interaction, "❌ Backup non trovato.", ephemeral=True)
+            await interaction.response.send_message("❌ Backup non trovato.", ephemeral=True)
             return
 
         if not db_path:
-            await safe_send(interaction, "❌ Database attuale non trovato.", ephemeral=True)
+            await interaction.response.send_message("❌ Database attuale non trovato.", ephemeral=True)
             return
 
         # Backup di sicurezza prima del restore
@@ -2120,7 +2117,7 @@ class RestoreBackupSelect(discord.ui.Select):
         try:
             shutil.copy2(selected, db_path)
         except Exception as e:
-            await safe_send(interaction, f"❌ Errore durante il ripristino: `{e}`", ephemeral=True)
+            await interaction.response.send_message(f"❌ Errore durante il ripristino: `{e}`", ephemeral=True)
             return
 
         embed = discord.Embed(
@@ -2142,15 +2139,14 @@ class RestoreBackupView(discord.ui.View):
 
 @tree.command(name="restore_backup", description="Staff: ripristina un backup del database")
 async def restore_backup(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not can_use_dangerous_commands(interaction.user):
-        await safe_send(interaction, "❌ Solo lo staff autorizzato può ripristinare backup.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff autorizzato può ripristinare backup.", ephemeral=True)
         return
 
     backups = list_database_backups()
 
     if not backups:
-        await safe_send(interaction, "Nessun backup disponibile da ripristinare.", ephemeral=True)
+        await interaction.response.send_message("Nessun backup disponibile da ripristinare.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -2163,7 +2159,7 @@ async def restore_backup(interaction: discord.Interaction):
         color=discord.Color.orange()
     )
 
-    await safe_send(interaction, embed=embed, view=RestoreBackupView(backups), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=RestoreBackupView(backups), ephemeral=True)
 
 # ===========================================================
 
@@ -2213,13 +2209,13 @@ class RandomLeagueNamesModal(discord.ui.Modal, title="Nomi campionati random"):
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_admin(interaction):
-            await safe_send(interaction, "❌ Solo lo staff può configurare i gironi.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può configurare i gironi.", ephemeral=True)
             return
 
         raw_count = str(self.group_count.value).strip()
 
         if not raw_count.isdigit() or int(raw_count) <= 0:
-            await safe_send(interaction, "❌ Inserisci un numero valido di campionati/gironi.", ephemeral=True)
+            await interaction.response.send_message("❌ Inserisci un numero valido di campionati/gironi.", ephemeral=True)
             return
 
         count = min(int(raw_count), 25)
@@ -2259,7 +2255,7 @@ class RandomLeagueNamesModal(discord.ui.Modal, title="Nomi campionati random"):
         )
         embed.set_footer(text="Se usi i campionati reali, il bot userà invece i nomi reali delle competizioni.")
 
-        await safe_send(interaction, embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class GroupNamingModeView(discord.ui.View):
@@ -2269,14 +2265,14 @@ class GroupNamingModeView(discord.ui.View):
     @discord.ui.button(label="Random con nomi custom", style=discord.ButtonStyle.primary, emoji="🎲")
     async def random_custom(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_admin(interaction):
-            await safe_send(interaction, "❌ Solo lo staff può configurare i gironi.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può configurare i gironi.", ephemeral=True)
             return
         await interaction.response.send_modal(RandomLeagueNamesModal())
 
     @discord.ui.button(label="Campionati reali automatici", style=discord.ButtonStyle.success, emoji="🏆")
     async def real_leagues(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_admin(interaction):
-            await safe_send(interaction, "❌ Solo lo staff può configurare i gironi.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può configurare i gironi.", ephemeral=True)
             return
 
         conn = connect()
@@ -2301,9 +2297,8 @@ class GroupNamingModeView(discord.ui.View):
 
 @tree.command(name="configura_gironi", description="Staff: configura nomi gironi random o campionati reali")
 async def configura_gironi(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo lo staff può configurare i gironi.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff può configurare i gironi.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -2318,7 +2313,7 @@ async def configura_gironi(interaction: discord.Interaction):
         color=discord.Color.blue()
     )
 
-    await safe_send(interaction, embed=embed, view=GroupNamingModeView(), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=GroupNamingModeView(), ephemeral=True)
 
 
 def get_random_group_names_for_generation(default_count=1):
@@ -2372,9 +2367,8 @@ def get_real_league_names_from_assigned_clubs():
 
 @tree.command(name="nomi_gironi_random", description="Staff: imposta direttamente i nomi dei gironi random")
 async def nomi_gironi_random(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo lo staff può configurare i gironi.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff può configurare i gironi.", ephemeral=True)
         return
 
     await interaction.response.send_modal(RandomLeagueNamesModal())
@@ -2600,7 +2594,7 @@ async def check_player_inactivity():
             rows = cur.fetchall()
             conn.close()
 
-            now = datetime.now()
+            now = datetime.utcnow()
 
             for row in rows:
                 discord_id = str(row["discord_id"])
@@ -2674,14 +2668,13 @@ async def check_player_inactivity():
     app_commands.Choice(name="Risposta ricevuta", value="response"),
 ])
 async def attivita_player(interaction: discord.Interaction, utente: discord.Member, tipo: app_commands.Choice[str]):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not can_use_normal_staff(interaction.user):
-        await safe_send(interaction, "❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
     update_player_activity(utente.id, tipo.value)
 
-    await safe_send(interaction, 
+    await interaction.response.send_message(
         f"✅ Attività aggiornata per {utente.mention}: **{tipo.name}**.",
         ephemeral=True
     )
@@ -2701,10 +2694,10 @@ async def attivita_player(interaction: discord.Interaction, utente: discord.Memb
 @tree.command(name="controllo_inattivi", description="Staff: esegue subito il controllo inattività")
 async def controllo_inattivi(interaction: discord.Interaction):
     if not can_use_normal_staff(interaction.user):
-        await safe_send(interaction, "❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
-    await safe_defer(interaction, ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
 
     # Esegue un controllo singolo senza aspettare il loop.
     try:
@@ -2716,7 +2709,7 @@ async def controllo_inattivi(interaction: discord.Interaction):
         rows = cur.fetchall()
         conn.close()
 
-        now = datetime.now()
+        now = datetime.utcnow()
         sent = 0
 
         for row in rows:
@@ -2960,10 +2953,10 @@ class EndSeasonView(discord.ui.View):
     @discord.ui.button(label="Avvia stagione nuova", style=discord.ButtonStyle.success, emoji="✅")
     async def start_new_season(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_admin(interaction):
-            await safe_send(interaction, "❌ Solo lo staff può avviare la nuova stagione.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può avviare la nuova stagione.", ephemeral=True)
             return
 
-        await safe_defer(interaction, ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
 
         close_active_season()
         season_id, notes = await generate_new_season_competitions(interaction, with_europe=True)
@@ -2986,7 +2979,7 @@ class EndSeasonView(discord.ui.View):
     @discord.ui.button(label="Avvia stagione con nuovi campionati", style=discord.ButtonStyle.primary, emoji="🏗️")
     async def start_with_new_leagues(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_admin(interaction):
-            await safe_send(interaction, "❌ Solo lo staff può modificare la struttura campionati.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può modificare la struttura campionati.", ephemeral=True)
             return
 
         leagues = get_current_league_names()
@@ -3024,7 +3017,7 @@ class LeagueExpansionSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if not is_admin(interaction):
-            await safe_send(interaction, "❌ Solo lo staff può modificare i campionati.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può modificare i campionati.", ephemeral=True)
             return
 
         selected_league = self.values[0]
@@ -3059,7 +3052,7 @@ class LeagueExpansionTypeView(discord.ui.View):
     @discord.ui.button(label="Campionato inferiore", style=discord.ButtonStyle.secondary, emoji="⬇️")
     async def lower_league(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_admin(interaction):
-            await safe_send(interaction, "❌ Solo lo staff può modificare i campionati.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può modificare i campionati.", ephemeral=True)
             return
 
         await interaction.response.send_modal(NewLeagueNameModal(self.selected_league, "lower"))
@@ -3067,7 +3060,7 @@ class LeagueExpansionTypeView(discord.ui.View):
     @discord.ui.button(label="Nuovo campionato", style=discord.ButtonStyle.primary, emoji="🆕")
     async def new_top_league(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_admin(interaction):
-            await safe_send(interaction, "❌ Solo lo staff può modificare i campionati.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può modificare i campionati.", ephemeral=True)
             return
 
         await interaction.response.send_modal(NewLeagueNameModal(self.selected_league, "top"))
@@ -3088,10 +3081,10 @@ class NewLeagueNameModal(discord.ui.Modal, title="Crea nuovo campionato"):
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_admin(interaction):
-            await safe_send(interaction, "❌ Solo lo staff può creare campionati.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può creare campionati.", ephemeral=True)
             return
 
-        await safe_defer(interaction, ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
         await create_backup_before_sensitive_action("nuovi_campionati")
 
         new_name = str(self.league_name.value).strip()
@@ -3124,7 +3117,6 @@ class NewLeagueNameModal(discord.ui.Modal, title="Crea nuovo campionato"):
 
 @tree.command(name="fine_stagione", description="Owner staff: chiude la stagione e avvia il flusso nuova stagione")
 async def fine_stagione(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     async def show_end_panel(confirm_interaction: discord.Interaction):
         ensure_season_tables()
         season = get_active_season()
@@ -3163,7 +3155,7 @@ async def fine_stagione(interaction: discord.Interaction):
 @tree.command(name="setup_iscrizioni", description="Staff: pubblica il pannello richiesta iscrizione FC26")
 async def setup_iscrizioni(interaction: discord.Interaction):
     try:
-        await safe_defer(interaction, ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
     except Exception as e:
         print(f"[SETUP ISCRIZIONI] Defer fallito: {e}")
         return
@@ -3226,9 +3218,8 @@ async def setup_iscrizioni(interaction: discord.Interaction):
 @tree.command(name="assegna_club", description="Staff: assegna manualmente un club a una richiesta/utente")
 @app_commands.describe(utente="Player da accettare", club="Nome del club da assegnare")
 async def assegna_club(interaction: discord.Interaction, utente: discord.Member, club: str):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not can_manage_signup(interaction.user):
-        await safe_send(interaction, "❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
     conn = connect()
@@ -3244,15 +3235,15 @@ async def assegna_club(interaction: discord.Interaction, utente: discord.Member,
     conn.close()
 
     if not request:
-        await safe_send(interaction, "❌ Questo utente non ha una richiesta pending.", ephemeral=True)
+        await interaction.response.send_message("❌ Questo utente non ha una richiesta pending.", ephemeral=True)
         return
 
     club_row = get_club_row_by_name(club)
     if not club_row:
-        await safe_send(interaction, "❌ Club non trovato nel database fc26_clubs.", ephemeral=True)
+        await interaction.response.send_message("❌ Club non trovato nel database fc26_clubs.", ephemeral=True)
         return
     if club_row["assigned_to"]:
-        await safe_send(interaction, "❌ Questo club è già stato assegnato.", ephemeral=True)
+        await interaction.response.send_message("❌ Questo club è già stato assegnato.", ephemeral=True)
         return
 
     await complete_signup_accept(interaction, int(request["id"]), club_row["name"])
@@ -3260,23 +3251,22 @@ async def assegna_club(interaction: discord.Interaction, utente: discord.Member,
 
 @tree.command(name="club_liberi", description="Mostra i club liberi per le iscrizioni")
 async def club_liberi(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not can_manage_signup(interaction.user):
-        await safe_send(interaction, "❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
     clubs = get_free_signup_clubs()
     text = "\n".join(f"• {c}" for c in clubs[:50]) if clubs else "Nessun club libero."
-    await safe_send(interaction, f"🏟️ **Club liberi**\n{text}", ephemeral=True)
+    await interaction.response.send_message(f"🏟️ **Club liberi**\n{text}", ephemeral=True)
 
 
 @tree.command(name="libera_club", description="Staff: libera il club di un player mantenendo rosa, budget e dati per il prossimo assegnatario")
 @app_commands.describe(utente="Player che abbandona o da rimuovere dal club")
 async def libera_club(interaction: discord.Interaction, utente: discord.Member):
     if not can_manage_signup(interaction.user):
-        await safe_send(interaction, "❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
-    await safe_defer(interaction, ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
 
     conn = connect()
     cur = conn.cursor()
@@ -3353,7 +3343,7 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
     async def on_submit(self, interaction: discord.Interaction):
         # Risposta immediata al modal: evita "Unknown interaction" / "Qualcosa è andato storto".
         try:
-            await safe_defer(interaction, ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
         except Exception as e:
             print(f"[SIGNUP MODAL] Defer fallito: {e}")
             return
@@ -3569,13 +3559,13 @@ def get_free_signup_leagues():
 async def complete_signup_accept(interaction: discord.Interaction, request_id: int, club: str):
     request = get_signup_request(request_id)
     if not request or request["status"] != "pending":
-        await safe_send(interaction, "Richiesta non valida o già gestita.", ephemeral=True)
+        await interaction.response.send_message("Richiesta non valida o già gestita.", ephemeral=True)
         return
 
     guild = interaction.guild
     member = await get_member_safe(guild, request["discord_id"]) if "get_member_safe" in globals() else guild.get_member(int(request["discord_id"]))
     if not member:
-        await safe_send(interaction, "Player non trovato nel server.", ephemeral=True)
+        await interaction.response.send_message("Player non trovato nel server.", ephemeral=True)
         return
 
     conn = connect()
@@ -3590,11 +3580,11 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     club_row = cur.fetchone()
     if not club_row:
         conn.close()
-        await safe_send(interaction, "❌ Club non trovato nel database.", ephemeral=True)
+        await interaction.response.send_message("❌ Club non trovato nel database.", ephemeral=True)
         return
     if club_row["assigned_to"]:
         conn.close()
-        await safe_send(interaction, "❌ Questo club non è più libero. Scegli un altro club.", ephemeral=True)
+        await interaction.response.send_message("❌ Questo club non è più libero. Scegli un altro club.", ephemeral=True)
         return
 
     club_name = club_row["name"]
@@ -3628,7 +3618,7 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
 
             if not players:
                 conn.close()
-                await safe_send(interaction, 
+                await interaction.response.send_message(
                     "❌ Modalità Squadre Reali attiva, ma non ho trovato giocatori liberi per questo club nel database. "
                     "Usa `/diagnostica_squadra nome:` per verificare il nome esatto della squadra nel database.",
                     ephemeral=True
@@ -3769,7 +3759,7 @@ class SignupLeagueSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         try:
-            await safe_defer(interaction, ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
         except Exception:
             pass
 
@@ -3865,7 +3855,7 @@ class SignupClubSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         try:
-            await safe_defer(interaction, ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
         except Exception:
             pass
 
@@ -4102,7 +4092,7 @@ class SignupStaffView(discord.ui.View):
     @discord.ui.button(label="Accetta", style=discord.ButtonStyle.success, custom_id="signup_staff_accept")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
-            await safe_defer(interaction, ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
         except Exception:
             pass
 
@@ -4198,7 +4188,7 @@ class SignupStaffView(discord.ui.View):
     @discord.ui.button(label="Rifiuta", style=discord.ButtonStyle.danger, custom_id="signup_staff_reject")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
-            await safe_defer(interaction, ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
         except Exception:
             pass
 
@@ -4273,15 +4263,15 @@ class StaffDecisionSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if not can_use_normal_staff(interaction.user):
-            await safe_send(interaction, "❌ Solo lo staff può gestire le richieste.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può gestire le richieste.", ephemeral=True)
             return
 
         request = get_signup_request(self.request_id)
         if not request:
-            await safe_send(interaction, "Richiesta non trovata.", ephemeral=True)
+            await interaction.response.send_message("Richiesta non trovata.", ephemeral=True)
             return
         if request["status"] != "pending":
-            await safe_send(interaction, "Questa richiesta è già stata gestita.", ephemeral=True)
+            await interaction.response.send_message("Questa richiesta è già stata gestita.", ephemeral=True)
             return
 
         if self.values[0] == "reject":
@@ -4354,13 +4344,13 @@ class LeagueAssignSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if not can_use_normal_staff(interaction.user):
-            await safe_send(interaction, "❌ Solo lo staff può assegnare il club.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può assegnare il club.", ephemeral=True)
             return
 
         league = self.values[0]
         clubs = get_free_signup_clubs(league)
         if not clubs:
-            await safe_send(interaction, "❌ Non ci sono club liberi in questo campionato.", ephemeral=True)
+            await interaction.response.send_message("❌ Non ci sono club liberi in questo campionato.", ephemeral=True)
             return
 
         request = get_signup_request(self.request_id)
@@ -4389,7 +4379,7 @@ class ClubAssignSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if not can_use_normal_staff(interaction.user):
-            await safe_send(interaction, "❌ Solo lo staff può assegnare il club.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può assegnare il club.", ephemeral=True)
             return
         await complete_signup_accept(interaction, self.request_id, self.values[0])
 
@@ -4428,7 +4418,7 @@ class SignupStartView(discord.ui.View):
                         ephemeral=True
                     )
                 else:
-                    await safe_send(interaction, 
+                    await interaction.response.send_message(
                         f"❌ Errore apertura modulo: `{e}`",
                         ephemeral=True
                     )
@@ -4510,7 +4500,7 @@ def sync_fc26_dataset_to_bot_tables():
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS players (
-                id TEXT PRIMARY KEY,
+                id BIGINT PRIMARY KEY,
                 name TEXT,
                 team TEXT,
                 league TEXT,
@@ -4575,7 +4565,7 @@ def sync_fc26_dataset_to_bot_tables():
                 nation, age, weak_foot, skill_moves
             )
             SELECT
-                {expr('id')}::text AS id,
+                NULLIF(TRIM({expr('id')}::text), '')::bigint AS id,
                 {expr('name')}::text AS name,
                 {expr('team')}::text AS team,
                 {expr('league')}::text AS league,
@@ -4593,6 +4583,7 @@ def sync_fc26_dataset_to_bot_tables():
                 NULLIF({expr('skill_moves', "NULL")}::text, '')::integer AS skill_moves
             FROM players_fc26
             WHERE {expr('id')} IS NOT NULL
+              AND TRIM({expr('id')}::text) <> ''
             ON CONFLICT (id) DO UPDATE SET
                 name = EXCLUDED.name,
                 team = EXCLUDED.team,
@@ -4778,10 +4769,10 @@ class SquadraRealeModal(discord.ui.Modal, title="Assegna squadra reale"):
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_admin(interaction):
-            await safe_send(interaction, "❌ Solo lo staff può completare questa registrazione.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può completare questa registrazione.", ephemeral=True)
             return
 
-        await safe_defer(interaction, ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
 
         guild = interaction.guild
         member = await get_member_safe(guild, self.member_id)
@@ -4864,14 +4855,14 @@ class RegistraPreIscrittoSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if not is_admin(interaction):
-            await safe_send(interaction, "❌ Solo lo staff può registrare i player.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può registrare i player.", ephemeral=True)
             return
 
         member_id = int(self.values[0])
         member = await get_member_safe(interaction.guild, member_id)
 
         if not member:
-            await safe_send(interaction, "Utente non trovato nel server.", ephemeral=True)
+            await interaction.response.send_message("Utente non trovato nel server.", ephemeral=True)
             return
 
         mode = get_league_mode()
@@ -4959,21 +4950,20 @@ async def on_message(message: discord.Message):
 
 @tree.command(name="registra", description="Staff: registra un player pre-iscritto")
 async def registra(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
     role = interaction.guild.get_role(int(PRE_ISCRITTO_ROLE_ID)) if interaction.guild else None
 
     if not role:
-        await safe_send(interaction, "Ruolo PRE-ISCRITTO non trovato.", ephemeral=True)
+        await interaction.response.send_message("Ruolo PRE-ISCRITTO non trovato.", ephemeral=True)
         return
 
     members = [m for m in role.members if not m.bot]
 
     if not members:
-        await safe_send(interaction, "Non ci sono player con il ruolo PRE-ISCRITTO.", ephemeral=True)
+        await interaction.response.send_message("Non ci sono player con il ruolo PRE-ISCRITTO.", ephemeral=True)
         return
 
     mode = get_league_mode()
@@ -5001,7 +4991,7 @@ async def registra(interaction: discord.Interaction):
     if len(members) > 25:
         embed.set_footer(text="Discord permette massimo 25 utenti nella tendina. Mostro i primi 25.")
 
-    await safe_send(interaction, embed=embed, view=RegistraPreIscrittoView(members), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=RegistraPreIscrittoView(members), ephemeral=True)
 
 
 
@@ -5035,7 +5025,7 @@ class MarketToggleButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         if not is_admin(interaction):
-            await safe_send(interaction, "❌ Solo lo staff può modificare lo stato del mercato.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo lo staff può modificare lo stato del mercato.", ephemeral=True)
             return
 
         new_state = not self.opened
@@ -5077,9 +5067,8 @@ class MarketToggleButton(discord.ui.Button):
 
 @tree.command(name="mercato_stato", description="Staff: mostra lo stato mercato e permette di aprirlo/chiuderlo")
 async def mercato_stato(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
     opened = is_market_open()
@@ -5097,26 +5086,24 @@ async def mercato_stato(interaction: discord.Interaction):
             color=discord.Color.red()
         )
 
-    await safe_send(interaction, embed=embed, view=MarketStatusView(), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=MarketStatusView(), ephemeral=True)
 
 
 @tree.command(name="stato_mercato", description="Mostra se il mercato è aperto o chiuso")
 async def stato_mercato(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     embed = discord.Embed(
         title="📊 Stato mercato",
         description=f"Il mercato è: **{market_status_label()}**",
         color=discord.Color.green() if is_market_open() else discord.Color.red()
     )
-    await safe_send(interaction, embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 
 @tree.command(name="budget", description="Mostra il tuo budget residuo")
 async def budget(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_spam_channel(interaction):
-        await safe_send(interaction, "❌ Usa questo comando solo nel canale SPAM-CHAT.", ephemeral=True)
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale SPAM-CHAT.", ephemeral=True)
         return
 
     conn = connect()
@@ -5126,18 +5113,17 @@ async def budget(interaction: discord.Interaction):
     conn.close()
 
     if not row:
-        await safe_send(interaction, "Prima usa /registrami.", ephemeral=True)
+        await interaction.response.send_message("Prima usa /registrami.", ephemeral=True)
         return
 
-    await safe_send(interaction, f"💰 Budget residuo: {row['budget']} crediti.", ephemeral=True)
+    await interaction.response.send_message(f"💰 Budget residuo: {row['budget']} crediti.", ephemeral=True)
 
 
 @tree.command(name="reset_budget", description="Admin: resetta il budget di tutti")
 @app_commands.describe(importo="Nuovo budget da assegnare")
 async def reset_budget(interaction: discord.Interaction, importo: int = DEFAULT_BUDGET):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
         return
 
     conn = connect()
@@ -5146,7 +5132,7 @@ async def reset_budget(interaction: discord.Interaction, importo: int = DEFAULT_
     conn.commit()
     conn.close()
 
-    await safe_send(interaction, f"✅ Budget resettato a **{importo}** crediti per tutti.")
+    await interaction.response.send_message(f"✅ Budget resettato a **{importo}** crediti per tutti.")
     await send_staff_log(
         interaction.guild,
         "💰 Budget resettato dallo staff",
@@ -5158,9 +5144,8 @@ async def reset_budget(interaction: discord.Interaction, importo: int = DEFAULT_
 
 @tree.command(name="reset_asta", description="Admin: chiude tutte le aste aperte")
 async def reset_asta(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
         return
 
     conn = connect()
@@ -5169,7 +5154,7 @@ async def reset_asta(interaction: discord.Interaction):
     conn.commit()
     conn.close()
 
-    await safe_send(interaction, "✅ Aste aperte resettate.")
+    await interaction.response.send_message("✅ Aste aperte resettate.")
     await send_staff_log(
         interaction.guild,
         "🔨 Aste resettate dallo staff",
@@ -5181,7 +5166,6 @@ async def reset_asta(interaction: discord.Interaction):
 
 @tree.command(name="database", description="Mostra statistiche del database giocatori")
 async def database(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     conn = connect()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) AS total FROM players")
@@ -5199,7 +5183,7 @@ async def database(interaction: discord.Interaction):
     embed.add_field(name="Liberi", value=str(free), inline=True)
     embed.add_field(name="Assegnati", value=str(sold), inline=True)
     embed.add_field(name="Overall medio", value=f"{avg_ovr:.1f}", inline=True)
-    await safe_send(interaction, embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 
@@ -5207,10 +5191,10 @@ async def database(interaction: discord.Interaction):
 @app_commands.describe(player_id="ID giocatore")
 async def card(interaction: discord.Interaction, player_id: str):
     if not is_spam_channel(interaction):
-        await safe_send(interaction, "❌ Usa questo comando solo nel canale SPAM-CHAT.", ephemeral=True)
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale SPAM-CHAT.", ephemeral=True)
         return
 
-    await safe_defer(interaction)
+    await interaction.response.defer()
 
     conn = connect()
     cur = conn.cursor()
@@ -5432,7 +5416,7 @@ class AuctionLeagueSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         try:
-            await safe_defer(interaction, ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
         except Exception:
             pass
 
@@ -5524,7 +5508,7 @@ class AuctionTeamSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         try:
-            await safe_defer(interaction, ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
         except Exception:
             pass
 
@@ -5614,7 +5598,7 @@ class AuctionPlayerSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         try:
-            await safe_defer(interaction)
+            await interaction.response.defer()
         except Exception:
             pass
 
@@ -5673,7 +5657,7 @@ class AuctionPlayerSelectView(discord.ui.View):
 @tree.command(name="asta", description="Avvia un'asta guidata: campionato → squadra → giocatore libero")
 async def asta(interaction: discord.Interaction):
     try:
-        await safe_defer(interaction, ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
     except Exception as e:
         print(f"[ASTA] Defer fallito: {e}")
         return
@@ -5908,7 +5892,6 @@ async def close_auction(channel, auction_id: int, message=None):
 
 @tree.command(name="storico_aste_scambi", description="Mostra riepilogo storico aste e scambi")
 async def storico_aste_scambi(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     conn = connect()
     cur = conn.cursor()
 
@@ -5961,13 +5944,12 @@ async def storico_aste_scambi(interaction: discord.Interaction):
     else:
         embed.add_field(name="Scambi", value="Nessuno scambio registrato.", inline=False)
 
-    await safe_send(interaction, embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @tree.command(name="mercato_panel", description="Mostra il pannello live del mercato")
 async def mercato_panel(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not can_use_normal_staff(interaction.user):
-        await safe_send(interaction, "❌ Solo lo staff può pubblicare il panel mercato.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff può pubblicare il panel mercato.", ephemeral=True)
         return
 
     conn = connect()
@@ -6020,12 +6002,11 @@ async def mercato_panel(interaction: discord.Interaction):
         embed.add_field(name="Top acquisti", value="Nessun acquisto registrato.", inline=False)
 
     embed.set_footer(text="Aggiornato live dal bot • Usa /asta_info per l'asta attiva")
-    await safe_send(interaction, embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="asta_info", description="Mostra l'asta attualmente aperta")
 async def asta_info(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     conn = connect()
     cur = conn.cursor()
     cur.execute("""
@@ -6040,7 +6021,7 @@ async def asta_info(interaction: discord.Interaction):
     conn.close()
 
     if not auction:
-        await safe_send(interaction, "Non c'è nessuna asta aperta.", ephemeral=True)
+        await interaction.response.send_message("Non c'è nessuna asta aperta.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -6052,16 +6033,16 @@ async def asta_info(interaction: discord.Interaction):
     embed.add_field(name="Leader", value=f"<@{auction['highest_bidder_id']}>" if auction["highest_bidder_id"] else "Nessuno", inline=True)
     embed.add_field(name="Tempo stimato", value=f"{auction_timers.get(int(auction['id']), 'N/D')}s", inline=True)
 
-    await safe_send(interaction, embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @tree.command(name="chiudi_asta", description="Staff: chiude subito l'asta aperta")
 async def chiudi_asta(interaction: discord.Interaction):
     if not can_use_normal_staff(interaction.user):
-        await safe_send(interaction, "❌ Solo lo staff può chiudere manualmente un'asta.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff può chiudere manualmente un'asta.", ephemeral=True)
         return
 
-    await safe_defer(interaction, ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
 
     conn = connect()
     cur = conn.cursor()
@@ -6196,7 +6177,7 @@ class RosaSelect(discord.ui.Select):
         conn.close()
 
         if not manager:
-            await safe_send(interaction, "Manager non trovato.", ephemeral=True)
+            await interaction.response.send_message("Manager non trovato.", ephemeral=True)
             return
 
         embed = build_roster_embed(selected_id, manager["name"])
@@ -6211,9 +6192,8 @@ class RosaView(discord.ui.View):
 
 @tree.command(name="rosa", description="Mostra una rosa scegliendo il manager da una tendina")
 async def rosa(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_rose_channel(interaction):
-        await safe_send(interaction, "❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
         return
 
     conn = connect()
@@ -6229,7 +6209,7 @@ async def rosa(interaction: discord.Interaction):
     conn.close()
 
     if not managers:
-        await safe_send(interaction, "Nessun manager registrato.", ephemeral=True)
+        await interaction.response.send_message("Nessun manager registrato.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -6251,7 +6231,7 @@ async def rosa(interaction: discord.Interaction):
     if len(managers) > 25:
         embed.set_footer(text="Mostro solo i primi 25 manager nella tendina per limite Discord.")
 
-    await safe_send(interaction, embed=embed, view=RosaView(managers), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=RosaView(managers), ephemeral=True)
 
 
 
@@ -6259,7 +6239,7 @@ async def rosa(interaction: discord.Interaction):
 @tree.command(name="mercato", description="Mostra giocatori liberi filtrabili")
 @app_commands.describe(ruolo="Ruolo, es. ST, CM, CB", overall_min="Overall minimo", overall_max="Overall massimo")
 async def mercato(interaction: discord.Interaction, ruolo: str = None, overall_min: int = 0, overall_max: int = 99):
-    await safe_defer(interaction, ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
 
     conn = connect()
     cur = conn.cursor()
@@ -6309,9 +6289,8 @@ async def mercato(interaction: discord.Interaction, ruolo: str = None, overall_m
 
 @tree.command(name="top_acquisti", description="Mostra gli acquisti più costosi")
 async def top_acquisti(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_rose_channel(interaction):
-        await safe_send(interaction, "❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
         return
 
     conn = connect()
@@ -6327,7 +6306,7 @@ async def top_acquisti(interaction: discord.Interaction):
     conn.close()
 
     if not rows:
-        await safe_send(interaction, "Nessun acquisto registrato.")
+        await interaction.response.send_message("Nessun acquisto registrato.")
         return
 
     embed = discord.Embed(title="💸 Top acquisti", color=discord.Color.gold())
@@ -6339,14 +6318,13 @@ async def top_acquisti(interaction: discord.Interaction):
             inline=False
         )
 
-    await safe_send(interaction, embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="classifica_budget", description="Classifica budget residuo")
 async def classifica_budget(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_spam_channel(interaction):
-        await safe_send(interaction, "❌ Usa questo comando solo nel canale SPAM-CHAT.", ephemeral=True)
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale SPAM-CHAT.", ephemeral=True)
         return
 
     conn = connect()
@@ -6361,7 +6339,7 @@ async def classifica_budget(interaction: discord.Interaction):
     conn.close()
 
     if not rows:
-        await safe_send(interaction, "Nessun manager registrato.")
+        await interaction.response.send_message("Nessun manager registrato.")
         return
 
     embed = discord.Embed(title="💰 Classifica budget", color=discord.Color.green())
@@ -6373,15 +6351,14 @@ async def classifica_budget(interaction: discord.Interaction):
             inline=False
         )
 
-    await safe_send(interaction, embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="team_rating", description="Mostra overall medio della rosa")
 @app_commands.describe(utente="Manager da controllare")
 async def team_rating(interaction: discord.Interaction, utente: discord.Member = None):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_rose_channel(interaction):
-        await safe_send(interaction, "❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
         return
 
     target = utente or interaction.user
@@ -6397,7 +6374,7 @@ async def team_rating(interaction: discord.Interaction, utente: discord.Member =
     conn.close()
 
     if not row or not row["total"]:
-        await safe_send(interaction, f"{target.display_name} non ha ancora giocatori.")
+        await interaction.response.send_message(f"{target.display_name} non ha ancora giocatori.")
         return
 
     embed = discord.Embed(
@@ -6408,15 +6385,14 @@ async def team_rating(interaction: discord.Interaction, utente: discord.Member =
     embed.add_field(name="Overall medio", value=f"{row['avg_ovr']:.1f}", inline=True)
     embed.add_field(name="Miglior OVR", value=str(row["max_ovr"]), inline=True)
 
-    await safe_send(interaction, embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="svincola", description="Admin: svincola un giocatore")
 @app_commands.describe(player_id="ID giocatore da svincolare")
 async def svincola(interaction: discord.Interaction, player_id: str):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
         return
 
     conn = connect()
@@ -6426,7 +6402,7 @@ async def svincola(interaction: discord.Interaction, player_id: str):
 
     if not player:
         conn.close()
-        await safe_send(interaction, "Giocatore non trovato.", ephemeral=True)
+        await interaction.response.send_message("Giocatore non trovato.", ephemeral=True)
         return
 
     if player["owner_discord_id"] and player["sold_price"]:
@@ -6439,15 +6415,14 @@ async def svincola(interaction: discord.Interaction, player_id: str):
     conn.commit()
     conn.close()
 
-    await safe_send(interaction, f"✅ **{player['name']}** svincolato. Budget rimborsato.")
+    await interaction.response.send_message(f"✅ **{player['name']}** svincolato. Budget rimborsato.")
 
 
 @tree.command(name="assegna", description="Admin: assegna manualmente un giocatore")
 @app_commands.describe(player_id="ID giocatore", utente="Utente a cui assegnare", prezzo="Prezzo assegnazione")
 async def assegna(interaction: discord.Interaction, player_id: str, utente: discord.Member, prezzo: int):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
         return
 
     conn = connect()
@@ -6458,7 +6433,7 @@ async def assegna(interaction: discord.Interaction, player_id: str, utente: disc
 
     if not player:
         conn.close()
-        await safe_send(interaction, "Giocatore non trovato.", ephemeral=True)
+        await interaction.response.send_message("Giocatore non trovato.", ephemeral=True)
         return
 
     cur.execute("SELECT * FROM managers WHERE discord_id = %s", (str(utente.id),))
@@ -6466,12 +6441,12 @@ async def assegna(interaction: discord.Interaction, player_id: str, utente: disc
 
     if not manager:
         conn.close()
-        await safe_send(interaction, "L'utente deve prima usare `/registrami`.", ephemeral=True)
+        await interaction.response.send_message("L'utente deve prima usare `/registrami`.", ephemeral=True)
         return
 
     if safe_int(manager["budget"]) < prezzo:
         conn.close()
-        await safe_send(interaction, "Budget insufficiente per questo utente.", ephemeral=True)
+        await interaction.response.send_message("Budget insufficiente per questo utente.", ephemeral=True)
         return
 
     cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (prezzo, str(utente.id)))
@@ -6479,15 +6454,14 @@ async def assegna(interaction: discord.Interaction, player_id: str, utente: disc
     conn.commit()
     conn.close()
 
-    await safe_send(interaction, f"✅ **{player['name']}** assegnato a **{utente.display_name}** per **{prezzo}** crediti.")
+    await interaction.response.send_message(f"✅ **{player['name']}** assegnato a **{utente.display_name}** per **{prezzo}** crediti.")
 
 
 @tree.command(name="pack_gold", description="Admin: assegna un pack gold casuale a un utente")
 @app_commands.describe(utente="Utente che riceve il pack", numero="Numero giocatori da assegnare")
 async def pack_gold(interaction: discord.Interaction, utente: discord.Member, numero: int = 3):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
         return
 
     numero = max(1, min(numero, 5))
@@ -6500,7 +6474,7 @@ async def pack_gold(interaction: discord.Interaction, utente: discord.Member, nu
 
     if not manager:
         conn.close()
-        await safe_send(interaction, "L'utente deve prima usare `/registrami`.", ephemeral=True)
+        await interaction.response.send_message("L'utente deve prima usare `/registrami`.", ephemeral=True)
         return
 
     cur.execute("""
@@ -6515,7 +6489,7 @@ async def pack_gold(interaction: discord.Interaction, utente: discord.Member, nu
 
     if not players:
         conn.close()
-        await safe_send(interaction, "Non ci sono abbastanza giocatori liberi per il pack.", ephemeral=True)
+        await interaction.response.send_message("Non ci sono abbastanza giocatori liberi per il pack.", ephemeral=True)
         return
 
     for p in players:
@@ -6540,7 +6514,7 @@ async def pack_gold(interaction: discord.Interaction, utente: discord.Member, nu
             inline=False
         )
 
-    await safe_send(interaction, embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 
@@ -6631,7 +6605,7 @@ class LiberiSelect(discord.ui.Select):
         elif value == "att":
             embed = free_players_embed("⚽ Attaccanti liberi", ["ST", "CF", "LW", "RW", "LF", "RF", "ATT", "AS", "AD", "P"])
         else:
-            await safe_send(interaction, "Ruolo non valido.", ephemeral=True)
+            await interaction.response.send_message("Ruolo non valido.", ephemeral=True)
             return
 
         await interaction.response.edit_message(embed=embed, view=self.view)
@@ -6645,9 +6619,8 @@ class LiberiView(discord.ui.View):
 
 @tree.command(name="liberi", description="Mostra i giocatori liberi divisi per ruolo")
 async def liberi(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_search_channel(interaction):
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             "❌ Puoi usare `/liberi` solo nel canale dedicato alla ricerca giocatori.",
             ephemeral=True
         )
@@ -6661,7 +6634,7 @@ async def liberi(interaction: discord.Interaction):
     embed.add_field(name="Disponibili", value="🧤 Portieri\\n🛡️ Difensori\\n🎯 Centrocampisti\\n⚽ Attaccanti", inline=False)
     embed.set_footer(text="La lista mostra i migliori 15 liberi per ruolo.")
 
-    await safe_send(interaction, embed=embed, view=LiberiView(), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=LiberiView(), ephemeral=True)
 
 
 
@@ -6670,10 +6643,10 @@ async def liberi(interaction: discord.Interaction):
 @app_commands.describe(utente="Manager da visualizzare")
 async def rosa_grafica(interaction: discord.Interaction, utente: discord.Member = None):
     if not is_rose_channel(interaction):
-        await safe_send(interaction, "❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
         return
 
-    await safe_defer(interaction)
+    await interaction.response.defer()
 
     target = utente or interaction.user
     image_path = generate_roster_graphic(target.id, target.display_name)
@@ -6734,7 +6707,7 @@ class StoricoSelect(discord.ui.Select):
         conn.close()
 
         if not manager:
-            await safe_send(interaction, "Manager non trovato.", ephemeral=True)
+            await interaction.response.send_message("Manager non trovato.", ephemeral=True)
             return
 
         embed = discord.Embed(
@@ -6765,9 +6738,8 @@ class StoricoView(discord.ui.View):
 
 @tree.command(name="storico", description="Mostra lo storico mercato scegliendo un manager")
 async def storico(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_rose_channel(interaction):
-        await safe_send(interaction, "❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
         return
 
     conn = connect()
@@ -6781,7 +6753,7 @@ async def storico(interaction: discord.Interaction):
     conn.close()
 
     if not managers:
-        await safe_send(interaction, "Nessun manager registrato.", ephemeral=True)
+        await interaction.response.send_message("Nessun manager registrato.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -6790,7 +6762,7 @@ async def storico(interaction: discord.Interaction):
         color=discord.Color.blue()
     )
 
-    await safe_send(interaction, embed=embed, view=StoricoView(managers), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=StoricoView(managers), ephemeral=True)
 
 
 class TradeView(discord.ui.View):
@@ -6808,12 +6780,12 @@ class TradeView(discord.ui.View):
 
         if not trade:
             conn.close()
-            await safe_send(interaction, "Scambio non trovato o già concluso.", ephemeral=True)
+            await interaction.response.send_message("Scambio non trovato o già concluso.", ephemeral=True)
             return
 
         if str(interaction.user.id) != str(trade["target_id"]):
             conn.close()
-            await safe_send(interaction, "Solo il destinatario dello scambio può accettare.", ephemeral=True)
+            await interaction.response.send_message("Solo il destinatario dello scambio può accettare.", ephemeral=True)
             return
 
         proposer_id = str(trade["proposer_id"])
@@ -6829,7 +6801,7 @@ class TradeView(discord.ui.View):
             p = cur.fetchone()
             if not p or str(p["owner_discord_id"]) != proposer_id:
                 conn.close()
-                await safe_send(interaction, "Scambio non valido: il proponente non possiede più il giocatore offerto.", ephemeral=True)
+                await interaction.response.send_message("Scambio non valido: il proponente non possiede più il giocatore offerto.", ephemeral=True)
                 return
 
         if request_player_id:
@@ -6837,7 +6809,7 @@ class TradeView(discord.ui.View):
             p = cur.fetchone()
             if not p or str(p["owner_discord_id"]) != target_id:
                 conn.close()
-                await safe_send(interaction, "Scambio non valido: non possiedi più il giocatore richiesto.", ephemeral=True)
+                await interaction.response.send_message("Scambio non valido: non possiedi più il giocatore richiesto.", ephemeral=True)
                 return
 
         # Validate budgets.
@@ -6848,17 +6820,17 @@ class TradeView(discord.ui.View):
 
         if not proposer or not target:
             conn.close()
-            await safe_send(interaction, "Uno dei due utenti non è registrato.", ephemeral=True)
+            await interaction.response.send_message("Uno dei due utenti non è registrato.", ephemeral=True)
             return
 
         if safe_int(proposer["budget"]) < credits_to_target:
             conn.close()
-            await safe_send(interaction, "Scambio non valido: il proponente non ha abbastanza crediti.", ephemeral=True)
+            await interaction.response.send_message("Scambio non valido: il proponente non ha abbastanza crediti.", ephemeral=True)
             return
 
         if safe_int(target["budget"]) < credits_to_proposer:
             conn.close()
-            await safe_send(interaction, "Scambio non valido: non hai abbastanza crediti.", ephemeral=True)
+            await interaction.response.send_message("Scambio non valido: non hai abbastanza crediti.", ephemeral=True)
             return
 
         # Money movements.
@@ -6896,12 +6868,12 @@ class TradeView(discord.ui.View):
 
         if not trade:
             conn.close()
-            await safe_send(interaction, "Scambio non trovato o già concluso.", ephemeral=True)
+            await interaction.response.send_message("Scambio non trovato o già concluso.", ephemeral=True)
             return
 
         if str(interaction.user.id) != str(trade["target_id"]):
             conn.close()
-            await safe_send(interaction, "Solo il destinatario dello scambio può rifiutare.", ephemeral=True)
+            await interaction.response.send_message("Solo il destinatario dello scambio può rifiutare.", ephemeral=True)
             return
 
         cur.execute("UPDATE trade_offers SET status = 'rejected' WHERE id = %s", (self.trade_id,))
@@ -6915,9 +6887,8 @@ class TradeView(discord.ui.View):
 @tree.command(name="blacklist_add", description="Admin: aggiungi un giocatore alla blacklist")
 @app_commands.describe(player_id="ID giocatore", motivo="Motivo blacklist")
 async def blacklist_add(interaction: discord.Interaction, player_id: str, motivo: str = "Non specificato"):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
         return
 
     conn = connect()
@@ -6927,7 +6898,7 @@ async def blacklist_add(interaction: discord.Interaction, player_id: str, motivo
 
     if not player:
         conn.close()
-        await safe_send(interaction, "Giocatore non trovato.", ephemeral=True)
+        await interaction.response.send_message("Giocatore non trovato.", ephemeral=True)
         return
 
     cur.execute("""
@@ -6941,15 +6912,14 @@ async def blacklist_add(interaction: discord.Interaction, player_id: str, motivo
     conn.commit()
     conn.close()
 
-    await safe_send(interaction, f"🚫 **{player['name']}** aggiunto alla blacklist.")
+    await interaction.response.send_message(f"🚫 **{player['name']}** aggiunto alla blacklist.")
 
 
 @tree.command(name="blacklist_remove", description="Admin: rimuovi un giocatore dalla blacklist")
 @app_commands.describe(player_id="ID giocatore")
 async def blacklist_remove(interaction: discord.Interaction, player_id: str):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
         return
 
     conn = connect()
@@ -6958,12 +6928,11 @@ async def blacklist_remove(interaction: discord.Interaction, player_id: str):
     conn.commit()
     conn.close()
 
-    await safe_send(interaction, "✅ Giocatore rimosso dalla blacklist.")
+    await interaction.response.send_message("✅ Giocatore rimosso dalla blacklist.")
 
 
 @tree.command(name="blacklist", description="Mostra i giocatori in blacklist")
 async def blacklist(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     conn = connect()
     cur = conn.cursor()
     cur.execute("""
@@ -6977,7 +6946,7 @@ async def blacklist(interaction: discord.Interaction):
     conn.close()
 
     if not rows:
-        await safe_send(interaction, "Blacklist vuota.")
+        await interaction.response.send_message("Blacklist vuota.")
         return
 
     embed = discord.Embed(title="🚫 Blacklist giocatori", color=discord.Color.red())
@@ -6989,7 +6958,7 @@ async def blacklist(interaction: discord.Interaction):
             inline=False
         )
 
-    await safe_send(interaction, embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 
@@ -7022,7 +6991,7 @@ class ModalitaSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if not is_admin(interaction):
-            await safe_send(interaction, "❌ Solo gli admin possono cambiare modalità.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo gli admin possono cambiare modalità.", ephemeral=True)
             return
 
         mode = self.values[0]
@@ -7065,9 +7034,8 @@ class ModalitaView(discord.ui.View):
 
 @tree.command(name="modalita", description="Admin: scegli la modalità della lega")
 async def modalita(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
         return
 
     current_mode = get_league_mode()
@@ -7079,25 +7047,23 @@ async def modalita(interaction: discord.Interaction):
         color=discord.Color.blue()
     )
 
-    await safe_send(interaction, embed=embed, view=ModalitaView(), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=ModalitaView(), ephemeral=True)
 
 
 @tree.command(name="modalita_attuale", description="Mostra la modalità attuale della lega")
 async def modalita_attuale(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     current_mode = get_league_mode()
     pretty = "Fantacalcio" if current_mode == "fantacalcio" else "Squadre reali"
 
-    await safe_send(interaction, f"⚙️ Modalità attuale: **{pretty}**.", ephemeral=True)
+    await interaction.response.send_message(f"⚙️ Modalità attuale: **{pretty}**.", ephemeral=True)
 
 
 
 @tree.command(name="diagnostica_squadra", description="Staff: controlla se una squadra reale ha giocatori nel database")
 @app_commands.describe(nome="Nome squadra da controllare")
 async def diagnostica_squadra(interaction: discord.Interaction, nome: str):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
     searches = possible_team_names(nome)
@@ -7146,13 +7112,13 @@ async def diagnostica_squadra(interaction: discord.Interaction, nome: str):
             inline=False
         )
 
-    await safe_send(interaction, embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @tree.command(name="lista_squadre", description="Mostra le squadre reali disponibili")
 @app_commands.describe(nome="Filtro nome squadra, opzionale")
 async def lista_squadre(interaction: discord.Interaction, nome: str = None):
-    await safe_defer(interaction, ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
 
     conn = connect()
     cur = conn.cursor()
@@ -7198,19 +7164,18 @@ async def lista_squadre(interaction: discord.Interaction, nome: str = None):
 @tree.command(name="assegna_squadra", description="Admin: assegna una squadra reale a un manager")
 @app_commands.describe(utente="Manager a cui assegnare la squadra", squadra="Nome squadra, es. Milan")
 async def assegna_squadra(interaction: discord.Interaction, utente: discord.Member, squadra: str):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
         return
 
     if get_league_mode() != "squadre_reali":
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             "❌ Questo comando funziona solo in modalità **Squadre reali**. Usa `/modalita` per cambiarla.",
             ephemeral=True
         )
         return
 
-    await safe_defer(interaction)
+    await interaction.response.defer()
 
     players, avg_ovr, budget = get_team_stats(squadra)
 
@@ -7259,7 +7224,6 @@ async def assegna_squadra(interaction: discord.Interaction, utente: discord.Memb
 
 @tree.command(name="squadre_assegnate", description="Mostra le squadre reali già assegnate")
 async def squadre_assegnate(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     conn = connect()
     cur = conn.cursor()
     cur.execute("""
@@ -7271,7 +7235,7 @@ async def squadre_assegnate(interaction: discord.Interaction):
     conn.close()
 
     if not rows:
-        await safe_send(interaction, "Nessuna squadra reale assegnata.", ephemeral=True)
+        await interaction.response.send_message("Nessuna squadra reale assegnata.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -7286,12 +7250,11 @@ async def squadre_assegnate(interaction: discord.Interaction):
             inline=False
         )
 
-    await safe_send(interaction, embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="reset_modalita", description="Owner staff: resetta modalità, rose e squadre assegnate")
 async def reset_modalita(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     async def do_reset(confirm_interaction: discord.Interaction):
         await create_backup_before_sensitive_action("reset_modalita")
 
@@ -7349,9 +7312,8 @@ async def reset_modalita(interaction: discord.Interaction):
 
 @tree.command(name="dashboard_admin", description="Admin dashboard completa del bot")
 async def dashboard_admin(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
         return
 
     conn = connect()
@@ -7401,7 +7363,7 @@ async def dashboard_admin(interaction: discord.Interaction):
         inline=False
     )
 
-    await safe_send(interaction, embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 
@@ -7602,29 +7564,29 @@ class CreaCampionatoModal(discord.ui.Modal, title="Crea campionato"):
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_league_admin(interaction):
-            await safe_send(interaction, "❌ Solo gli admin possono creare il campionato.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo gli admin possono creare il campionato.", ephemeral=True)
             return
 
         try:
             group_count = int(str(self.numero_gironi.value).strip())
             teams_per_group = int(str(self.squadre_per_girone.value).strip())
         except Exception:
-            await safe_send(interaction, "Numero gironi e squadre per girone devono essere numeri.", ephemeral=True)
+            await interaction.response.send_message("Numero gironi e squadre per girone devono essere numeri.", ephemeral=True)
             return
 
         group_names = [g.strip() for g in str(self.nomi_gironi.value).split(",") if g.strip()]
 
         if group_count <= 0 or teams_per_group <= 1:
-            await safe_send(interaction, "Valori non validi.", ephemeral=True)
+            await interaction.response.send_message("Valori non validi.", ephemeral=True)
             return
 
         if len(group_names) != group_count:
-            await safe_send(interaction, "Il numero dei nomi girone deve coincidere con il numero gironi.", ephemeral=True)
+            await interaction.response.send_message("Il numero dei nomi girone deve coincidere con il numero gironi.", ephemeral=True)
             return
 
         role = interaction.guild.get_role(int(LEAGUE_PLAYER_ROLE_ID)) if interaction.guild else None
         if not role:
-            await safe_send(interaction, "Ruolo ISCRITTI non trovato.", ephemeral=True)
+            await interaction.response.send_message("Ruolo ISCRITTI non trovato.", ephemeral=True)
             return
 
         members = [m for m in role.members if not m.bot]
@@ -7637,7 +7599,7 @@ class CreaCampionatoModal(discord.ui.Modal, title="Crea campionato"):
         selected = members[:total_needed]
 
         if len(selected) < total_needed:
-            await safe_send(interaction, 
+            await interaction.response.send_message(
                 f"⚠️ Non ci sono abbastanza iscritti. Richiesti {total_needed}, trovati {len(selected)}.",
                 ephemeral=True
             )
@@ -7701,7 +7663,7 @@ class CreaCampionatoModal(discord.ui.Modal, title="Crea campionato"):
         embed.add_field(name="Nomi gironi", value=", ".join(group_names), inline=False)
         embed.set_footer(text="Per creare Champions/Europa/Conference usa /genera_coppe_europee.")
 
-        await safe_send(interaction, embed=embed)
+        await interaction.response.send_message(embed=embed)
 
 
 class ChampionshipGroupingSelect(discord.ui.Select):
@@ -7714,7 +7676,7 @@ class ChampionshipGroupingSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if not is_league_admin(interaction):
-            await safe_send(interaction, "❌ Solo gli admin possono creare il campionato.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo gli admin possono creare il campionato.", ephemeral=True)
             return
         await interaction.response.send_modal(CreaCampionatoModal(self.values[0]))
 
@@ -7726,9 +7688,8 @@ class ChampionshipGroupingView(discord.ui.View):
 
 @tree.command(name="crea_campionato", description="Admin: crea gironi e calendario automatico")
 async def crea_campionato(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_league_admin(interaction):
-        await safe_send(interaction, "❌ Solo gli admin possono creare il campionato.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo gli admin possono creare il campionato.", ephemeral=True)
         return
 
     if get_league_mode() == "squadre_reali":
@@ -7737,7 +7698,7 @@ async def crea_campionato(interaction: discord.Interaction):
             description="Modalità **Squadre reali** attiva. Scegli se creare i gironi random o in base al campionato reale del club assegnato.",
             color=discord.Color.gold()
         )
-        await safe_send(interaction, embed=embed, view=ChampionshipGroupingView(), ephemeral=True)
+        await interaction.response.send_message(embed=embed, view=ChampionshipGroupingView(), ephemeral=True)
     else:
         await interaction.response.send_modal(CreaCampionatoModal("random"))
 
@@ -7745,10 +7706,10 @@ async def crea_campionato(interaction: discord.Interaction):
 @tree.command(name="reset_campionato", description="Admin: archivia il campionato attivo")
 async def reset_campionato(interaction: discord.Interaction):
     if not is_league_admin(interaction):
-        await safe_send(interaction, "❌ Solo gli admin possono resettare il campionato.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo gli admin possono resettare il campionato.", ephemeral=True)
         return
 
-    await safe_defer(interaction, ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
 
     await create_backup_before_sensitive_action("generazione_campionato")
 
@@ -7822,7 +7783,7 @@ class ResultModal(discord.ui.Modal, title="Inserisci risultato"):
             my_goals = int(str(self.gol_miei.value).strip())
             opp_goals = int(str(self.gol_avversario.value).strip())
         except Exception:
-            await safe_send(interaction, "I gol devono essere numeri.", ephemeral=True)
+            await interaction.response.send_message("I gol devono essere numeri.", ephemeral=True)
             return
 
         conn = connect()
@@ -7832,13 +7793,13 @@ class ResultModal(discord.ui.Modal, title="Inserisci risultato"):
 
         if not match:
             conn.close()
-            await safe_send(interaction, "Partita non trovata o già giocata.", ephemeral=True)
+            await interaction.response.send_message("Partita non trovata o già giocata.", ephemeral=True)
             return
 
         user_id = str(interaction.user.id)
         if user_id not in (str(match["home_id"]), str(match["away_id"])):
             conn.close()
-            await safe_send(interaction, "Non fai parte di questa partita.", ephemeral=True)
+            await interaction.response.send_message("Non fai parte di questa partita.", ephemeral=True)
             return
 
         is_home = user_id == str(match["home_id"])
@@ -7856,11 +7817,11 @@ class ResultModal(discord.ui.Modal, title="Inserisci risultato"):
         else:
             if len(my_scorers) != my_goals:
                 conn.close()
-                await safe_send(interaction, "Il numero dei tuoi marcatori deve coincidere con i tuoi gol.", ephemeral=True)
+                await interaction.response.send_message("Il numero dei tuoi marcatori deve coincidere con i tuoi gol.", ephemeral=True)
                 return
             if len(opp_scorers) != opp_goals:
                 conn.close()
-                await safe_send(interaction, "Il numero dei marcatori avversari deve coincidere con i gol avversari.", ephemeral=True)
+                await interaction.response.send_message("Il numero dei marcatori avversari deve coincidere con i gol avversari.", ephemeral=True)
                 return
 
         cur.execute("""
@@ -7898,7 +7859,7 @@ class ResultModal(discord.ui.Modal, title="Inserisci risultato"):
         conn.close()
 
         embed = build_result_embed(self.match_id)
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             content=f"<@{confirm_by}> devi confermare o contestare il risultato.",
             embed=embed,
             view=ResultConfirmView(self.match_id, str(confirm_by))
@@ -7950,7 +7911,7 @@ class ResultConfirmView(discord.ui.View):
     @discord.ui.button(label="Conferma", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if str(interaction.user.id) != self.confirm_by:
-            await safe_send(interaction, "Solo l'avversario può confermare questo risultato.", ephemeral=True)
+            await interaction.response.send_message("Solo l'avversario può confermare questo risultato.", ephemeral=True)
             return
 
         conn = connect()
@@ -7965,7 +7926,7 @@ class ResultConfirmView(discord.ui.View):
     @discord.ui.button(label="Contesta", style=discord.ButtonStyle.danger)
     async def contest(self, interaction: discord.Interaction, button: discord.ui.Button):
         if str(interaction.user.id) != self.confirm_by:
-            await safe_send(interaction, "Solo l'avversario può contestare questo risultato.", ephemeral=True)
+            await interaction.response.send_message("Solo l'avversario può contestare questo risultato.", ephemeral=True)
             return
 
         conn = connect()
@@ -7980,14 +7941,13 @@ class ResultConfirmView(discord.ui.View):
 
 @tree.command(name="risultato", description="Inserisci un risultato del tuo girone")
 async def risultato(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_results_channel(interaction):
-        await safe_send(interaction, "❌ I risultati si inseriscono solo nel canale RISULTATI.", delete_after=10)
+        await interaction.response.send_message("❌ I risultati si inseriscono solo nel canale RISULTATI.", delete_after=10)
         return
 
     champ = active_championship()
     if not champ:
-        await safe_send(interaction, "Nessun campionato attivo.", ephemeral=True)
+        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
         return
 
     conn = connect()
@@ -8005,7 +7965,7 @@ async def risultato(interaction: discord.Interaction):
     conn.close()
 
     if not matches:
-        await safe_send(interaction, "Non hai partite da inserire.", ephemeral=True)
+        await interaction.response.send_message("Non hai partite da inserire.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -8014,19 +7974,18 @@ async def risultato(interaction: discord.Interaction):
         color=discord.Color.blue()
     )
 
-    await safe_send(interaction, embed=embed, view=ResultOpponentView(matches), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=ResultOpponentView(matches), ephemeral=True)
 
 
 @tree.command(name="classifica", description="Mostra la classifica del campionato")
 async def classifica(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_standings_channel(interaction):
-        await safe_send(interaction, "❌ La classifica si vede solo nel canale CLASSIFICHE.", delete_after=10)
+        await interaction.response.send_message("❌ La classifica si vede solo nel canale CLASSIFICHE.", delete_after=10)
         return
 
     champ = active_championship()
     if not champ:
-        await safe_send(interaction, "Nessun campionato attivo.", ephemeral=True)
+        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
         return
 
     conn = connect()
@@ -8053,19 +8012,18 @@ async def classifica(interaction: discord.Interaction):
             value = "\n".join(lines[:10])
         embed.add_field(name=g["name"], value=value, inline=False)
 
-    await safe_send(interaction, embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="calendario", description="Mostra le partite ancora da disputare")
 async def calendario(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_calendar_channel(interaction):
-        await safe_send(interaction, "❌ Il calendario si vede solo nel canale CALENDARIO.", delete_after=10)
+        await interaction.response.send_message("❌ Il calendario si vede solo nel canale CALENDARIO.", delete_after=10)
         return
 
     champ = active_championship()
     if not champ:
-        await safe_send(interaction, "Nessun campionato attivo.", ephemeral=True)
+        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
         return
 
     conn = connect()
@@ -8115,7 +8073,7 @@ async def calendario(interaction: discord.Interaction):
     conn.close()
 
     if not rows:
-        await safe_send(interaction, "✅ Non ci sono partite da disputare in calendario.", ephemeral=True)
+        await interaction.response.send_message("✅ Non ci sono partite da disputare in calendario.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -8132,20 +8090,19 @@ async def calendario(interaction: discord.Interaction):
         )
 
     embed.set_footer(text="Il ritorno comparirà solo quando tutte le partite di andata saranno completate.")
-    await safe_send(interaction, embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 
 @tree.command(name="prossima_partita", description="Mostra la tua prossima partita")
 async def prossima_partita(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_calendar_channel(interaction):
-        await safe_send(interaction, "❌ Questo comando si usa solo nel canale CALENDARIO.", delete_after=10)
+        await interaction.response.send_message("❌ Questo comando si usa solo nel canale CALENDARIO.", delete_after=10)
         return
 
     champ = active_championship()
     if not champ:
-        await safe_send(interaction, "Nessun campionato attivo.", ephemeral=True)
+        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
         return
 
     conn = connect()
@@ -8164,7 +8121,7 @@ async def prossima_partita(interaction: discord.Interaction):
     conn.close()
 
     if not m:
-        await safe_send(interaction, "Non hai prossime partite.", ephemeral=True)
+        await interaction.response.send_message("Non hai prossime partite.", ephemeral=True)
         return
 
     embed = discord.Embed(title="⏭️ Prossima partita", color=discord.Color.blue())
@@ -8172,19 +8129,18 @@ async def prossima_partita(interaction: discord.Interaction):
     embed.add_field(name="Giornata", value=str(m["round_number"]), inline=True)
     embed.add_field(name="Match", value=f"**{m['home_name']}** vs **{m['away_name']}**", inline=False)
 
-    await safe_send(interaction, embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="capocannonieri", description="Classifica marcatori")
 async def capocannonieri(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_stats_channel(interaction):
-        await safe_send(interaction, "❌ Le statistiche si vedono solo nel canale STATISTICHE.", delete_after=10)
+        await interaction.response.send_message("❌ Le statistiche si vedono solo nel canale STATISTICHE.", delete_after=10)
         return
 
     champ = active_championship()
     if not champ:
-        await safe_send(interaction, "Nessun campionato attivo.", ephemeral=True)
+        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
         return
 
     conn = connect()
@@ -8209,19 +8165,18 @@ async def capocannonieri(interaction: discord.Interaction):
         for i, r in enumerate(rows, start=1):
             embed.add_field(name=f"{i}. {r['scorer_name']}", value=f"{r['goals']} gol", inline=False)
 
-    await safe_send(interaction, embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="miglior_difesa", description="Mostra le migliori difese")
 async def miglior_difesa(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_stats_channel(interaction):
-        await safe_send(interaction, "❌ Le statistiche si vedono solo nel canale STATISTICHE.", delete_after=10)
+        await interaction.response.send_message("❌ Le statistiche si vedono solo nel canale STATISTICHE.", delete_after=10)
         return
 
     champ = active_championship()
     if not champ:
-        await safe_send(interaction, "Nessun campionato attivo.", ephemeral=True)
+        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
         return
 
     conn = connect()
@@ -8240,15 +8195,14 @@ async def miglior_difesa(interaction: discord.Interaction):
     for i, r in enumerate(all_rows[:15], start=1):
         embed.add_field(name=f"{i}. {r['name']}", value=f"Gol subiti: {r['ga']} | PG: {r['pg']}", inline=False)
 
-    await safe_send(interaction, embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="forza_risultato", description="Admin: forza o corregge un risultato")
 @app_commands.describe(match_id="ID partita", home_goals="Gol casa", away_goals="Gol trasferta")
 async def forza_risultato(interaction: discord.Interaction, match_id: int, home_goals: int, away_goals: int):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_league_admin(interaction):
-        await safe_send(interaction, "❌ Solo gli admin possono forzare risultati.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo gli admin possono forzare risultati.", ephemeral=True)
         return
 
     conn = connect()
@@ -8261,14 +8215,13 @@ async def forza_risultato(interaction: discord.Interaction, match_id: int, home_
     conn.commit()
     conn.close()
 
-    await safe_send(interaction, f"✅ Risultato forzato per partita ID {match_id}: {home_goals}-{away_goals}")
+    await interaction.response.send_message(f"✅ Risultato forzato per partita ID {match_id}: {home_goals}-{away_goals}")
 
 
 @tree.command(name="revisioni", description="Admin: mostra risultati contestati")
 async def revisioni(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_league_admin(interaction):
-        await safe_send(interaction, "❌ Solo gli admin possono vedere le revisioni.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo gli admin possono vedere le revisioni.", ephemeral=True)
         return
 
     conn = connect()
@@ -8295,7 +8248,7 @@ async def revisioni(interaction: discord.Interaction):
                 inline=False
             )
 
-    await safe_send(interaction, embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 
@@ -8322,14 +8275,14 @@ class ReplaceNewPlayerSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if not is_league_admin(interaction):
-            await safe_send(interaction, "❌ Solo gli admin possono sostituire player.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo gli admin possono sostituire player.", ephemeral=True)
             return
 
         guild = interaction.guild
         new_member = await get_member_safe(guild, self.values[0])
 
         if not new_member:
-            await safe_send(interaction, "Nuovo player non trovato.", ephemeral=True)
+            await interaction.response.send_message("Nuovo player non trovato.", ephemeral=True)
             return
 
         old_id = str(self.old_member.id)
@@ -8430,7 +8383,7 @@ class ReplaceOldPlayerSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if not is_league_admin(interaction):
-            await safe_send(interaction, "❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
             return
 
         guild = interaction.guild
@@ -8438,19 +8391,19 @@ class ReplaceOldPlayerSelect(discord.ui.Select):
         old_member = await get_member_safe(guild, self.values[0])
 
         if not old_member:
-            await safe_send(interaction, "Player non trovato.", ephemeral=True)
+            await interaction.response.send_message("Player non trovato.", ephemeral=True)
             return
 
         pre_role = guild.get_role(int(PRE_ISCRITTO_ROLE_ID)) if guild else None
 
         if not pre_role:
-            await safe_send(interaction, "Ruolo PRE-ISCRITTO non trovato.", ephemeral=True)
+            await interaction.response.send_message("Ruolo PRE-ISCRITTO non trovato.", ephemeral=True)
             return
 
         candidates = [m for m in pre_role.members if not m.bot]
 
         if not candidates:
-            await safe_send(interaction, "Nessun player PRE-ISCRITTO disponibile.", ephemeral=True)
+            await interaction.response.send_message("Nessun player PRE-ISCRITTO disponibile.", ephemeral=True)
             return
 
         embed = discord.Embed(
@@ -8473,9 +8426,8 @@ class ReplaceOldPlayerView(discord.ui.View):
 
 @tree.command(name="sostituisci_player", description="Admin: sostituisce un player nel campionato")
 async def sostituisci_player(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_league_admin(interaction):
-        await safe_send(interaction, "❌ Solo gli admin possono usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
         return
 
     guild = interaction.guild
@@ -8483,13 +8435,13 @@ async def sostituisci_player(interaction: discord.Interaction):
     role = guild.get_role(int(LEAGUE_PLAYER_ROLE_ID)) if guild else None
 
     if not role:
-        await safe_send(interaction, "Ruolo ISCRITTI non trovato.", ephemeral=True)
+        await interaction.response.send_message("Ruolo ISCRITTI non trovato.", ephemeral=True)
         return
 
     registered_members = [m for m in role.members if not m.bot]
 
     if not registered_members:
-        await safe_send(interaction, "Nessun player ISCRITTO trovato.", ephemeral=True)
+        await interaction.response.send_message("Nessun player ISCRITTO trovato.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -8498,7 +8450,7 @@ async def sostituisci_player(interaction: discord.Interaction):
         color=discord.Color.blue()
     )
 
-    await safe_send(interaction, 
+    await interaction.response.send_message(
         embed=embed,
         view=ReplaceOldPlayerView(registered_members),
         ephemeral=True
@@ -8589,7 +8541,7 @@ class StaffPanelView(discord.ui.View):
     @discord.ui.button(label="Stato mercato", style=discord.ButtonStyle.primary, emoji="📈")
     async def market(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not can_use_staff_panel(interaction.user):
-            await safe_send(interaction, "❌ Non hai accesso allo staff panel.", ephemeral=True)
+            await interaction.response.send_message("❌ Non hai accesso allo staff panel.", ephemeral=True)
             return
         opened = is_market_open()
         embed = discord.Embed(
@@ -8597,50 +8549,49 @@ class StaffPanelView(discord.ui.View):
             description=f"Il mercato è: **{'APERTO ✅' if opened else 'CHIUSO 🔒'}**",
             color=discord.Color.green() if opened else discord.Color.red()
         )
-        await safe_send(interaction, embed=embed, view=MarketStatusView(), ephemeral=True)
+        await interaction.response.send_message(embed=embed, view=MarketStatusView(), ephemeral=True)
 
     @discord.ui.button(label="Backup", style=discord.ButtonStyle.secondary, emoji="💾")
     async def backup(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not can_use_staff_panel(interaction.user):
-            await safe_send(interaction, "❌ Non hai accesso allo staff panel.", ephemeral=True)
+            await interaction.response.send_message("❌ Non hai accesso allo staff panel.", ephemeral=True)
             return
         embed = discord.Embed(
             title="💾 Backup",
             description="Usa `/backup_now`, `/backup_list` o `/restore_backup`.\nLe azioni critiche richiedono conferma.",
             color=discord.Color.blue()
         )
-        await safe_send(interaction, embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="Fine stagione", style=discord.ButtonStyle.danger, emoji="🏁")
     async def season(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not can_use_staff_panel(interaction.user):
-            await safe_send(interaction, "❌ Non hai accesso allo staff panel.", ephemeral=True)
+            await interaction.response.send_message("❌ Non hai accesso allo staff panel.", ephemeral=True)
             return
         embed = discord.Embed(
             title="🏁 Fine stagione",
             description="Usa `/fine_stagione` per avviare il flusso protetto con conferma.",
             color=discord.Color.gold()
         )
-        await safe_send(interaction, embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="Inattivi", style=discord.ButtonStyle.secondary, emoji="⚠️")
     async def inactive(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not can_use_staff_panel(interaction.user):
-            await safe_send(interaction, "❌ Non hai accesso allo staff panel.", ephemeral=True)
+            await interaction.response.send_message("❌ Non hai accesso allo staff panel.", ephemeral=True)
             return
         embed = discord.Embed(
             title="⚠️ Sistema inattività",
             description="Il bot controlla automaticamente ogni 22 ore e invia segnalazioni nel canale configurato.",
             color=discord.Color.orange()
         )
-        await safe_send(interaction, embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @tree.command(name="staff_panel", description="Owner staff: pannello centrale gestione bot")
 async def staff_panel(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not can_use_staff_panel(interaction.user):
-        await safe_send(interaction, "❌ Solo il ruolo autorizzato può usare lo staff panel.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo il ruolo autorizzato può usare lo staff panel.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -8656,7 +8607,7 @@ async def staff_panel(interaction: discord.Interaction):
     embed.add_field(name="Stagioni", value="Fine/nuova stagione", inline=True)
     embed.add_field(name="Inattivi", value="Controlli automatici", inline=True)
 
-    await safe_send(interaction, embed=embed, view=StaffPanelView(), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=StaffPanelView(), ephemeral=True)
 
 # ===========================================================
 
@@ -8665,9 +8616,8 @@ async def staff_panel(interaction: discord.Interaction):
 
 @tree.command(name="ripubblica_richieste", description="Staff: ripubblica tutte le richieste pending nel canale staff")
 async def ripubblica_richieste(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not can_use_normal_staff(interaction.user):
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             "❌ Non hai i permessi per usare questo comando.",
             ephemeral=True
         )
@@ -8687,7 +8637,7 @@ async def ripubblica_richieste(interaction: discord.Interaction):
     conn.close()
 
     if not rows:
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             "ℹ️ Nessuna richiesta pending trovata.",
             ephemeral=True
         )
@@ -8695,7 +8645,7 @@ async def ripubblica_richieste(interaction: discord.Interaction):
 
     staff_channel = interaction.guild.get_channel(int(SIGNUP_STAFF_CHANNEL_ID))
     if not staff_channel:
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             "❌ Canale staff richieste non trovato.",
             ephemeral=True
         )
@@ -8751,7 +8701,7 @@ async def ripubblica_richieste(interaction: discord.Interaction):
         color=discord.Color.green()
     )
 
-    await safe_send(interaction, 
+    await interaction.response.send_message(
         f"✅ Ripubblicate {sent} richieste pending nel canale staff.",
         ephemeral=True
     )
@@ -8766,10 +8716,10 @@ async def ripubblica_richieste(interaction: discord.Interaction):
 @app_commands.describe(utente="Player già iscritto", squadra="Nome squadra reale da assegnare, es. Arsenal")
 async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.Member, squadra: str):
     if not can_use_normal_staff(interaction.user):
-        await safe_send(interaction, "❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
-    await safe_defer(interaction, ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
 
     club_name = str(squadra).strip()
     players, avg_ovr, budget = get_team_stats_reale(club_name, include_owned_by=str(utente.id))
@@ -8911,15 +8861,14 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
 
 @tree.command(name="mia_squadra", description="Mostra la tua squadra, budget e rosa")
 async def mia_squadra(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if str(interaction.channel_id) != str(ROSE_CHANNEL_ID):
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             f"❌ Puoi usare questo comando solo nel canale <#{ROSE_CHANNEL_ID}>.",
             ephemeral=True
         )
         return
 
-    await safe_defer(interaction, ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
 
     conn = connect()
     cur = conn.cursor()
@@ -9016,9 +8965,8 @@ async def mia_squadra(interaction: discord.Interaction):
 
 @tree.command(name="mio_budget", description="Mostra rapidamente il tuo budget")
 async def mio_budget(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if str(interaction.channel_id) != str(ROSE_CHANNEL_ID):
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             f"❌ Puoi usare questo comando solo nel canale <#{ROSE_CHANNEL_ID}>.",
             ephemeral=True
         )
@@ -9031,13 +8979,13 @@ async def mio_budget(interaction: discord.Interaction):
     conn.close()
 
     if not row:
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             "❌ Non risulti ancora registrato come manager.",
             ephemeral=True
         )
         return
 
-    await safe_send(interaction, 
+    await interaction.response.send_message(
         f"💰 Il tuo budget attuale è: **{row['budget']} crediti**.",
         ephemeral=True
     )
@@ -9415,14 +9363,14 @@ async def scambio(
 
 
     if not is_market_open():
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             "🔒 Il mercato è chiuso. Non puoi proporre scambi in questo momento.",
             ephemeral=True
         )
         return
 
     if str(interaction.channel_id) != str(SCAMBI_CHANNEL_ID):
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             f"❌ Puoi proporre scambi solo nel canale <#{SCAMBI_CHANNEL_ID}>.",
             ephemeral=True
         )
@@ -9431,14 +9379,14 @@ async def scambio(
     target_owner_id = get_club_owner_id(club)
 
     if not target_owner_id:
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             "❌ Questo club non risulta assegnato a nessun manager.",
             ephemeral=True
         )
         return
 
     if str(target_owner_id) == str(interaction.user.id):
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             "❌ Non puoi proporre uno scambio alla tua stessa squadra.",
             ephemeral=True
         )
@@ -9446,7 +9394,7 @@ async def scambio(
 
     requested_player = get_player_by_name_from_owner(target_owner_id, giocatore_richiesto)
     if not requested_player:
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             "❌ Il giocatore richiesto non risulta nella rosa del club selezionato.",
             ephemeral=True
         )
@@ -9456,7 +9404,7 @@ async def scambio(
     if mio_giocatore:
         offered_player = get_player_by_name_from_owner(str(interaction.user.id), mio_giocatore)
         if not offered_player:
-            await safe_send(interaction, 
+            await interaction.response.send_message(
                 "❌ Il giocatore che vuoi offrire non risulta nella tua rosa.",
                 ephemeral=True
             )
@@ -9464,11 +9412,11 @@ async def scambio(
 
     crediti = safe_int(crediti, 0)
     if crediti < 0:
-        await safe_send(interaction, "❌ I crediti non possono essere negativi.", ephemeral=True)
+        await interaction.response.send_message("❌ I crediti non possono essere negativi.", ephemeral=True)
         return
 
     if not offered_player and crediti <= 0:
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             "❌ Devi offrire almeno un tuo giocatore oppure dei crediti.",
             ephemeral=True
         )
@@ -9482,7 +9430,7 @@ async def scambio(
 
     if crediti > 0 and (not proposer_manager or safe_int(proposer_manager["budget"]) < crediti):
         conn.close()
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             "❌ Budget insufficiente per proporre questi crediti.",
             ephemeral=True
         )
@@ -9543,7 +9491,7 @@ async def scambio(
 
     except Exception as e:
         conn.close()
-        await safe_send(interaction, f"❌ Errore creazione offerta: `{e}`", ephemeral=True)
+        await interaction.response.send_message(f"❌ Errore creazione offerta: `{e}`", ephemeral=True)
         return
 
     conn.close()
@@ -9573,7 +9521,7 @@ async def scambio(
 
     view = TradeOfferResponseView(offer_id)
 
-    await safe_send(interaction, embed=embed, view=view)
+    await interaction.response.send_message(embed=embed, view=view)
 
     try:
         if target_member:
@@ -9646,7 +9594,7 @@ class CounterOfferModal(discord.ui.Modal, title="Controfferta"):
         if str(self.note.value).strip():
             embed.add_field(name="Messaggio", value=str(self.note.value).strip(), inline=False)
 
-        await safe_send(interaction, embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
         try:
             if proposer_id:
@@ -9673,15 +9621,15 @@ class TradeOfferResponseView(discord.ui.View):
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         offer = await self._get_offer()
         if not offer:
-            await safe_send(interaction, "Offerta non trovata.", ephemeral=True)
+            await interaction.response.send_message("Offerta non trovata.", ephemeral=True)
             return
 
         if str(interaction.user.id) != str(offer["target_id"]):
-            await safe_send(interaction, "❌ Solo il destinatario può accettare questa offerta.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo il destinatario può accettare questa offerta.", ephemeral=True)
             return
 
         if offer["status"] != "pending":
-            await safe_send(interaction, "Questa offerta non è più pending.", ephemeral=True)
+            await interaction.response.send_message("Questa offerta non è più pending.", ephemeral=True)
             return
 
         conn = connect()
@@ -9698,7 +9646,7 @@ class TradeOfferResponseView(discord.ui.View):
         req = cur.fetchone()
         if not req or str(req["owner_discord_id"]) != target_id:
             conn.close()
-            await safe_send(interaction, "❌ Il giocatore richiesto non appartiene più al destinatario.", ephemeral=True)
+            await interaction.response.send_message("❌ Il giocatore richiesto non appartiene più al destinatario.", ephemeral=True)
             return
 
         if offered_player_id:
@@ -9706,7 +9654,7 @@ class TradeOfferResponseView(discord.ui.View):
             off = cur.fetchone()
             if not off or str(off["owner_discord_id"]) != proposer_id:
                 conn.close()
-                await safe_send(interaction, "❌ Il giocatore offerto non appartiene più al proponente.", ephemeral=True)
+                await interaction.response.send_message("❌ Il giocatore offerto non appartiene più al proponente.", ephemeral=True)
                 return
 
         if amount > 0:
@@ -9714,7 +9662,7 @@ class TradeOfferResponseView(discord.ui.View):
             proposer = cur.fetchone()
             if not proposer or safe_int(proposer["budget"]) < amount:
                 conn.close()
-                await safe_send(interaction, "❌ Il proponente non ha più budget sufficiente.", ephemeral=True)
+                await interaction.response.send_message("❌ Il proponente non ha più budget sufficiente.", ephemeral=True)
                 return
 
         # Trasferimento giocatore richiesto al proponente
@@ -9744,11 +9692,11 @@ class TradeOfferResponseView(discord.ui.View):
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         offer = await self._get_offer()
         if not offer:
-            await safe_send(interaction, "Offerta non trovata.", ephemeral=True)
+            await interaction.response.send_message("Offerta non trovata.", ephemeral=True)
             return
 
         if str(interaction.user.id) != str(offer["target_id"]):
-            await safe_send(interaction, "❌ Solo il destinatario può rifiutare questa offerta.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo il destinatario può rifiutare questa offerta.", ephemeral=True)
             return
 
         conn = connect()
@@ -9768,11 +9716,11 @@ class TradeOfferResponseView(discord.ui.View):
     async def counter(self, interaction: discord.Interaction, button: discord.ui.Button):
         offer = await self._get_offer()
         if not offer:
-            await safe_send(interaction, "Offerta non trovata.", ephemeral=True)
+            await interaction.response.send_message("Offerta non trovata.", ephemeral=True)
             return
 
         if str(interaction.user.id) != str(offer["target_id"]):
-            await safe_send(interaction, "❌ Solo il destinatario può fare una controfferta.", ephemeral=True)
+            await interaction.response.send_message("❌ Solo il destinatario può fare una controfferta.", ephemeral=True)
             return
 
         await interaction.response.send_modal(CounterOfferModal(self.offer_id))
@@ -9792,9 +9740,8 @@ class TradeOfferResponseView(discord.ui.View):
     app_commands.Choice(name="Nome club", value="club"),
 ])
 async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str], testo: str):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     if not is_search_channel(interaction):
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             f"❌ Puoi usare questo comando solo nel canale <#{SEARCH_CHANNEL_ID}>.",
             ephemeral=True
         )
@@ -9803,13 +9750,13 @@ async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str]
     query = normalize_text(testo).strip()
 
     if len(query) < 2:
-        await safe_send(interaction, 
+        await interaction.response.send_message(
             "❌ Scrivi almeno 2 caratteri per la ricerca.",
             ephemeral=True
         )
         return
 
-    await safe_defer(interaction, ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
 
     conn = connect()
     cur = conn.cursor()
@@ -9910,7 +9857,6 @@ async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str]
     app_commands.Choice(name="Nome club", value="club"),
 ])
 async def cerc(interaction: discord.Interaction, tipo: app_commands.Choice[str], testo: str):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
     await cerca.callback(interaction, tipo, testo)
 
 # ===========================================================
@@ -9921,10 +9867,10 @@ async def cerc(interaction: discord.Interaction, tipo: app_commands.Choice[str],
 @tree.command(name="aggiorna_budget_reali", description="Staff: ricalcola il budget dei club già iscritti in modalità reale")
 async def aggiorna_budget_reali(interaction: discord.Interaction):
     if not can_use_normal_staff(interaction.user):
-        await safe_send(interaction, "❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
-    await safe_defer(interaction, ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
 
     conn = connect()
     cur = conn.cursor()
@@ -10784,10 +10730,10 @@ async def reset_league_roles_background(guild_id: int):
 @tree.command(name="reset_league", description="Owner staff: reset totale competizione, iscrizioni, club, rose e ruoli")
 async def reset_league(interaction: discord.Interaction):
     if not can_use_dangerous_commands(interaction.user):
-        await safe_send(interaction, "❌ Non hai i permessi per usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Non hai i permessi per usare questo comando.", ephemeral=True)
         return
 
-    await safe_defer(interaction, ephemeral=True, thinking=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
     def reset_database_sync():
         conn = connect()
