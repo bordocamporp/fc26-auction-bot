@@ -9767,6 +9767,117 @@ class TradeOfferResponseView(discord.ui.View):
 
 # ================= RICERCA GIOCATORI: NOME O CLUB =================
 
+# ================= AUTOCOMPLETE RICERCA =================
+# Nota Discord: i menu a tendina/autocomplete degli slash command possono mostrare al massimo 25 risultati.
+# Per questo non si possono mostrare TUTTI i giocatori/club contemporaneamente: il menu si aggiorna mentre scrivi.
+
+async def cerca_testo_autocomplete(interaction: discord.Interaction, current: str):
+    """
+    Autocomplete dinamico per /cerca.
+    - Se tipo = Nome club: mostra campionato + club, usando fc26_clubs e lo stato assegnazione.
+    - Se tipo = Nome giocatore: mostra giocatore + OVR + ruolo + club attuale.
+      Il club attuale viene preso dal manager proprietario, se il giocatore è stato comprato/venduto.
+    """
+    try:
+        tipo = getattr(interaction.namespace, "tipo", None)
+        tipo_value = getattr(tipo, "value", tipo) or "player"
+        current_norm = normalize_text(current).strip()
+
+        conn = connect()
+        cur = conn.cursor()
+
+        # Menu club: campionato + squadra. Filtra mentre scrivi.
+        if str(tipo_value) == "club":
+            if current_norm:
+                cur.execute("""
+                    SELECT
+                        c.name,
+                        COALESCE(c.league, 'Senza campionato') AS league,
+                        c.assigned_to,
+                        COUNT(p.id) AS players_count
+                    FROM fc26_clubs c
+                    LEFT JOIN managers m ON m.club_name = c.name
+                    LEFT JOIN players p ON p.owner_discord_id = m.discord_id OR (p.owner_discord_id IS NULL AND LOWER(p.team) = LOWER(c.name))
+                    WHERE LOWER(c.name) LIKE %s OR LOWER(COALESCE(c.league, '')) LIKE %s
+                    GROUP BY c.name, c.league, c.assigned_to
+                    ORDER BY COALESCE(c.league, 'Senza campionato') ASC, c.name ASC
+                    LIMIT 25
+                """, (f"%{current.lower()}%", f"%{current.lower()}%"))
+            else:
+                cur.execute("""
+                    SELECT
+                        c.name,
+                        COALESCE(c.league, 'Senza campionato') AS league,
+                        c.assigned_to,
+                        COUNT(p.id) AS players_count
+                    FROM fc26_clubs c
+                    LEFT JOIN managers m ON m.club_name = c.name
+                    LEFT JOIN players p ON p.owner_discord_id = m.discord_id OR (p.owner_discord_id IS NULL AND LOWER(p.team) = LOWER(c.name))
+                    GROUP BY c.name, c.league, c.assigned_to
+                    ORDER BY COALESCE(c.league, 'Senza campionato') ASC, c.name ASC
+                    LIMIT 25
+                """)
+
+            rows = cur.fetchall()
+            conn.close()
+
+            choices = []
+            for r in rows[:25]:
+                status = "assegnato" if r["assigned_to"] else "libero"
+                label = f"{r['league']} • {r['name']} • {safe_int(r['players_count'])} giocatori • {status}"
+                choices.append(app_commands.Choice(name=label[:100], value=str(r["name"])[:100]))
+            return choices
+
+        # Menu giocatori: mostra club ATTUALE se il giocatore è già di un manager.
+        # Se l'utente non scrive nulla, mostra i migliori per overall.
+        if current_norm:
+            cur.execute("""
+                SELECT
+                    p.id,
+                    p.name,
+                    p.position,
+                    p.overall,
+                    p.team AS original_team,
+                    p.owner_discord_id,
+                    COALESCE(m.club_name, p.team) AS current_club
+                FROM players p
+                LEFT JOIN managers m ON m.discord_id = p.owner_discord_id
+                WHERE LOWER(p.name) LIKE %s
+                   OR LOWER(p.team) LIKE %s
+                   OR LOWER(COALESCE(m.club_name, '')) LIKE %s
+                ORDER BY p.overall DESC NULLS LAST, p.name ASC
+                LIMIT 25
+            """, (f"%{current.lower()}%", f"%{current.lower()}%", f"%{current.lower()}%"))
+        else:
+            cur.execute("""
+                SELECT
+                    p.id,
+                    p.name,
+                    p.position,
+                    p.overall,
+                    p.team AS original_team,
+                    p.owner_discord_id,
+                    COALESCE(m.club_name, p.team) AS current_club
+                FROM players p
+                LEFT JOIN managers m ON m.discord_id = p.owner_discord_id
+                ORDER BY p.overall DESC NULLS LAST, p.name ASC
+                LIMIT 25
+            """)
+
+        rows = cur.fetchall()
+        conn.close()
+
+        choices = []
+        for p in rows[:25]:
+            stato = "venduto" if p["owner_discord_id"] else "libero"
+            label = f"{p['name']} • OVR {p['overall']} • {p['position']} • {p['current_club']} • {stato}"
+            choices.append(app_commands.Choice(name=label[:100], value=str(p["id"])[:100]))
+        return choices
+
+    except Exception as e:
+        print(f"[AUTOCOMPLETE CERCA] Errore: {e}")
+        return []
+
 @tree.command(name="cerca", description="Cerca giocatori per nome oppure per club")
 @app_commands.describe(
     tipo="Scegli se cercare per nome giocatore o per club",
@@ -9776,6 +9887,7 @@ class TradeOfferResponseView(discord.ui.View):
     app_commands.Choice(name="Nome giocatore", value="player"),
     app_commands.Choice(name="Nome club", value="club"),
 ])
+@app_commands.autocomplete(testo=cerca_testo_autocomplete)
 async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str], testo: str):
     if not is_search_channel(interaction):
         await interaction.response.send_message(
@@ -9799,13 +9911,25 @@ async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str]
     cur = conn.cursor()
 
     if tipo.value == "player":
-        cur.execute("""
-            SELECT *
-            FROM players
-            WHERE LOWER(name) LIKE %s
-            ORDER BY overall DESC
-            LIMIT 10
-        """, (f"%{testo.lower()}%",))
+        # Se arriva un valore dal menu a tendina, testo è l'ID del giocatore.
+        # Altrimenti resta valida la ricerca manuale per nome.
+        if str(testo).isdigit():
+            cur.execute("""
+                SELECT p.*, COALESCE(m.club_name, p.team) AS current_club
+                FROM players p
+                LEFT JOIN managers m ON m.discord_id = p.owner_discord_id
+                WHERE p.id = %s
+                LIMIT 1
+            """, (int(testo),))
+        else:
+            cur.execute("""
+                SELECT p.*, COALESCE(m.club_name, p.team) AS current_club
+                FROM players p
+                LEFT JOIN managers m ON m.discord_id = p.owner_discord_id
+                WHERE LOWER(p.name) LIKE %s
+                ORDER BY p.overall DESC NULLS LAST
+                LIMIT 10
+            """, (f"%{testo.lower()}%",))
         rows = cur.fetchall()
 
         conn.close()
@@ -9826,7 +9950,8 @@ async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str]
             embed.add_field(
                 name=f"{p['name']} — OVR {p['overall']}",
                 value=(
-                    f"Club: **{p['team']}**\n"
+                    f"Club attuale: **{p.get('current_club', p['team']) if hasattr(p, 'get') else p['team']}**\n"
+                    f"Club originale: **{p['team']}**\n"
                     f"Ruolo: **{p['position']}**\n"
                     f"Stato: **{status}**\n"
                     f"ID: `{p['id']}`"
@@ -9837,18 +9962,19 @@ async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str]
         await interaction.followup.send(embed=embed, ephemeral=True)
         return
 
-    # Ricerca per club
+    # Ricerca per club: usa il club ATTUALE del proprietario, così i trasferimenti sono aggiornati.
     cur.execute("""
-        SELECT *
-        FROM players
-        ORDER BY overall DESC
+        SELECT p.*, COALESCE(m.club_name, p.team) AS current_club
+        FROM players p
+        LEFT JOIN managers m ON m.discord_id = p.owner_discord_id
+        ORDER BY p.overall DESC NULLS LAST
     """)
     all_players = cur.fetchall()
     conn.close()
 
     matched = [
         p for p in all_players
-        if query in normalize_text(p["team"])
+        if query in normalize_text(p.get("current_club", p["team"]) if hasattr(p, "get") else p["team"])
     ]
 
     if not matched:
@@ -9870,7 +9996,8 @@ async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str]
         embed.add_field(
             name=f"{p['name']} — OVR {p['overall']}",
             value=(
-                f"Club: **{p['team']}**\n"
+                f"Club attuale: **{p.get('current_club', p['team']) if hasattr(p, 'get') else p['team']}**\n"
+                f"Club originale: **{p['team']}**\n"
                 f"Ruolo: **{p['position']}**\n"
                 f"Stato: **{status}**\n"
                 f"ID: `{p['id']}`"
@@ -9893,6 +10020,7 @@ async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str]
     app_commands.Choice(name="Nome giocatore", value="player"),
     app_commands.Choice(name="Nome club", value="club"),
 ])
+@app_commands.autocomplete(testo=cerca_testo_autocomplete)
 async def cerc(interaction: discord.Interaction, tipo: app_commands.Choice[str], testo: str):
     await cerca.callback(interaction, tipo, testo)
 
