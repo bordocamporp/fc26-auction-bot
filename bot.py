@@ -1325,24 +1325,16 @@ def sync_real_team_roster_to_manager(discord_id, club_name):
         """, (discord_id, pid))
         assigned_count += 1
 
-    # Crea/aggiorna manager senza ON CONFLICT: compatibile anche se discord_id non è UNIQUE.
-    cur.execute("SELECT id FROM managers WHERE discord_id = %s LIMIT 1", (discord_id,))
-    manager_row = cur.fetchone()
-
-    if manager_row:
-        cur.execute("""
-            UPDATE managers
-            SET name = %s,
-                manager_name = %s,
-                club_name = %s,
-                budget = %s
-            WHERE discord_id = %s
-        """, (discord_id, discord_id, club_name, int(budget), discord_id))
-    else:
-        cur.execute("""
-            INSERT INTO managers (discord_id, name, manager_name, club_name, budget)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (discord_id, discord_id, discord_id, club_name, int(budget)))
+    # Crea/aggiorna manager
+    cur.execute("""
+        INSERT INTO managers (discord_id, name, manager_name, club_name, budget)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (discord_id) DO UPDATE SET
+            name = EXCLUDED.name,
+            manager_name = EXCLUDED.manager_name,
+            club_name = EXCLUDED.club_name,
+            budget = EXCLUDED.budget
+    """, (discord_id, discord_id, discord_id, club_name, int(budget)))
 
     # Libera eventuale club precedente assegnato allo stesso manager
     cur.execute("""
@@ -2444,9 +2436,8 @@ def update_player_activity(discord_id, activity_type="discord"):
 
     cur.execute(f"""
         INSERT INTO player_activity (discord_id, {field}, {warned_field})
-        VALUES (?, CURRENT_TIMESTAMP, 0)
-        ON CONFLICT (discord_id) DO NOTHING
-        ON CONFLICT(discord_id)
+        VALUES (%s, CURRENT_TIMESTAMP, 0)
+        ON CONFLICT (discord_id)
         DO UPDATE SET {field} = CURRENT_TIMESTAMP, {warned_field} = 0
     """, (str(discord_id),))
 
@@ -2538,7 +2529,7 @@ async def send_inactivity_warning(guild, member, reason, field):
         cur.execute(f"""
             UPDATE player_activity
             SET {warned_field} = 1
-            WHERE discord_id = ?
+            WHERE discord_id = %s
         """, (str(member.id),))
         conn.commit()
 
@@ -2568,7 +2559,7 @@ async def check_player_inactivity():
 
     while not bot.is_closed():
         try:
-            ensure_registered_players_in_activity()
+            await asyncio.to_thread(ensure_registered_players_in_activity)
 
             conn = connect()
             cur = conn.cursor()
@@ -3911,7 +3902,7 @@ class SignupClubSelect(discord.ui.Select):
         conn.commit()
         conn.close()
 
-        players_count, avg_ovr, budget, real_team_name = sync_real_team_roster_to_manager(discord_id, club_name)
+        players_count, avg_ovr, budget, real_team_name = await asyncio.to_thread(sync_real_team_roster_to_manager, discord_id, club_name)
 
         if players_count <= 0:
             await interaction.followup.send(
@@ -10186,11 +10177,7 @@ async def apply_signup_accept_from_website(req, request_id, club_name, handled_b
 
             if mode == "squadre_reali":
                 try:
-                    players_count, avg_ovr, budget, real_team_name = await asyncio.to_thread(
-                        sync_real_team_roster_to_manager,
-                        discord_id,
-                        club_name
-                    )
+                    players_count, avg_ovr, budget, real_team_name = await asyncio.to_thread(sync_real_team_roster_to_manager, discord_id, club_name)
                 except Exception as e:
                     print(f"[WEBSITE SYNC] sync_real_team_roster_to_manager fallito: {e}")
                     budget = DEFAULT_BUDGET
@@ -10584,136 +10571,14 @@ async def process_website_signup_actions_loop():
 
         await asyncio.sleep(5)
 
-
-
 # ===========================================================
-# COMANDO RESET LEAGUE - RESET COMPLETO COMPETIZIONE
+# FINE WEBSITE/DISCORD SIGNUP SYNC PATCH v2
 # ===========================================================
 
-async def reset_league_database():
-    """
-    Reset completo lato database per ripartire da zero.
-    Non cancella il dataset FC26 dei giocatori: libera solo owner/rose/club/iscrizioni.
-    """
-    def _run():
-        conn = connect()
-        cur = conn.cursor()
-
-        statements = [
-            """
-            UPDATE signup_requests
-            SET status = 'reset',
-                club_name = NULL,
-                handled_by = NULL,
-                handled_at = NULL,
-                staff_message_id = NULL,
-                staff_channel_id = NULL
-            """,
-            "DELETE FROM signup_staff_actions",
-            "DELETE FROM managers",
-            "DELETE FROM real_team_assignments",
-            """
-            UPDATE fc26_clubs
-            SET assigned_to = NULL,
-                assigned_at = NULL,
-                previous_owner_id = NULL,
-                previous_owner_name = NULL
-            """,
-            """
-            UPDATE players
-            SET owner_discord_id = NULL,
-                sold_price = NULL
-            """,
-            "DELETE FROM auctions",
-            "DELETE FROM bid_history",
-            "DELETE FROM trade_offers",
-            "DELETE FROM player_trade_offers",
-            "DELETE FROM transfer_history",
-        ]
-
-        executed = []
-        skipped = []
-
-        for sql in statements:
-            try:
-                cur.execute(sql)
-                executed.append(sql.strip().split("\n")[0][:80])
-            except Exception as e:
-                conn.rollback()
-                skipped.append(str(e))
-            else:
-                conn.commit()
-
-        try:
-            cur.execute("""
-                INSERT INTO league_settings (key, value)
-                VALUES ('market_open', 'closed')
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-            """)
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            skipped.append(str(e))
-
-        conn.close()
-        return executed, skipped
-
-    return await asyncio.to_thread(_run)
 
 
-async def reset_league_discord_roles(guild):
-    """Rimuove ruoli PRE ISCRITTO / ISCRITTO FC26 e rimette il ruolo base se presente."""
-    if not guild:
-        return 0, 0, 0
-
-    base_role = guild.get_role(int(BASE_ROLE_ID)) if BASE_ROLE_ID else None
-    pre_role = guild.get_role(int(PRE_SIGNUP_ROLE_ID)) if PRE_SIGNUP_ROLE_ID else None
-    registered_role = guild.get_role(int(REGISTERED_ROLE_ID)) if REGISTERED_ROLE_ID else None
-
-    checked = 0
-    changed = 0
-    errors = 0
-
-    async def handle_member(member):
-        nonlocal checked, changed, errors
-        checked += 1
-        to_remove = []
-        if pre_role and pre_role in getattr(member, "roles", []):
-            to_remove.append(pre_role)
-        if registered_role and registered_role in getattr(member, "roles", []):
-            to_remove.append(registered_role)
-
-        try:
-            if to_remove:
-                await member.remove_roles(*to_remove, reason="Reset competizione BC FC")
-                changed += 1
-
-            if base_role and base_role not in getattr(member, "roles", []):
-                await member.add_roles(base_role, reason="Reset competizione BC FC")
-        except Exception as e:
-            errors += 1
-            print(f"[RESET LEAGUE] Errore ruoli membro {getattr(member, 'id', '?')}: {e}")
-
-    # Prima usa cache, poi prova fetch_members per coprire tutti.
-    seen = set()
-    for member in list(getattr(guild, "members", [])):
-        seen.add(member.id)
-        await handle_member(member)
-
-    try:
-        async for member in guild.fetch_members(limit=None):
-            if member.id in seen:
-                continue
-            await handle_member(member)
-    except Exception as e:
-        print(f"[RESET LEAGUE] fetch_members non disponibile o intents mancanti: {e}")
-
-    return checked, changed, errors
-
-
-@tree.command(name="reset_league", description="Owner staff: resetta iscrizioni, club, rose, mercato e ruoli Discord")
-@app_commands.describe(conferma="Imposta True per confermare il reset definitivo")
-async def reset_league(interaction: discord.Interaction, conferma: bool = False):
+@tree.command(name="reset_league", description="Owner staff: reset totale competizione, iscrizioni, club, rose e ruoli")
+async def reset_league(interaction: discord.Interaction):
     if not can_use_dangerous_commands(interaction.user):
         await interaction.response.send_message(
             "❌ Non hai i permessi per usare questo comando.",
@@ -10721,82 +10586,203 @@ async def reset_league(interaction: discord.Interaction, conferma: bool = False)
         )
         return
 
-    if not conferma:
-        embed = discord.Embed(
-            title="⚠️ Conferma reset competizione",
-            description=(
-                "Questo comando resetta completamente la competizione:\n"
-                "• iscrizioni e richieste\n"
-                "• manager\n"
-                "• club assegnati\n"
-                "• rose assegnate\n"
-                "• aste/offerte/trasferimenti\n"
-                "• ruoli PRE ISCRITTO / ISCRITTO FC26\n\n"
-                "Per eseguirlo davvero usa:\n"
-                "`/reset_league conferma: True`"
-            ),
-            color=discord.Color.orange()
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
+    # Fondamentale: evita Unknown interaction quando il reset richiede più di 3 secondi.
     await interaction.response.defer(ephemeral=True, thinking=True)
 
+    async def reset_database():
+        def _run():
+            conn = connect()
+            cur = conn.cursor()
+
+            # Richieste iscrizione
+            try:
+                cur.execute("""
+                    UPDATE signup_requests
+                    SET status = 'reset',
+                        club_name = NULL,
+                        handled_by = NULL,
+                        handled_at = NULL
+                """)
+            except Exception as e:
+                print(f"[RESET LEAGUE] signup_requests base: {e}")
+
+            # Campi opzionali sito/discord sync
+            for sql in [
+                "UPDATE signup_requests SET staff_message_id = NULL",
+                "UPDATE signup_requests SET staff_channel_id = NULL",
+                "UPDATE signup_requests SET signup_source = 'discord'",
+                "UPDATE signup_requests SET source = 'discord'"
+            ]:
+                try:
+                    cur.execute(sql)
+                except Exception:
+                    pass
+
+            # Azioni staff dal sito
+            try:
+                cur.execute("DELETE FROM signup_staff_actions")
+            except Exception:
+                pass
+
+            # Manager
+            try:
+                cur.execute("DELETE FROM managers")
+            except Exception as e:
+                print(f"[RESET LEAGUE] managers: {e}")
+
+            # Assegnazioni squadre reali
+            try:
+                cur.execute("DELETE FROM real_team_assignments")
+            except Exception:
+                pass
+
+            # Club FC26
+            try:
+                cur.execute("""
+                    UPDATE fc26_clubs
+                    SET assigned_to = NULL,
+                        assigned_at = NULL,
+                        previous_owner_id = NULL,
+                        previous_owner_name = NULL
+                """)
+            except Exception as e:
+                print(f"[RESET LEAGUE] fc26_clubs: {e}")
+
+            # Giocatori
+            try:
+                cur.execute("""
+                    UPDATE players
+                    SET owner_discord_id = NULL,
+                        sold_price = NULL
+                """)
+            except Exception as e:
+                print(f"[RESET LEAGUE] players: {e}")
+
+            # Aste / offerte / trasferimenti
+            for sql in [
+                "UPDATE auctions SET status = 'closed' WHERE status = 'open'",
+                "DELETE FROM trade_offers",
+                "DELETE FROM player_trade_offers",
+                "DELETE FROM transfer_history",
+                "DELETE FROM bid_history"
+            ]:
+                try:
+                    cur.execute(sql)
+                except Exception:
+                    pass
+
+            # Campionati opzionali
+            for sql in [
+                "UPDATE championships SET status = 'archived' WHERE status = 'active'",
+                "UPDATE championship_matches SET status = 'reset' WHERE status <> 'reset'",
+                "DELETE FROM match_scorers"
+            ]:
+                try:
+                    cur.execute(sql)
+                except Exception:
+                    pass
+
+            conn.commit()
+            conn.close()
+
+        await asyncio.to_thread(_run)
+
     try:
-        executed, skipped = await reset_league_database()
-        checked, changed, role_errors = await reset_league_discord_roles(interaction.guild)
-
-        try:
-            reset_auction_state()
-        except Exception as e:
-            skipped.append(f"reset_auction_state: {e}")
-
-        embed = discord.Embed(
-            title="✅ Competizione resettata",
-            description=(
-                "La competizione è stata riportata allo stato iniziale.\n\n"
-                f"🗄️ Operazioni DB eseguite: **{len(executed)}**\n"
-                f"👥 Membri controllati: **{checked}**\n"
-                f"🎭 Membri con ruoli aggiornati: **{changed}**\n"
-                f"⚠️ Errori ruoli: **{role_errors}**"
-            ),
-            color=discord.Color.green()
-        )
-
-        if skipped:
-            embed.add_field(
-                name="Avvisi",
-                value="\n".join(f"• {x[:160]}" for x in skipped[:8]),
-                inline=False
-            )
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-        try:
-            await send_staff_log(
-                interaction.guild,
-                "♻️ Reset competizione eseguito",
-                f"Reset eseguito da {interaction.user.mention}. DB: {len(executed)} operazioni. Ruoli aggiornati: {changed}.",
-                user=interaction.user,
-                color=discord.Color.green()
-            )
-        except Exception:
-            pass
-
+        await reset_database()
     except Exception as e:
         await interaction.followup.send(
-            f"❌ Errore durante il reset: `{e}`",
+            f"❌ Errore reset database:\n```{e}```",
             ephemeral=True
         )
+        return
 
-# ===========================================================
-# FINE COMANDO RESET LEAGUE
-# ===========================================================
+    # Reset ruoli Discord
+    changed = 0
+    failed = 0
 
+    guild = interaction.guild
+    if guild:
+        base_role = guild.get_role(int(BASE_ROLE_ID)) if BASE_ROLE_ID else None
+        pre_role = guild.get_role(int(PRE_SIGNUP_ROLE_ID)) if PRE_SIGNUP_ROLE_ID else None
+        registered_role = guild.get_role(int(REGISTERED_ROLE_ID)) if REGISTERED_ROLE_ID else None
 
-# ===========================================================
-# FINE WEBSITE/DISCORD SIGNUP SYNC PATCH v2
-# ===========================================================
+        # Usa fetch_members se possibile: più affidabile su Railway/cache.
+        try:
+            members_iter = guild.fetch_members(limit=None)
+            async for member in members_iter:
+                if member.bot:
+                    continue
+
+                roles_to_remove = [
+                    role for role in (pre_role, registered_role)
+                    if role and role in member.roles
+                ]
+
+                try:
+                    if roles_to_remove:
+                        await member.remove_roles(*roles_to_remove, reason="Reset totale competizione BC FC")
+                        changed += 1
+
+                    if base_role and base_role not in member.roles:
+                        await member.add_roles(base_role, reason="Reset totale competizione BC FC")
+                except Exception:
+                    failed += 1
+
+        except Exception as e:
+            print(f"[RESET LEAGUE] fetch_members fallito, uso cache: {e}")
+            for member in guild.members:
+                if member.bot:
+                    continue
+
+                roles_to_remove = [
+                    role for role in (pre_role, registered_role)
+                    if role and role in member.roles
+                ]
+
+                try:
+                    if roles_to_remove:
+                        await member.remove_roles(*roles_to_remove, reason="Reset totale competizione BC FC")
+                        changed += 1
+
+                    if base_role and base_role not in member.roles:
+                        await member.add_roles(base_role, reason="Reset totale competizione BC FC")
+                except Exception:
+                    failed += 1
+
+    embed = discord.Embed(
+        title="✅ Reset competizione completato",
+        description=(
+            "La competizione è stata riportata a zero.\n\n"
+            "Sono stati resettati:\n"
+            "• iscrizioni\n"
+            "• manager\n"
+            "• club assegnati\n"
+            "• rose giocatori\n"
+            "• aste/offerte/trasferimenti\n"
+            "• ruoli PRE ISCRITTO / ISCRITTO FC26"
+        ),
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Ruoli aggiornati", value=str(changed), inline=True)
+    embed.add_field(name="Errori ruoli", value=str(failed), inline=True)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    try:
+        await send_staff_log(
+            interaction.guild,
+            "♻️ Reset totale competizione",
+            (
+                f"Eseguito da {interaction.user.mention}\n"
+                f"Ruoli aggiornati: **{changed}**\n"
+                f"Errori ruoli: **{failed}**"
+            ),
+            user=interaction.user,
+            color=discord.Color.green()
+        )
+    except Exception:
+        pass
+
 
 
 bot.run(TOKEN)
