@@ -10419,4 +10419,263 @@ async def process_website_signup_actions_loop():
 # ===========================================================
 
 
+# ===========================================================
+# RESET LEGA COMPLETO - DATABASE + RUOLI DISCORD
+# ===========================================================
+
+def execute_reset_sql_safe(cur, sql, params=None, label=""):
+    """Esegue una query di reset senza bloccare tutto se una tabella/colonna non esiste."""
+    try:
+        cur.execute(sql, params or ())
+        return True, None
+    except Exception as e:
+        print(f"[RESET LEAGUE] Errore query {label}: {e}")
+        return False, str(e)
+
+
+def reset_league_database_full():
+    """
+    Reset completo iscrizioni/club/rose per tornare da zero.
+
+    Pulisce:
+    - signup_requests
+    - managers
+    - real_team_assignments
+    - signup_staff_actions
+    - owner_discord_id / sold_price dei players
+    - assigned_to / assigned_at dei club
+    - aste/offerte/trasferimenti opzionali se le tabelle esistono
+    """
+    conn = connect()
+    cur = conn.cursor()
+
+    results = []
+
+    queries = [
+        (
+            "players",
+            """
+            UPDATE players
+            SET owner_discord_id = NULL,
+                sold_price = NULL
+            """
+        ),
+        (
+            "fc26_clubs",
+            """
+            UPDATE fc26_clubs
+            SET assigned_to = NULL,
+                assigned_at = NULL,
+                previous_owner_id = NULL,
+                previous_owner_name = NULL
+            """
+        ),
+        (
+            "real_team_assignments",
+            "DELETE FROM real_team_assignments"
+        ),
+        (
+            "managers",
+            "DELETE FROM managers"
+        ),
+        (
+            "signup_staff_actions",
+            "DELETE FROM signup_staff_actions"
+        ),
+        (
+            "signup_requests",
+            "DELETE FROM signup_requests"
+        ),
+        (
+            "transfer_history",
+            "DELETE FROM transfer_history"
+        ),
+        (
+            "trade_offers",
+            "DELETE FROM trade_offers"
+        ),
+        (
+            "player_trade_offers",
+            "DELETE FROM player_trade_offers"
+        ),
+        (
+            "auctions",
+            "DELETE FROM auctions"
+        ),
+        (
+            "bid_history",
+            "DELETE FROM bid_history"
+        ),
+    ]
+
+    for label, sql in queries:
+        ok, error = execute_reset_sql_safe(cur, sql, label=label)
+        results.append((label, ok, error))
+
+    # Reset impostazioni mercato/modalità senza cancellare league_settings.
+    execute_reset_sql_safe(
+        cur,
+        """
+        INSERT INTO league_settings (key, value)
+        VALUES ('market_open', 'closed')
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """,
+        label="league_settings market_open"
+    )
+
+    conn.commit()
+    conn.close()
+
+    return results
+
+
+async def reset_league_discord_roles(guild):
+    """
+    Rimuove i ruoli PRE ISCRITTO e ISCRITTO FC26.
+    Assicura il ruolo base ai membri coinvolti.
+    """
+    if not guild:
+        return 0, 0, 0
+
+    base_role = guild.get_role(int(BASE_ROLE_ID)) if BASE_ROLE_ID else None
+    pre_role = guild.get_role(int(PRE_SIGNUP_ROLE_ID)) if PRE_SIGNUP_ROLE_ID else None
+    registered_role = guild.get_role(int(REGISTERED_ROLE_ID)) if REGISTERED_ROLE_ID else None
+
+    checked = 0
+    changed = 0
+    errors = 0
+
+    try:
+        async for member in guild.fetch_members(limit=None):
+            if member.bot:
+                continue
+
+            checked += 1
+            roles_to_remove = []
+
+            if pre_role and pre_role in member.roles:
+                roles_to_remove.append(pre_role)
+
+            if registered_role and registered_role in member.roles:
+                roles_to_remove.append(registered_role)
+
+            try:
+                did_change = False
+
+                if roles_to_remove:
+                    await member.remove_roles(
+                        *roles_to_remove,
+                        reason="Reset completo competizione FC26"
+                    )
+                    did_change = True
+
+                if base_role and base_role not in member.roles:
+                    await member.add_roles(
+                        base_role,
+                        reason="Reset completo competizione FC26"
+                    )
+                    did_change = True
+
+                if did_change:
+                    changed += 1
+
+                # evita rate limit aggressivi su server grandi
+                await asyncio.sleep(0.15)
+
+            except Exception as e:
+                errors += 1
+                print(f"[RESET LEAGUE ROLES] Errore membro {member.id}: {e}")
+
+    except Exception as e:
+        print(f"[RESET LEAGUE ROLES] Errore fetch_members: {e}")
+
+    return checked, changed, errors
+
+
+@tree.command(
+    name="reset_league",
+    description="Owner staff: resetta iscrizioni, club, rose e ruoli per ripartire da zero"
+)
+async def reset_league(interaction: discord.Interaction):
+    async def do_reset(confirm_interaction: discord.Interaction):
+        await confirm_interaction.response.edit_message(
+            embed=discord.Embed(
+                title="♻️ Reset competizione in corso",
+                description="Sto resettando database, club, rose e ruoli Discord...",
+                color=discord.Color.orange()
+            ),
+            view=None
+        )
+
+        # Backup se disponibile
+        try:
+            await create_backup_before_sensitive_action("reset_league")
+        except Exception as e:
+            print(f"[RESET LEAGUE] Backup saltato: {e}")
+
+        db_results = reset_league_database_full()
+        checked, changed, role_errors = await reset_league_discord_roles(confirm_interaction.guild)
+
+        ok_tables = [label for label, ok, _ in db_results if ok]
+        failed_tables = [(label, error) for label, ok, error in db_results if not ok]
+
+        description = (
+            "✅ **Reset completato.**\n\n"
+            f"🗄️ Tabelle resettate: **{len(ok_tables)}**\n"
+            f"👥 Membri controllati: **{checked}**\n"
+            f"🔁 Membri aggiornati: **{changed}**\n"
+            f"⚠️ Errori ruoli: **{role_errors}**\n\n"
+            "Sono stati liberati club, rose e iscrizioni. La competizione è pronta da zero."
+        )
+
+        if failed_tables:
+            compact_errors = "\n".join(
+                f"• `{label}`: {str(error)[:90]}"
+                for label, error in failed_tables[:5]
+            )
+            description += f"\n\n⚠️ Alcune tabelle opzionali non sono state resettate:\n{compact_errors}"
+
+        embed = discord.Embed(
+            title="✅ Reset lega completato",
+            description=description,
+            color=discord.Color.green()
+        )
+        embed.set_footer(text="FC26 Reset League")
+
+        try:
+            await confirm_interaction.edit_original_response(embed=embed, view=None)
+        except Exception:
+            await confirm_interaction.followup.send(embed=embed, ephemeral=True)
+
+        await send_staff_log(
+            confirm_interaction.guild,
+            "♻️ Reset lega completato",
+            (
+                f"Reset eseguito da {confirm_interaction.user.mention}\n"
+                f"Tabelle OK: {len(ok_tables)}\n"
+                f"Membri controllati: {checked}\n"
+                f"Membri aggiornati: {changed}\n"
+                f"Errori ruoli: {role_errors}"
+            ),
+            user=confirm_interaction.user,
+            color=discord.Color.green()
+        )
+
+    await ask_danger_confirmation(
+        interaction,
+        "Reset completo lega",
+        (
+            "Questa azione cancella/resetta iscrizioni, manager, club assegnati, rose, "
+            "azioni staff, aste/offerte/trasferimenti e rimuove i ruoli PRE ISCRITTO / ISCRITTO FC26.\n\n"
+            "Da usare solo quando vuoi ripartire da zero."
+        ),
+        do_reset
+    )
+
+# ===========================================================
+# FINE RESET LEGA COMPLETO
+# ===========================================================
+
+
+
 bot.run(TOKEN)
