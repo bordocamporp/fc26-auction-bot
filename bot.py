@@ -3385,7 +3385,27 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
                 embed.add_field(name="Modalità attiva", value=get_league_mode(), inline=False)
                 embed.set_footer(text="Lo staff deve scegliere ACCETTA o RIFIUTA.")
 
-                await staff_channel.send(embed=embed, view=SignupStaffView(int(request_id)))
+                staff_message = await staff_channel.send(embed=embed, view=SignupStaffView(int(request_id)))
+                try:
+                    conn_msg = connect()
+                    cur_msg = conn_msg.cursor()
+                    cur_msg.execute("""
+                        ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_message_id TEXT
+                    """)
+                    cur_msg.execute("""
+                        ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_channel_id TEXT
+                    """)
+                    cur_msg.execute("""
+                        UPDATE signup_requests
+                        SET staff_message_id = %s,
+                            staff_channel_id = %s,
+                            signup_source = COALESCE(signup_source, 'discord')
+                        WHERE id = %s
+                    """, (str(staff_message.id), str(staff_channel.id), int(request_id)))
+                    conn_msg.commit()
+                    conn_msg.close()
+                except Exception as e:
+                    print(f"[SIGNUP MODAL] Errore salvataggio messaggio staff: {e}")
             except Exception as e:
                 print(f"[SIGNUP MODAL] Errore invio staff: {e}")
 
@@ -4324,7 +4344,6 @@ async def on_ready():
     try:
         await asyncio.to_thread(init_db)
     except Exception as e:
-        bot.loop.create_task(process_website_signup_actions_loop())
         print(f"[ON_READY] init_db non bloccante fallito: {e}")
     try:
         await asyncio.to_thread(ensure_extra_tables)
@@ -4344,6 +4363,18 @@ async def on_ready():
         print(f"[ON_READY] reset_auction_state non bloccante fallito: {e}")
     bot.add_view(SignupStartView())
     bot.add_view(AuctionView())
+    try:
+        await asyncio.to_thread(ensure_website_signup_sync_tables)
+    except Exception as e:
+        print(f"[ON_READY] ensure_website_signup_sync_tables fallito: {e}")
+    try:
+        await register_pending_signup_views()
+    except Exception as e:
+        print(f"[ON_READY] register_pending_signup_views fallito: {e}")
+    try:
+        bot.loop.create_task(process_website_signup_actions_loop())
+    except Exception as e:
+        print(f"[ON_READY] process_website_signup_actions_loop non avviato: {e}")
 
     guild = get_guild()
 
@@ -9567,37 +9598,366 @@ async def aggiorna_budget_reali(interaction: discord.Interaction):
 
 # ===============================================================
 
-bot.run(TOKEN)
-
-
 
 # ===========================================================
-# BORDO CAMPO - PROCESSA AZIONI STAFF DAL SITO
+# BORDO CAMPO - WEBSITE/DISCORD SIGNUP SYNC PATCH v2
+# Sincronizza azioni dal sito con Discord:
+# - accetta/rifiuta dal sito
+# - aggiorna signup_requests
+# - assegna club e rosa se necessario
+# - manda DM
+# - pubblica nei canali accettati/rifiutati
+# - aggiorna il messaggio staff originale rimuovendo Accetta/Rifiuta
 # ===========================================================
 
-async def notify_signup_channel(channel_id, title, description, color=None):
+def ensure_website_signup_sync_tables():
+    conn = connect()
+    cur = conn.cursor()
+
+    for sql in [
+        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_message_id TEXT",
+        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_channel_id TEXT",
+        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS signup_source TEXT DEFAULT 'discord'",
+        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS ea_id TEXT",
+        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS preferred_clubs TEXT",
+        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_by TEXT",
+        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_at TIMESTAMP",
+        "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_name TEXT",
+        "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_to TEXT",
+        "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP",
+        "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_id TEXT",
+        "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_name TEXT",
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception as e:
+            print(f"[WEBSITE SYNC] Migrazione ignorata: {e}")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS signup_staff_actions (
+          id SERIAL PRIMARY KEY,
+          request_id BIGINT NOT NULL,
+          action TEXT NOT NULL,
+          club_name TEXT,
+          handled_by TEXT,
+          handled_by_name TEXT,
+          source TEXT DEFAULT 'website',
+          processed BOOLEAN DEFAULT false,
+          processed_at TIMESTAMP,
+          error TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+async def register_pending_signup_views():
+    """
+    Dopo un riavvio del bot, registra di nuovo i bottoni Accetta/Rifiuta
+    delle richieste ancora pending. Questo evita che i vecchi bottoni Discord
+    restino bloccati.
+    """
+    try:
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id
+            FROM signup_requests
+            WHERE status IN ('pending', 'choosing_club')
+            ORDER BY id DESC
+            LIMIT 100
+        """)
+        rows = cur.fetchall()
+        conn.close()
+
+        count = 0
+        for row in rows:
+            try:
+                bot.add_view(SignupStaffView(int(row["id"])))
+                count += 1
+            except Exception:
+                pass
+
+        print(f"[WEBSITE SYNC] View iscrizioni pending registrate: {count}")
+    except Exception as e:
+        print(f"[WEBSITE SYNC] Errore registrazione view pending: {e}")
+
+
+async def find_signup_staff_message(request_id, req=None):
+    """
+    Trova il messaggio Discord originale nel canale LOG-ISCRIZIONI.
+    Prima prova con staff_message_id salvato nel DB.
+    Se non c'è, cerca nella history del canale per Richiesta ID.
+    """
+    channel_id = None
+    message_id = None
+
+    try:
+        if req:
+            channel_id = req.get("staff_channel_id")
+            message_id = req.get("staff_message_id")
+    except Exception:
+        pass
+
+    if not channel_id:
+        channel_id = SIGNUP_STAFF_CHANNEL_ID
+
+    channel = None
     try:
         channel = bot.get_channel(int(channel_id))
         if not channel:
             channel = await bot.fetch_channel(int(channel_id))
+    except Exception as e:
+        print(f"[WEBSITE SYNC] Canale staff non trovato: {e}")
+        return None
 
+    if message_id:
+        try:
+            return await channel.fetch_message(int(message_id))
+        except Exception:
+            pass
+
+    try:
+        async for msg in channel.history(limit=100):
+            for emb in msg.embeds:
+                haystack = f"{emb.title or ''}\n{emb.description or ''}"
+                if f"Richiesta ID: **{request_id}**" in haystack or f"Richiesta **#{request_id}**" in haystack or f"#{request_id}" in haystack:
+                    return msg
+    except Exception as e:
+        print(f"[WEBSITE SYNC] Errore ricerca messaggio staff: {e}")
+
+    return None
+
+
+def build_signup_result_embed(req, action, club_name=None, handled_by_name=None, request_id=None):
+    discord_id = str(req.get("discord_id") or "")
+    real_name = str(req.get("real_name") or "-")
+    platform = str(req.get("platform") or "-")
+    game_id = str(req.get("game_id") or req.get("ea_id") or "-")
+    request_id = request_id or req.get("id") or "-"
+
+    if action == "accepted":
         embed = discord.Embed(
-            title=title,
-            description=description,
-            color=color or discord.Color.blue()
+            title="✅ Iscrizione accettata",
+            description=f"Richiesta **#{request_id}** accettata.",
+            color=discord.Color.green()
         )
-        embed.set_footer(text="Bordo Campo • BC FC")
+    else:
+        embed = discord.Embed(
+            title="❌ Iscrizione rifiutata",
+            description=f"Richiesta **#{request_id}** rifiutata.",
+            color=discord.Color.red()
+        )
+
+    embed.add_field(name="Player", value=f"<@{discord_id}>", inline=False)
+    embed.add_field(name="Nome", value=real_name, inline=True)
+    embed.add_field(name="Piattaforma", value=platform, inline=True)
+    embed.add_field(name="ID PSN/Xbox/EA", value=game_id, inline=False)
+
+    if club_name:
+        embed.add_field(name="Club assegnato", value=f"**{club_name}**", inline=False)
+
+    if handled_by_name:
+        embed.add_field(name="Gestita da", value=str(handled_by_name), inline=False)
+
+    embed.set_footer(text="Bordo Campo • BC FC")
+    return embed
+
+
+async def update_original_signup_message(request_id, req, action, club_name=None, handled_by_name=None):
+    msg = await find_signup_staff_message(request_id, req)
+
+    embed = build_signup_result_embed(
+        req,
+        action,
+        club_name=club_name,
+        handled_by_name=handled_by_name,
+        request_id=request_id
+    )
+
+    if msg:
+        try:
+            await msg.edit(embed=embed, view=None)
+            print(f"[WEBSITE SYNC] Messaggio staff #{request_id} aggiornato.")
+            return True
+        except Exception as e:
+            print(f"[WEBSITE SYNC] Errore edit messaggio staff: {e}")
+
+    return False
+
+
+async def publish_signup_result_channels(req, action, club_name=None, handled_by_name=None, request_id=None):
+    embed = build_signup_result_embed(
+        req,
+        action,
+        club_name=club_name,
+        handled_by_name=handled_by_name,
+        request_id=request_id
+    )
+
+    target_channel_id = SIGNUP_ACCEPT_CHANNEL_ID if action == "accepted" else SIGNUP_REJECT_CHANNEL_ID
+
+    try:
+        channel = bot.get_channel(int(target_channel_id))
+        if not channel:
+            channel = await bot.fetch_channel(int(target_channel_id))
+
         await channel.send(embed=embed)
     except Exception as e:
-        print(f"[WEBSITE SIGNUP ACTION] Errore canale {channel_id}: {e}")
+        print(f"[WEBSITE SYNC] Errore invio canale esito: {e}")
+
+
+async def apply_signup_accept_from_website(req, request_id, club_name, handled_by, handled_by_name):
+    discord_id = str(req.get("discord_id"))
+    guild = bot.get_guild(int(GUILD_ID))
+    member = await get_member_safe(guild, discord_id) if guild else None
+    display_name = member.display_name if member else str(req.get("discord_name") or discord_id)
+
+    conn = connect()
+    cur = conn.cursor()
+
+    try:
+        mode = get_league_mode()
+        budget = DEFAULT_BUDGET
+
+        if club_name:
+            cur.execute("""
+                SELECT *
+                FROM fc26_clubs
+                WHERE LOWER(name) = LOWER(%s)
+                LIMIT 1
+            """, (club_name,))
+            club_row = cur.fetchone()
+
+            if not club_row:
+                raise Exception(f"Club non trovato: {club_name}")
+
+            assigned_to = str(club_row.get("assigned_to") or "").strip()
+            if assigned_to and assigned_to != discord_id:
+                raise Exception(f"Club già assegnato: {club_name}")
+
+            if mode == "squadre_reali":
+                try:
+                    players_count, avg_ovr, budget, real_team_name = sync_real_team_roster_to_manager(discord_id, club_name)
+                except Exception as e:
+                    print(f"[WEBSITE SYNC] sync_real_team_roster_to_manager fallito: {e}")
+                    budget = DEFAULT_BUDGET
+
+        # Crea/aggiorna manager anche in modalità fantacalcio.
+        try:
+            cur.execute("""
+                INSERT INTO managers (discord_id, name, manager_name, club_name, budget)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (discord_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    manager_name = EXCLUDED.manager_name,
+                    club_name = COALESCE(EXCLUDED.club_name, managers.club_name),
+                    budget = COALESCE(managers.budget, EXCLUDED.budget)
+            """, (discord_id, display_name, display_name, club_name, int(budget)))
+        except Exception:
+            cur.execute("""
+                INSERT INTO managers (discord_id, name, budget)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (discord_id) DO UPDATE SET
+                    name = EXCLUDED.name
+            """, (discord_id, display_name, int(budget)))
+
+        if club_name:
+            cur.execute("""
+                UPDATE fc26_clubs
+                SET assigned_to = %s,
+                    assigned_at = CURRENT_TIMESTAMP,
+                    previous_owner_id = NULL,
+                    previous_owner_name = NULL
+                WHERE LOWER(name) = LOWER(%s)
+            """, (discord_id, club_name))
+
+        cur.execute("""
+            UPDATE signup_requests
+            SET status = 'accepted',
+                club_name = %s,
+                handled_by = %s,
+                handled_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """, (club_name, str(handled_by), int(request_id)))
+
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        raise e
+
+    conn.close()
+
+    if guild and member:
+        try:
+            pending_role = guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
+            registered_role = guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
+
+            if pending_role:
+                await member.remove_roles(pending_role, reason="Iscrizione accettata dal sito")
+
+            if registered_role:
+                await member.add_roles(registered_role, reason="Iscrizione accettata dal sito")
+        except Exception as e:
+            print(f"[WEBSITE SYNC] Errore ruoli accepted: {e}")
+
+    await safe_dm_signup_result(
+        discord_id,
+        "✅ Iscrizione BC FC accettata",
+        (
+            "La tua richiesta di iscrizione a **BC FC** è stata accettata!\n\n"
+            f"Club assegnato: **{club_name or 'da definire'}**"
+        ),
+        discord.Color.green()
+    )
+
+
+async def apply_signup_reject_from_website(req, request_id, handled_by, handled_by_name):
+    discord_id = str(req.get("discord_id"))
+    guild = bot.get_guild(int(GUILD_ID))
+    member = await get_member_safe(guild, discord_id) if guild else None
+
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE signup_requests
+        SET status = 'rejected',
+            handled_by = %s,
+            handled_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+    """, (str(handled_by), int(request_id)))
+
+    conn.commit()
+    conn.close()
+
+    if guild and member:
+        try:
+            pending_role = guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
+            if pending_role:
+                await member.remove_roles(pending_role, reason="Iscrizione rifiutata dal sito")
+        except Exception as e:
+            print(f"[WEBSITE SYNC] Errore ruoli rejected: {e}")
+
+    await safe_dm_signup_result(
+        discord_id,
+        "❌ Iscrizione BC FC rifiutata",
+        "La tua richiesta di iscrizione a **BC FC** è stata rifiutata. Puoi contattare lo staff per maggiori informazioni.",
+        discord.Color.red()
+    )
 
 
 async def process_website_signup_action(action_row):
     action_id = action_row["id"]
-    request_id = action_row["request_id"]
-    action = action_row["action"]
+    request_id = int(action_row["request_id"])
+    action = str(action_row["action"])
     club_name = action_row.get("club_name")
     handled_by = action_row.get("handled_by") or "website"
+    handled_by_name = action_row.get("handled_by_name") or handled_by
 
     conn = connect()
     cur = conn.cursor()
@@ -9612,48 +9972,63 @@ async def process_website_signup_action(action_row):
         req = cur.fetchone()
 
         if not req:
+            raise Exception("Richiesta non trovata")
+
+        current_status = str(req.get("status") or "pending")
+        if current_status not in {"pending", "choosing_club"}:
+            raise Exception(f"Richiesta già gestita: {current_status}")
+
+    except Exception as e:
+        try:
             cur.execute("""
                 UPDATE signup_staff_actions
                 SET processed = true,
                     processed_at = CURRENT_TIMESTAMP,
                     error = %s
                 WHERE id = %s
-            """, ("Richiesta non trovata", action_id))
+            """, (str(e), action_id))
             conn.commit()
-            return
+        except Exception:
+            pass
+        conn.close()
+        print(f"[WEBSITE SYNC] Azione #{action_id} non processata: {e}")
+        return
 
-        if str(req.get("status", "pending")) != "pending":
-            cur.execute("""
-                UPDATE signup_staff_actions
-                SET processed = true,
-                    processed_at = CURRENT_TIMESTAMP,
-                    error = %s
-                WHERE id = %s
-            """, ("Richiesta già gestita", action_id))
-            conn.commit()
-            return
+    conn.close()
 
-        discord_id = str(req.get("discord_id"))
-
+    try:
         if action == "accepted":
-            cur.execute("""
-                UPDATE signup_requests
-                SET status = 'accepted',
-                    club_name = COALESCE(%s, club_name),
-                    handled_by = %s,
-                    handled_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-            """, (club_name, str(handled_by), request_id))
-
+            await apply_signup_accept_from_website(req, request_id, club_name, handled_by, handled_by_name)
         elif action == "rejected":
-            cur.execute("""
-                UPDATE signup_requests
-                SET status = 'rejected',
-                    handled_by = %s,
-                    handled_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-            """, (str(handled_by), request_id))
+            await apply_signup_reject_from_website(req, request_id, handled_by, handled_by_name)
+        else:
+            raise Exception(f"Azione non valida: {action}")
 
+        # rilegge richiesta aggiornata
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM signup_requests WHERE id = %s LIMIT 1", (request_id,))
+        updated_req = cur.fetchone()
+        conn.close()
+
+        await update_original_signup_message(
+            request_id,
+            updated_req or req,
+            action,
+            club_name=club_name,
+            handled_by_name=handled_by_name
+        )
+
+        await publish_signup_result_channels(
+            updated_req or req,
+            action,
+            club_name=club_name,
+            handled_by_name=handled_by_name,
+            request_id=request_id
+        )
+
+        conn = connect()
+        cur = conn.cursor()
         cur.execute("""
             UPDATE signup_staff_actions
             SET processed = true,
@@ -9661,90 +10036,34 @@ async def process_website_signup_action(action_row):
                 error = NULL
             WHERE id = %s
         """, (action_id,))
-
         conn.commit()
-
-    except Exception as e:
-        conn.rollback()
-        print(f"[WEBSITE SIGNUP ACTION] Errore DB: {e}")
-        return
-    finally:
         conn.close()
 
-    guild = bot.get_guild(int(GUILD_ID))
-    member = None
+        print(f"[WEBSITE SYNC] Azione #{action_id} processata: {action} richiesta #{request_id}")
 
-    if guild:
-        member = await get_member_safe(guild, discord_id)
-
-    if action == "accepted":
-        if member:
-            try:
-                pending_role = guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
-                registered_role = guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
-
-                if pending_role:
-                    await member.remove_roles(pending_role)
-
-                if registered_role:
-                    await member.add_roles(registered_role)
-            except Exception as e:
-                print(f"[WEBSITE SIGNUP ACTION] Errore ruoli accepted: {e}")
-
-        description = (
-            "✅ La tua richiesta di iscrizione a BC FC è stata accettata!\n\n"
-            f"Club assegnato: {club_name or 'da definire'}"
-        )
-
-        await safe_dm_signup_result(
-            discord_id,
-            "✅ Iscrizione BC FC accettata",
-            description,
-            discord.Color.green()
-        )
-
-    elif action == "rejected":
-        if member:
-            try:
-                pending_role = guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
-                if pending_role:
-                    await member.remove_roles(pending_role)
-            except Exception as e:
-                print(f"[WEBSITE SIGNUP ACTION] Errore ruoli rejected: {e}")
-
-        await safe_dm_signup_result(
-            discord_id,
-            "❌ Iscrizione BC FC rifiutata",
-            "La tua richiesta è stata rifiutata.",
-            discord.Color.red()
-        )
+    except Exception as e:
+        print(f"[WEBSITE SYNC] Errore processamento azione #{action_id}: {e}")
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE signup_staff_actions
+            SET processed = true,
+                processed_at = CURRENT_TIMESTAMP,
+                error = %s
+            WHERE id = %s
+        """, (str(e), action_id))
+        conn.commit()
+        conn.close()
 
 
 async def process_website_signup_actions_loop():
     await bot.wait_until_ready()
+    ensure_website_signup_sync_tables()
 
     while not bot.is_closed():
         try:
             conn = connect()
             cur = conn.cursor()
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS signup_staff_actions (
-                  id SERIAL PRIMARY KEY,
-                  request_id BIGINT NOT NULL,
-                  action TEXT NOT NULL,
-                  club_name TEXT,
-                  handled_by TEXT,
-                  handled_by_name TEXT,
-                  source TEXT DEFAULT 'website',
-                  processed BOOLEAN DEFAULT false,
-                  processed_at TIMESTAMP,
-                  error TEXT,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            conn.commit()
 
             cur.execute("""
                 SELECT *
@@ -9764,3 +10083,9 @@ async def process_website_signup_actions_loop():
 
         await asyncio.sleep(5)
 
+# ===========================================================
+# FINE WEBSITE/DISCORD SIGNUP SYNC PATCH v2
+# ===========================================================
+
+
+bot.run(TOKEN)
