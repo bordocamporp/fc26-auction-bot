@@ -39,7 +39,7 @@ LEAGUE_ADMIN_ROLE_ID = "1398342848436240434"
 SIGNUP_REQUEST_CHANNEL_ID = os.getenv("SIGNUP_REQUEST_CHANNEL_ID", "1504868857624399872")   # RICHIESTE ISCRIZIONI
 SIGNUP_STAFF_CHANNEL_ID = os.getenv("SIGNUP_STAFF_CHANNEL_ID", "1506320879015952535")     # LOG ISCRIZIONI / staff richieste
 SIGNUP_REJECT_CHANNEL_ID = os.getenv("SIGNUP_REJECT_CHANNEL_ID", "1506320879015952535")    # LOG ISCRIZIONI / richieste rifiutate
-SIGNUP_ACCEPT_CHANNEL_ID = os.getenv("SIGNUP_ACCEPT_CHANNEL_ID", "1506320879015952535")    # LOG ISCRIZIONI / richieste accettate
+SIGNUP_ACCEPT_CHANNEL_ID = os.getenv("SIGNUP_ACCEPT_CHANNEL_ID", "1506320769964183742")    # CANALE ACCETTATE
 MEDIA_CHANNEL_ID = "1506321171493163199"
 SIGNUP_PENDING_ROLE_ID = PRE_ISCRITTO_ROLE_ID        # 1505180973208440954
 SIGNUP_REGISTERED_ROLE_ID = LEAGUE_PLAYER_ROLE_ID    # 1505181066695016619
@@ -1381,6 +1381,45 @@ async def safe_dm_signup_result(user_id, title, description, color=None):
     except Exception:
         return False
 
+
+
+async def send_signup_accept_channel_log(guild, discord_id, club_name=None, league=None, budget=None, players_count=None, avg_ovr=None, handled_by=None, request_id=None):
+    """Invia UNA comunicazione pubblica nel canale ACCETTATE."""
+    try:
+        channel = None
+        if guild:
+            channel = guild.get_channel(int(SIGNUP_ACCEPT_CHANNEL_ID))
+        if not channel:
+            channel = await bot.fetch_channel(int(SIGNUP_ACCEPT_CHANNEL_ID))
+
+        embed = discord.Embed(
+            title="✅ Iscrizione accettata",
+            description=f"<@{discord_id}> è stato registrato ufficialmente.",
+            color=discord.Color.green()
+        )
+        if request_id is not None:
+            embed.add_field(name="Richiesta", value=f"#{request_id}", inline=True)
+        if club_name:
+            embed.add_field(name="Club", value=str(club_name), inline=True)
+        if league:
+            embed.add_field(name="Campionato", value=str(league), inline=True)
+        if budget is not None:
+            embed.add_field(name="Budget", value=f"{budget} crediti", inline=True)
+        if players_count is not None:
+            embed.add_field(name="Giocatori assegnati", value=str(players_count), inline=True)
+        if avg_ovr is not None:
+            try:
+                embed.add_field(name="OVR medio", value=f"{float(avg_ovr):.1f}", inline=True)
+            except Exception:
+                embed.add_field(name="OVR medio", value=str(avg_ovr), inline=True)
+        if handled_by:
+            embed.add_field(name="Gestito da", value=str(handled_by), inline=False)
+        embed.set_footer(text="FC26 • Iscrizioni accettate")
+        await channel.send(embed=embed)
+        return True
+    except Exception as e:
+        print(f"[SIGNUP ACCEPT LOG] Errore invio canale accettate: {e}")
+        return False
 
 async def get_member_safe(guild, member_id):
     """Recupera un membro anche se non è nella cache Discord."""
@@ -4025,7 +4064,18 @@ class SignupClubSelect(discord.ui.Select):
         except Exception:
             pass
 
-        # Notifica unica: aggiorna il messaggio originale nel canale LOG ISCRIZIONI.
+        # Comunicazione unica nel canale ACCETTATE.
+        await send_signup_accept_channel_log(
+            interaction.guild,
+            discord_id,
+            club_name=club_name,
+            league=self.league,
+            budget=budget,
+            players_count=players_count,
+            avg_ovr=avg_ovr,
+            handled_by=interaction.user.mention,
+            request_id=self.request_id
+        )
 
         await safe_dm_signup_result(
             discord_id,
@@ -4039,8 +4089,6 @@ class SignupClubSelect(discord.ui.Select):
             ),
             discord.Color.green()
         )
-
-        # Nessuna seconda comunicazione nel log: resta solo il messaggio staff aggiornato.
 
         await interaction.followup.send(
             f"✅ Iscrizione accettata e squadra **{club_name}** assegnata.",
@@ -4215,7 +4263,13 @@ class SignupStaffView(discord.ui.View):
         except Exception:
             pass
 
-        # Notifica unica: aggiorna il messaggio originale nel canale LOG ISCRIZIONI.
+        # Comunicazione unica nel canale ACCETTATE.
+        await send_signup_accept_channel_log(
+            interaction.guild,
+            discord_id,
+            handled_by=interaction.user.mention,
+            request_id=self.request_id
+        )
 
         await safe_dm_signup_result(
             discord_id,
@@ -4535,24 +4589,9 @@ async def on_ready():
     except Exception as e:
         print(f"[ON_READY] reset_auction_state non bloccante fallito: {e}")
 
-    try:
-        await register_pending_signup_views()
-    except Exception as e:
-        print(f"[ON_READY] register_pending_signup_views fallito: {e}")
-
-    # Loop sito: mantenuto SOLO per leggere richieste già presenti su Supabase.
-    # Non esegue migrazioni schema all'avvio.
-    try:
-        bot.loop.create_task(process_website_signup_actions_loop())
-        print("[ON_READY] process_website_signup_actions_loop avviato")
-    except Exception as e:
-        print(f"[ON_READY] process_website_signup_actions_loop non avviato: {e}")
-
-    try:
-        bot.loop.create_task(process_website_signup_requests_loop())
-        print("[ON_READY] process_website_signup_requests_loop avviato")
-    except Exception as e:
-        print(f"[ON_READY] process_website_signup_requests_loop non avviato: {e}")
+    print("[ON_READY] register_pending_signup_views disattivato: viste persistenti non necessarie dopo il sync comandi.")
+    print("[ON_READY] process_website_signup_actions_loop disattivato: evita errori e doppie notifiche.")
+    print("[ON_READY] process_website_signup_requests_loop disattivato: evita errori e doppie notifiche.")
 
     try:
         bot.loop.create_task(check_player_inactivity())
