@@ -478,9 +478,9 @@ def role_label(group):
 
 
 def ensure_extra_tables():
-    """Schema gestito da Supabase: nessuna migrazione automatica dal bot."""
+    """Supabase è già la source of truth: niente CREATE/ALTER automatici dal bot."""
+    print("[DB] Migrazioni automatiche disattivate: uso solo Supabase esistente.")
     return None
-
 
 def player_embed(player, title="FC26 Player Card"):
     sold = player["sold_price"]
@@ -934,8 +934,25 @@ def sync_real_team_roster_to_manager(discord_id, club_name):
     cur = conn.cursor()
 
     # Compatibilità schema
-    # Migrazioni schema disattivate: colonne/tabelle gestite da Supabase SQL Editor.
-    pass
+    for sql in [
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS name TEXT",
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS manager_name TEXT",
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS club_name TEXT",
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS budget INTEGER DEFAULT 500",
+        "ALTER TABLE players ADD COLUMN IF NOT EXISTS owner_discord_id TEXT",
+        "ALTER TABLE players ADD COLUMN IF NOT EXISTS sold_price INTEGER",
+        "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_to TEXT",
+        "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP",
+        "ALTER TABLE real_team_assignments ADD COLUMN IF NOT EXISTS manager_name TEXT",
+        "ALTER TABLE real_team_assignments ADD COLUMN IF NOT EXISTS team_name TEXT",
+        "ALTER TABLE real_team_assignments ADD COLUMN IF NOT EXISTS avg_overall DOUBLE PRECISION",
+        "ALTER TABLE real_team_assignments ADD COLUMN IF NOT EXISTS assigned_budget INTEGER"
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception:
+            pass
+
     # Libera eventuale rosa precedente del manager
     cur.execute("""
         UPDATE players
@@ -1401,8 +1418,8 @@ class AuctionView(discord.ui.View):
 
 # ================= PERMESSI STAFF / LOG / CONFERME =================
 
-OWNER_STAFF_ROLE_ID = "1398342848436240434"      # FOUNDER -> comandi sensibili
-LIMITED_STAFF_ROLE_ID = "1398358193197027408"    # STAFF -> no comandi sensibili
+OWNER_STAFF_ROLE_ID = "1398342848436240434"      # FOUNDER: comandi sensibili
+LIMITED_STAFF_ROLE_ID = "1398358193197027408"    # STAFF: no comandi sensibili
 STAFF_LOG_CHANNEL_ID = 1506321007873495070
 
 DANGEROUS_ACTIONS = {
@@ -1991,9 +2008,8 @@ INACTIVITY_CHECK_INTERVAL = 79200  # 22 ore
 
 
 def ensure_activity_tables():
-    """Schema gestito da Supabase: nessuna migrazione automatica dal bot."""
+    """Schema player_activity già gestito su Supabase: nessuna migrazione automatica."""
     return None
-
 
 def update_player_activity(discord_id, activity_type="discord"):
     ensure_activity_tables()
@@ -2300,9 +2316,8 @@ async def controllo_inattivi(interaction: discord.Interaction):
 # ================= SISTEMA FINE / NUOVA STAGIONE =================
 
 def ensure_season_tables():
-    """Schema gestito da Supabase: nessuna migrazione automatica dal bot."""
+    """Schema seasons già gestito su Supabase: nessuna migrazione automatica."""
     return None
-
 
 def get_active_season():
     ensure_season_tables()
@@ -2881,8 +2896,30 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
             cur = conn.cursor()
 
             # Sicurezza schema Supabase
-            # Migrazioni schema disattivate: colonne/tabelle gestite da Supabase SQL Editor.
-            pass
+            for sql in [
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS discord_name TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS real_name TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS age TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS platform TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS ea_id TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS game_id TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS preferred_clubs TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_preferences TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_name TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_by TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_at TIMESTAMP",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_message_id TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_channel_id TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS signup_source TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS source TEXT"
+            ]:
+                try:
+                    cur.execute(sql)
+                except Exception:
+                    pass
+
             cur.execute(
                 "SELECT id FROM signup_requests WHERE discord_id = %s AND status = 'pending' LIMIT 1",
                 (str(interaction.user.id),)
@@ -3003,8 +3040,17 @@ async def publish_signup_request_once(request_id: int, guild=None, *, source="di
     try:
         # Le colonne devono essere presenti nel DB Supabase; se non lo sono, le aggiunge una sola volta.
         # Se vuoi zero migrazioni nel bot, crea queste colonne da Supabase SQL Editor e rimuovi questi ALTER.
-        # Migrazioni schema disattivate: colonne/tabelle gestite da Supabase SQL Editor.
-        pass
+        for sql in [
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_message_id TEXT",
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_channel_id TEXT",
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS signup_source TEXT",
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS source TEXT"
+        ]:
+            try:
+                cur.execute(sql)
+            except Exception:
+                pass
+
         cur.execute("""
             UPDATE signup_requests
             SET staff_message_id = %s,
@@ -3646,8 +3692,18 @@ class SignupStaffView(discord.ui.View):
         conn = connect()
         cur = conn.cursor()
 
-        # Migrazioni schema disattivate: colonne/tabelle gestite da Supabase SQL Editor.
-        pass
+        for sql in [
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_by TEXT",
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_at TIMESTAMP",
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_name TEXT",
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'",
+            "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP"
+        ]:
+            try:
+                cur.execute(sql)
+            except Exception:
+                pass
+
         cur.execute("""
             UPDATE signup_requests
             SET status = %s,
@@ -3997,12 +4053,9 @@ class SignupStartView(discord.ui.View):
 # ===========================================================
 
 def sync_fc26_dataset_to_bot_tables():
-    """Disattivato: il bot usa direttamente Supabase, senza copiare o migrare tabelle."""
-    print("[FC26 SYNC] Disattivato: uso solo Supabase esistente.")
+    """Disattivato: il sito/Supabase gestisce già players, players_fc26 e club."""
+    print("[FC26 SYNC] Disattivato: uso direttamente i dati già presenti su Supabase.")
     return None
-
-# ===========================================================
-
 
 async def sync_pending_signup_roles_loop():
     """Assegna automaticamente PRE ISCRITTO anche alle richieste create dal sito."""
@@ -4063,12 +4116,7 @@ async def on_app_command_error(interaction: discord.Interaction, error):
 
 @bot.event
 async def on_ready():
-    # Supabase è la source of truth: niente init_db / CREATE TABLE / ALTER TABLE all’avvio.
-    try:
-        await asyncio.to_thread(reset_auction_state)
-    except Exception as e:
-        print(f"[ON_READY] reset_auction_state non bloccante fallito: {e}")
-
+    # Avvio pulito: nessuna migrazione/ALTER/CREATE automatica su Supabase.
     bot.add_view(SignupStartView())
     bot.add_view(AuctionView())
 
@@ -4094,215 +4142,19 @@ async def on_ready():
 
     guild = get_guild()
     if guild:
-        tree.copy_global_to(guild=guild)
-        synced = await tree.sync(guild=guild)
-        print(f"Comandi sincronizzati nel server {GUILD_ID}: {len(synced)}")
+        try:
+            synced = await tree.sync(guild=guild)
+            print(f"Comandi sincronizzati nel server {GUILD_ID}: {len(synced)}")
+        except Exception as e:
+            print(f"Errore sync comandi guild: {e}")
     else:
-        synced = await tree.sync()
-        print(f"Comandi globali sincronizzati: {len(synced)}")
-
-    try:
-        bot.loop.create_task(check_player_inactivity())
-    except Exception as e:
-        print(f"[ON_READY] check_player_inactivity non avviato: {e}")
+        try:
+            synced = await tree.sync()
+            print(f"Comandi globali sincronizzati: {len(synced)}")
+        except Exception as e:
+            print(f"Errore sync comandi globali: {e}")
 
     print(f"Bot online come {bot.user}")
-
-
-
-class SquadraRealeModal(discord.ui.Modal, title="Assegna squadra reale"):
-    squadra = discord.ui.TextInput(
-        label="Nome squadra da assegnare",
-        placeholder="Esempio: Milan, Inter, Juventus...",
-        required=True,
-        max_length=80
-    )
-
-    def __init__(self, member_id: int, member_name: str):
-        super().__init__()
-        self.member_id = member_id
-        self.member_name = member_name
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not is_admin(interaction):
-            await interaction.response.send_message("❌ Solo lo staff può completare questa registrazione.", ephemeral=True)
-            return
-
-        await safe_defer(interaction, ephemeral=True, thinking=True)
-
-        guild = interaction.guild
-        member = await get_member_safe(guild, self.member_id)
-
-        if not member:
-            await interaction.followup.send("Utente non trovato nel server.", ephemeral=True)
-            return
-
-        players, avg_ovr, budget = get_team_stats_reale(str(self.squadra.value), include_owned_by=str(member.id))
-
-        if not players:
-            await interaction.followup.send("Squadra non trovata o senza giocatori liberi disponibili.", ephemeral=True)
-            return
-
-        conn = connect()
-        cur = conn.cursor()
-
-        cur.execute(
-            "INSERT INTO managers (discord_id, name, budget) VALUES (%s, %s, %s)",
-            (str(member.id), member.display_name, budget)
-        )
-
-        # Se aveva già giocatori, li svincola prima.
-        cur.execute(
-            "UPDATE players SET owner_discord_id = NULL, sold_price = NULL WHERE owner_discord_id = %s",
-            (str(member.id),)
-        )
-
-        for p in players:
-            cur.execute(
-                "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s",
-                (str(member.id), 0, p["id"])
-            )
-
-        cur.execute(
-            "UPDATE managers SET budget = %s, name = %s WHERE discord_id = %s",
-            (budget, member.display_name, str(member.id))
-        )
-
-        cur.execute("""
-            INSERT INTO real_team_assignments (discord_id, manager_name, team_name, avg_overall, assigned_budget) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (discord_id) DO UPDATE SET manager_name = EXCLUDED.manager_name, team_name = EXCLUDED.team_name, avg_overall = EXCLUDED.avg_overall, assigned_budget = EXCLUDED.assigned_budget
-        """, (str(member.id), member.display_name, players[0]["team"], avg_ovr, budget))
-
-        conn.commit()
-        conn.close()
-
-        embed = discord.Embed(
-            title="✅ Registrazione completata",
-            description=f"**{member.display_name}** registrato in modalità **Squadre Reali**.",
-            color=discord.Color.green()
-        )
-        embed.add_field(name="Squadra", value=players[0]["team"], inline=True)
-        embed.add_field(name="Giocatori assegnati", value=str(len(players)), inline=True)
-        embed.add_field(name="OVR medio", value=f"{avg_ovr:.1f}", inline=True)
-        embed.add_field(name="Budget mercato", value=f"{budget} crediti", inline=True)
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-class RegistraPreIscrittoSelect(discord.ui.Select):
-    def __init__(self, members):
-        options = []
-
-        for member in members[:25]:
-            options.append(
-                discord.SelectOption(
-                    label=member.display_name[:100],
-                    value=str(member.id),
-                    description=f"ID: {member.id}"
-                )
-            )
-
-        super().__init__(
-            placeholder="Scegli un player PRE-ISCRITTO...",
-            min_values=1,
-            max_values=1,
-            options=options,
-            custom_id="registra_pre_iscritto_select"
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        if not is_admin(interaction):
-            await interaction.response.send_message("❌ Solo lo staff può registrare i player.", ephemeral=True)
-            return
-
-        member_id = int(self.values[0])
-        member = await get_member_safe(interaction.guild, member_id)
-
-        if not member:
-            await interaction.response.send_message("Utente non trovato nel server.", ephemeral=True)
-            return
-
-        mode = get_league_mode()
-
-        if mode == "squadre_reali":
-            await interaction.response.send_modal(SquadraRealeModal(member.id, member.display_name))
-            return
-
-        conn = connect()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO managers (discord_id, name, budget) VALUES (%s, %s, %s)",
-            (str(member.id), member.display_name, DEFAULT_BUDGET)
-        )
-        cur.execute(
-            "UPDATE managers SET name = %s, budget = %s WHERE discord_id = %s",
-            (member.display_name, DEFAULT_BUDGET, str(member.id))
-        )
-        conn.commit()
-        conn.close()
-
-        embed = discord.Embed(
-            title="✅ Registrazione completata",
-            description=f"**{member.display_name}** registrato in modalità **Fantacalcio**.",
-            color=discord.Color.green()
-        )
-        embed.add_field(name="Budget iniziale", value=f"{DEFAULT_BUDGET} crediti", inline=True)
-
-        await interaction.response.edit_message(embed=embed, view=None)
-
-
-class RegistraPreIscrittoView(discord.ui.View):
-    def __init__(self, members):
-        super().__init__(timeout=180)
-        self.add_item(RegistraPreIscrittoSelect(members))
-
-
-
-def can_bypass_bot_only(member):
-    return any(str(role.id) in BOT_ONLY_BYPASS_ROLE_IDS for role in getattr(member, "roles", []))
-
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-
-    try:
-        update_player_activity(message.author.id, "discord")
-    except Exception:
-        pass
-
-
-    # Gli admin/staff con questi ruoli possono scrivere liberamente nei canali bot-only.
-    if can_bypass_bot_only(message.author):
-        await bot.process_commands(message)
-        return
-
-    if message.channel.id in BOT_ONLY_CHANNELS:
-
-        # Permette i comandi slash Discord
-        if not message.content.startswith("/"):
-
-            try:
-                await message.delete()
-
-                warning = await message.channel.send(
-                    f"{message.author.mention} ⚠️ Su questo canale puoi usare solo i comandi `/` del bot."
-                )
-
-                await asyncio.sleep(5)
-                await warning.delete()
-
-            except discord.Forbidden:
-                pass
-
-            except discord.NotFound:
-                pass
-
-            except Exception:
-                pass
-
-    await bot.process_commands(message)
-
 
 @tree.command(name="registra", description="Staff: registra un player pre-iscritto")
 async def registra(interaction: discord.Interaction):
@@ -7830,7 +7682,7 @@ if __name__ == "__main__":
 async def log_every_staff_slash_command(interaction: discord.Interaction):
     """
     Logga automaticamente OGNI slash command usato dallo staff
-    nel canale LOG 1506321007873495070.
+    nel canale LOG 1498345679511355582.
     """
     try:
         if not interaction.guild:
@@ -8651,8 +8503,17 @@ def ensure_manager_from_real_team(discord_id):
     conn = connect()
     cur = conn.cursor()
 
-    # Migrazioni schema disattivate: colonne/tabelle gestite da Supabase SQL Editor.
-    pass
+    for sql in [
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS name TEXT",
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS manager_name TEXT",
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS club_name TEXT",
+        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS budget INTEGER DEFAULT 500"
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception:
+            pass
+
     cur.execute("""
         SELECT
             COALESCE(s.discord_name, %s) AS display_name,
@@ -9449,9 +9310,9 @@ async def aggiorna_budget_reali(interaction: discord.Interaction):
 # ===========================================================
 
 def ensure_website_signup_sync_tables():
-    """Schema gestito da Supabase: nessuna migrazione automatica dal bot."""
+    """Supabase è già pronto: disattiva CREATE TABLE / ALTER TABLE del sync sito per evitare deadlock."""
+    print("[WEBSITE SYNC] Migrazioni automatiche disattivate: uso solo tabelle Supabase esistenti.")
     return None
-
 
 async def register_pending_signup_views():
     try:
@@ -9769,26 +9630,8 @@ async def update_original_signup_message(request_id, req, action, club_name=None
 
 
 async def publish_signup_result_channels(req, action, club_name=None, handled_by_name=None, request_id=None, assigned_players=None, budget=None):
-    embed = build_signup_result_embed(
-        req,
-        action,
-        club_name=club_name,
-        handled_by_name=handled_by_name,
-        request_id=request_id,
-        assigned_players=assigned_players,
-        budget=budget
-    )
-
-    target_channel_id = SIGNUP_ACCEPT_CHANNEL_ID if action == "accepted" else SIGNUP_REJECT_CHANNEL_ID
-
-    try:
-        channel = bot.get_channel(int(target_channel_id))
-        if not channel:
-            channel = await bot.fetch_channel(int(target_channel_id))
-        await channel.send(embed=embed)
-    except Exception as e:
-        print(f"[WEBSITE SYNC] Errore invio canale esito: {e}")
-
+    """Non invia messaggi extra: il messaggio staff originale viene solo aggiornato."""
+    return True
 
 async def apply_signup_accept_from_website(req, request_id, club_name, handled_by, handled_by_name):
     discord_id = str(req.get("discord_id") or "").strip()
