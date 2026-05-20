@@ -37,9 +37,9 @@ LEAGUE_ADMIN_ROLE_ID = "1398342848436240434"
 
 # === FC26 ISCRIZIONI AUTOMATICHE ===
 SIGNUP_REQUEST_CHANNEL_ID = os.getenv("SIGNUP_REQUEST_CHANNEL_ID", "1504868857624399872")   # RICHIESTE ISCRIZIONI
-SIGNUP_STAFF_CHANNEL_ID = "1506320879015952535"     # LOG ISCRIZIONI / staff richieste
-SIGNUP_REJECT_CHANNEL_ID = "1506320879015952535"    # LOG ISCRIZIONI / richieste rifiutate
-SIGNUP_ACCEPT_CHANNEL_ID = "1506320879015952535"    # LOG ISCRIZIONI / richieste accettate
+SIGNUP_STAFF_CHANNEL_ID = os.getenv("SIGNUP_STAFF_CHANNEL_ID", "1506320879015952535")     # LOG ISCRIZIONI / staff richieste
+SIGNUP_REJECT_CHANNEL_ID = os.getenv("SIGNUP_REJECT_CHANNEL_ID", "1506320879015952535")    # LOG ISCRIZIONI / richieste rifiutate
+SIGNUP_ACCEPT_CHANNEL_ID = os.getenv("SIGNUP_ACCEPT_CHANNEL_ID", "1506320879015952535")    # LOG ISCRIZIONI / richieste accettate
 MEDIA_CHANNEL_ID = "1506321171493163199"
 SIGNUP_PENDING_ROLE_ID = PRE_ISCRITTO_ROLE_ID        # 1505180973208440954
 SIGNUP_REGISTERED_ROLE_ID = LEAGUE_PLAYER_ROLE_ID    # 1505181066695016619
@@ -3347,7 +3347,11 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
                 "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_by TEXT",
                 "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_at TIMESTAMP",
                 "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'",
-                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_message_id TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_channel_id TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS signup_source TEXT",
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS source TEXT"
             ]:
                 try:
                     cur.execute(sql)
@@ -3382,8 +3386,8 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
             cur.execute("""
                 INSERT INTO signup_requests
                 (discord_id, discord_name, real_name, age, platform, game_id,
-                 ea_id, preferred_clubs, club_preferences, status, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', CURRENT_TIMESTAMP)
+                 ea_id, preferred_clubs, club_preferences, status, created_at, signup_source, source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', CURRENT_TIMESTAMP, 'discord', 'discord')
             """, (
                 str(interaction.user.id),
                 str(interaction.user),
@@ -3420,50 +3424,9 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
                 print(f"[SIGNUP MODAL] Errore ruolo PRE-ISCRITTO: {e}")
 
             try:
-                staff_channel = interaction.guild.get_channel(int(SIGNUP_STAFF_CHANNEL_ID))
-                if not staff_channel:
-                    staff_channel = await bot.fetch_channel(int(SIGNUP_STAFF_CHANNEL_ID))
-
-                embed = discord.Embed(
-                    title="📩 Nuova richiesta iscrizione FC26",
-                    description=f"Richiesta ID: **{request_id}**",
-                    color=discord.Color.orange()
-                )
-                embed.add_field(name="Player Discord", value=interaction.user.mention, inline=False)
-                embed.add_field(name="Nome", value=real_name or "-", inline=True)
-                embed.add_field(name="Età", value=age or "-", inline=True)
-                embed.add_field(name="Piattaforma", value=platform or "-", inline=True)
-                embed.add_field(name="ID PSN/Xbox/EA", value=game_id or "-", inline=False)
-
-                if club_preferences:
-                    embed.add_field(name="Club preferiti", value=club_preferences, inline=False)
-
-                embed.add_field(name="Modalità attiva", value=get_league_mode(), inline=False)
-                embed.set_footer(text="Lo staff deve scegliere ACCETTA o RIFIUTA.")
-
-                staff_message = await staff_channel.send(embed=embed, view=SignupStaffView(int(request_id)))
-                try:
-                    conn_msg = connect()
-                    cur_msg = conn_msg.cursor()
-                    cur_msg.execute("""
-                        ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_message_id TEXT
-                    """)
-                    cur_msg.execute("""
-                        ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_channel_id TEXT
-                    """)
-                    cur_msg.execute("""
-                        UPDATE signup_requests
-                        SET staff_message_id = %s,
-                            staff_channel_id = %s,
-                            signup_source = COALESCE(signup_source, 'discord')
-                        WHERE id = %s
-                    """, (str(staff_message.id), str(staff_channel.id), int(request_id)))
-                    conn_msg.commit()
-                    conn_msg.close()
-                except Exception as e:
-                    print(f"[SIGNUP MODAL] Errore salvataggio messaggio staff: {e}")
+                await publish_signup_request_once(int(request_id), interaction.guild, source="discord")
             except Exception as e:
-                print(f"[SIGNUP MODAL] Errore invio staff: {e}")
+                print(f"[SIGNUP MODAL] Errore invio staff unico: {e}")
 
             await interaction.followup.send(
                 "✅ Richiesta inviata correttamente. Lo staff la controllerà appena possibile.",
@@ -3485,6 +3448,169 @@ def get_signup_request(request_id):
     row = cur.fetchone()
     conn.close()
     return row
+
+
+def _row_get(row, key, default=None):
+    try:
+        value = row.get(key)
+    except Exception:
+        try:
+            value = row[key]
+        except Exception:
+            value = default
+    return default if value is None else value
+
+
+async def publish_signup_request_once(request_id: int, guild=None, *, source="discord"):
+    """Pubblica una richiesta iscrizione nel canale staff una sola volta.
+
+    Usa Supabase/PostgreSQL come unica fonte dati. Per evitare doppi messaggi,
+    acquisisce un lock direttamente nella riga signup_requests prima di inviare.
+    """
+    request_id = int(request_id)
+    staff_channel_id = str(SIGNUP_STAFF_CHANNEL_ID)
+
+    # Lock atomico: se un altro processo/deploy ha già preso in carico la richiesta,
+    # non inviamo un secondo messaggio.
+    conn = connect()
+    cur = conn.cursor()
+    locked = None
+    try:
+        # Le colonne devono essere presenti nel DB Supabase; se non lo sono, le aggiunge una sola volta.
+        # Se vuoi zero migrazioni nel bot, crea queste colonne da Supabase SQL Editor e rimuovi questi ALTER.
+        for sql in [
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_message_id TEXT",
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_channel_id TEXT",
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS signup_source TEXT",
+            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS source TEXT"
+        ]:
+            try:
+                cur.execute(sql)
+            except Exception:
+                pass
+
+        cur.execute("""
+            UPDATE signup_requests
+            SET staff_message_id = %s,
+                staff_channel_id = %s,
+                signup_source = COALESCE(NULLIF(signup_source, ''), %s),
+                source = COALESCE(NULLIF(source, ''), %s)
+            WHERE id = %s
+              AND status = 'pending'
+              AND (staff_message_id IS NULL OR staff_message_id = '')
+            RETURNING *
+        """, ("LOCKING", staff_channel_id, str(source), str(source), request_id))
+        locked = cur.fetchone()
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[SIGNUP STAFF] Errore lock richiesta #{request_id}: {e}")
+    finally:
+        conn.close()
+
+    if not locked:
+        print(f"[SIGNUP STAFF] Richiesta #{request_id} già pubblicata o non pending: salto invio doppio.")
+        return False
+
+    req = get_signup_request(request_id) or locked
+    discord_id = str(_row_get(req, "discord_id", "") or "").strip()
+    real_name = str(_row_get(req, "real_name", _row_get(req, "discord_name", "-")) or "-")
+    age = str(_row_get(req, "age", "-") or "-")
+    platform = str(_row_get(req, "platform", "-") or "-")
+    game_id = str(_row_get(req, "game_id", _row_get(req, "psn_id", _row_get(req, "ea_id", "-"))) or "-")
+    preferred = str(_row_get(req, "preferred_clubs", _row_get(req, "club_preferences", "")) or "").strip()
+
+    try:
+        staff_channel = None
+        if guild:
+            staff_channel = guild.get_channel(int(staff_channel_id))
+        if not staff_channel:
+            staff_channel = bot.get_channel(int(staff_channel_id))
+        if not staff_channel:
+            staff_channel = await bot.fetch_channel(int(staff_channel_id))
+    except Exception as e:
+        print(f"[SIGNUP STAFF] Canale log iscrizioni non trovato ({staff_channel_id}): {e}")
+        # Sblocca la riga per poter riprovare dopo aver sistemato canale/permessi.
+        conn = connect()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                UPDATE signup_requests
+                SET staff_message_id = NULL,
+                    staff_channel_id = NULL
+                WHERE id = %s AND staff_message_id = 'LOCKING'
+            """, (request_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        finally:
+            conn.close()
+        return False
+
+    embed = discord.Embed(
+        title="📩 Nuova richiesta iscrizione FC26",
+        description=f"Richiesta ID: **{request_id}**",
+        color=discord.Color.orange()
+    )
+    if source == "website":
+        embed.description += "\nFonte: **sito web**"
+
+    if discord_id:
+        embed.add_field(name="Player Discord", value=f"<@{discord_id}>", inline=False)
+        embed.add_field(name="Discord ID", value=discord_id, inline=False)
+    else:
+        embed.add_field(name="Player Discord", value=str(_row_get(req, "discord_name", "Player")), inline=False)
+
+    embed.add_field(name="Nome", value=real_name or "-", inline=True)
+    embed.add_field(name="Età", value=age or "-", inline=True)
+    embed.add_field(name="Piattaforma", value=platform or "-", inline=True)
+    embed.add_field(name="ID PSN/Xbox/EA", value=game_id or "-", inline=False)
+    if preferred and preferred != "-":
+        embed.add_field(name="Club preferiti", value=preferred, inline=False)
+    try:
+        embed.add_field(name="Modalità attiva", value=get_league_mode(), inline=False)
+    except Exception:
+        pass
+    embed.set_footer(text="Lo staff deve scegliere ACCETTA o RIFIUTA.")
+
+    try:
+        staff_message = await staff_channel.send(embed=embed, view=SignupStaffView(request_id))
+    except Exception as e:
+        print(f"[SIGNUP STAFF] Errore invio richiesta #{request_id}: {e}")
+        conn = connect()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                UPDATE signup_requests
+                SET staff_message_id = NULL,
+                    staff_channel_id = NULL
+                WHERE id = %s AND staff_message_id = 'LOCKING'
+            """, (request_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        finally:
+            conn.close()
+        return False
+
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE signup_requests
+            SET staff_message_id = %s,
+                staff_channel_id = %s
+            WHERE id = %s
+        """, (str(staff_message.id), str(staff_channel.id), request_id))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[SIGNUP STAFF] Errore salvataggio messaggio richiesta #{request_id}: {e}")
+    finally:
+        conn.close()
+
+    print(f"[SIGNUP STAFF] Richiesta #{request_id} pubblicata una sola volta nel canale {staff_channel_id}.")
+    return True
 
 
 def get_free_signup_clubs(league=None):
@@ -10715,12 +10841,6 @@ async def process_website_signup_action(action_row):
 async def publish_website_signup_request_to_discord(req):
     request_id = int(req["id"])
     discord_id = str(req.get("discord_id") or "").strip()
-    discord_name = str(req.get("discord_name") or req.get("real_name") or discord_id or "Player")
-    real_name = str(req.get("real_name") or req.get("discord_name") or "-")
-    age = str(req.get("age") or "-")
-    platform = str(req.get("platform") or "-")
-    game_id = str(req.get("game_id") or req.get("psn_id") or req.get("ea_id") or "-")
-    preferred = str(req.get("preferred_clubs") or req.get("club_preferences") or "-")
 
     guild = bot.get_guild(int(GUILD_ID))
     member = await get_member_safe(guild, discord_id) if guild and discord_id else None
@@ -10735,65 +10855,20 @@ async def publish_website_signup_request_to_discord(req):
         except Exception as e:
             print(f"[WEBSITE REQUEST SYNC] Errore ruolo PRE ISCRITTO: {e}")
 
-    try:
-        staff_channel = bot.get_channel(int(SIGNUP_STAFF_CHANNEL_ID))
-        if not staff_channel:
-            staff_channel = await bot.fetch_channel(int(SIGNUP_STAFF_CHANNEL_ID))
-    except Exception as e:
-        print(f"[WEBSITE REQUEST SYNC] Canale staff non trovato: {e}")
+    published = await publish_signup_request_once(request_id, guild, source="website")
+    if not published:
         return False
 
-    embed = discord.Embed(
-        title="📩 Nuova richiesta iscrizione FC26",
-        description=f"Richiesta ID: **{request_id}**\nFonte: **sito web**",
-        color=discord.Color.orange()
-    )
-
     if discord_id:
-        embed.add_field(name="Player Discord", value=f"<@{discord_id}>", inline=False)
-        embed.add_field(name="Discord ID", value=discord_id, inline=False)
-    else:
-        embed.add_field(name="Player Discord", value=discord_name, inline=False)
-
-    embed.add_field(name="Nome", value=real_name, inline=True)
-    embed.add_field(name="Età", value=age, inline=True)
-    embed.add_field(name="Piattaforma", value=platform, inline=True)
-    embed.add_field(name="ID PSN/Xbox/EA", value=game_id, inline=False)
-
-    if preferred and preferred != "-":
-        embed.add_field(name="Club preferiti", value=preferred, inline=False)
-
-    embed.set_footer(text="Lo staff può gestire questa richiesta da Discord o dal sito.")
-
-    staff_message = await staff_channel.send(embed=embed, view=SignupStaffView(request_id))
-
-    conn = connect()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            UPDATE signup_requests
-            SET staff_message_id = %s,
-                staff_channel_id = %s,
-                signup_source = 'website',
-                source = 'website'
-            WHERE id = %s
-        """, (str(staff_message.id), str(staff_channel.id), request_id))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"[WEBSITE REQUEST SYNC] Errore salvataggio staff_message_id: {e}")
-    finally:
-        conn.close()
-
-    await safe_dm_signup_result(
-        discord_id,
-        "📩 Richiesta iscrizione ricevuta",
-        (
-            "La tua richiesta di iscrizione a **BC FC** è stata ricevuta correttamente.\n"
-            "Lo staff la controllerà appena possibile."
-        ),
-        discord.Color.orange()
-    )
+        await safe_dm_signup_result(
+            discord_id,
+            "📩 Richiesta iscrizione ricevuta",
+            (
+                "La tua richiesta di iscrizione a **BC FC** è stata ricevuta correttamente.\n"
+                "Lo staff la controllerà appena possibile."
+            ),
+            discord.Color.orange()
+        )
 
     print(f"[WEBSITE REQUEST SYNC] Richiesta sito #{request_id} pubblicata su Discord.")
     return True
