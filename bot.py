@@ -17,11 +17,11 @@ load_dotenv()
 print("[BOOT] Avvio bot.py")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")
-AUCTION_CHANNEL_ID = "1504825224422756463"
-AUCTION_LOG_CHANNEL_ID = "1504830394908803142"
-ADMIN_ROLE_ID = "1398342848436240434"
-SEARCH_CHANNEL_ID = "1504833349414551703"
+GUILD_ID = os.getenv("GUILD_ID", "1392747701308751943")
+AUCTION_CHANNEL_ID = os.getenv("AUCTION_CHANNEL_ID", "1504825224422756463")
+AUCTION_LOG_CHANNEL_ID = os.getenv("AUCTION_LOG_CHANNEL_ID", "1504830394908803142")
+ADMIN_ROLE_ID = os.getenv("ADMIN_ROLE_ID", "1398342848436240434")
+SEARCH_CHANNEL_ID = os.getenv("SEARCH_CHANNEL_ID", "1504833349414551703")
 SPAM_CHANNEL_ID = "1504846794142781480"
 ROSE_CHANNEL_ID = "1504847438727610519"
 SCAMBI_CHANNEL_ID = "1504847601361616996"
@@ -37,17 +37,17 @@ LEAGUE_ADMIN_ROLE_ID = "1398342848436240434"
 
 # === FC26 ISCRIZIONI AUTOMATICHE ===
 SIGNUP_REQUEST_CHANNEL_ID = os.getenv("SIGNUP_REQUEST_CHANNEL_ID", "1504868857624399872")   # RICHIESTE ISCRIZIONI
-SIGNUP_STAFF_CHANNEL_ID = "1506321007873495070"     # Canale staff richieste
-SIGNUP_REJECT_CHANNEL_ID = "1506321007873495070"    # Canale richieste rifiutate
-SIGNUP_ACCEPT_CHANNEL_ID = "1506321007873495070"    # Canale richieste accettate
-MEDIA_CHANNEL_ID = "1506321171493163199"              # Canale news/media FC26
-SIGNUP_PENDING_ROLE_ID = PRE_ISCRITTO_ROLE_ID        # 1398323859056365599
-SIGNUP_REGISTERED_ROLE_ID = LEAGUE_PLAYER_ROLE_ID    # 1398332847655358554
+SIGNUP_STAFF_CHANNEL_ID = os.getenv("SIGNUP_STAFF_CHANNEL_ID", "1506321007873495070")     # LOG staff richieste
+SIGNUP_REJECT_CHANNEL_ID = os.getenv("SIGNUP_REJECT_CHANNEL_ID", "1506321007873495070")    # LOG richieste rifiutate
+SIGNUP_ACCEPT_CHANNEL_ID = os.getenv("SIGNUP_ACCEPT_CHANNEL_ID", "1506321007873495070")    # LOG richieste accettate
+MEDIA_CHANNEL_ID = "1506321171493163199"
+SIGNUP_PENDING_ROLE_ID = PRE_ISCRITTO_ROLE_ID        # 1505180973208440954
+SIGNUP_REGISTERED_ROLE_ID = LEAGUE_PLAYER_ROLE_ID    # 1505181066695016619
 
 # Ruoli autorizzati a gestire ACCETTA/RIFIUTA e assegnazione club
 SIGNUP_STAFF_ROLE_IDS = {
-    "1398358193197027408",
     "1398342848436240434",
+    "1398358193197027408",
 }
 
 # Club divisi per campionato. Puoi aggiungere/togliere club liberamente.
@@ -96,6 +96,7 @@ MEDIA_CHANNEL_ID = "1506321171493163199"
 MEDIA_TRANSFER_MIN_OVERALL = 85
 MEDIA_TRANSFER_MIN_PRICE = 150
 MEDIA_SPECIAL_MATCH_MIN_GOALS = 5
+PLAYER_REPORT_CHANNEL_ID = "1506321044519125062"
 
 TOP_CLUBS_FOR_MEDIA = {
     "Real Madrid", "Barcellona", "Atletico Madrid", "Manchester City",
@@ -311,20 +312,20 @@ async def automatic_daily_backup_loop():
 # ===================================
 
 BOT_ONLY_BYPASS_ROLE_IDS = {
-    "1398358193197027408",
     "1398342848436240434",
+    "1398358193197027408",
 }
 
 BOT_ONLY_CHANNELS = {
-    int(CALENDAR_CHANNEL_ID),   # calendario
-    int(RESULTS_CHANNEL_ID),    # risultati
-    int(STANDINGS_CHANNEL_ID),  # classifiche
-    int(STATS_CHANNEL_ID),      # statistiche
-    int(AUCTION_CHANNEL_ID),    # asta
-    int(SCAMBI_CHANNEL_ID),     # scambi
-    int(SEARCH_CHANNEL_ID),     # ricerca-giocatori
-    int(SPAM_CHANNEL_ID),       # spam-chat
-    int(ROSE_CHANNEL_ID),       # rose
+    1504884471286075532,  # calendario
+    1504874612805337229,  # risultati
+    1504874671064223784,  # classifiche
+    1504874788349542431,  # statistiche
+    1504825224422756463,  # asta
+    1504847601361616996,  # scambi
+    1504833349414551703,  # ricerca-giocatori
+    1504846794142781480,  # spam-chat
+    1504847438727610519,  # rose
 }
 
 DEFAULT_BUDGET = 500
@@ -968,7 +969,7 @@ async def get_log_channel():
 
 async def send_auction_history_log(guild, title, description, *, color=None, embed=None):
     """
-    Storico aste/scambi nel canale 1504830394908803142.
+    Storico aste/scambi nel canale 1505148650723217540.
     """
     try:
         channel = None
@@ -1460,9 +1461,9 @@ async def get_member_safe(guild, member_id):
 
 
 # ================= BORDO CAMPO - GESTIONE RUOLI ISCRIZIONE =================
-BASE_ROLE_ID = REQUEST_ROLE_ID                 # 1398323695558332604
-PRE_SIGNUP_ROLE_ID = SIGNUP_PENDING_ROLE_ID    # 1398323859056365599
-REGISTERED_ROLE_ID = SIGNUP_REGISTERED_ROLE_ID # 1398332847655358554
+BASE_ROLE_ID = REQUEST_ROLE_ID                 # 1495072035624325130
+PRE_SIGNUP_ROLE_ID = SIGNUP_PENDING_ROLE_ID    # 1505180973208440954
+REGISTERED_ROLE_ID = SIGNUP_REGISTERED_ROLE_ID # 1505181066695016619
 
 
 async def apply_signup_role_pending(guild, member, reason="Richiesta iscrizione FC26"):
@@ -1807,8 +1808,8 @@ class AuctionView(discord.ui.View):
 
 # ================= PERMESSI STAFF / LOG / CONFERME =================
 
-OWNER_STAFF_ROLE_ID = "1398342848436240434"      # Può fare tutto
-LIMITED_STAFF_ROLE_ID = "1398358193197027408"    # Staff limitato
+OWNER_STAFF_ROLE_ID = "1398342848436240434"      # FOUNDER: comandi sensibili
+LIMITED_STAFF_ROLE_ID = "1398358193197027408"    # STAFF: no comandi sensibili
 STAFF_LOG_CHANNEL_ID = 1506321007873495070
 
 DANGEROUS_ACTIONS = {
@@ -1836,12 +1837,12 @@ def is_limited_staff_member(member):
 
 
 def can_use_dangerous_commands(member):
-    # Solo ruolo 1398342848436240434 o Administrator Discord
+    # Solo ruolo 1498341567105339492 o Administrator Discord
     return is_owner_staff_member(member)
 
 
 def can_use_staff_panel(member):
-    # Staff panel SOLO ruolo 1398342848436240434 o Administrator Discord
+    # Staff panel SOLO ruolo 1498341567105339492 o Administrator Discord
     return is_owner_staff_member(member)
 
 
@@ -3170,34 +3171,22 @@ async def setup_iscrizioni(interaction: discord.Interaction):
             await interaction.followup.send("❌ Solo lo staff può usare questo comando.", ephemeral=True)
             return
 
-        target_channel_id = int(SIGNUP_REQUEST_CHANNEL_ID)
         channel = None
-        fetch_error = None
-
-        # Prima prova dalla cache del server dove hai lanciato il comando.
         if interaction.guild:
-            channel = interaction.guild.get_channel(target_channel_id)
+            channel = interaction.guild.get_channel(int(SIGNUP_REQUEST_CHANNEL_ID))
 
-        # Poi prova dalla cache globale del bot.
-        if not channel:
-            channel = bot.get_channel(target_channel_id)
-
-        # Ultimo tentativo: richiesta diretta a Discord.
         if not channel:
             try:
-                channel = await bot.fetch_channel(target_channel_id)
-            except Exception as e:
-                fetch_error = f"{type(e).__name__}: {e}"
+                channel = await bot.fetch_channel(int(SIGNUP_REQUEST_CHANNEL_ID))
+            except Exception:
                 channel = None
 
         if not channel:
-            current_guild_id = interaction.guild.id if interaction.guild else "Nessun server"
             await interaction.followup.send(
-                "❌ Canale richiesta iscrizione non trovato.\n"
-                f"Server comando: `{current_guild_id}`\n"
+                f"❌ Canale richiesta iscrizione non trovato.\n"
+                f"Server attuale: `{interaction.guild.id if interaction.guild else None}`\n"
                 f"Canale cercato: `{SIGNUP_REQUEST_CHANNEL_ID}`\n"
-                f"Errore Discord: `{fetch_error or 'Non disponibile'}`\n\n"
-                "Controlla che il canale sia un canale testo normale e che il bot abbia **View Channel** e **Send Messages**.",
+                "Controlla che il bot abbia permesso **Visualizza canale** e che sia un canale testo normale.",
                 ephemeral=True
             )
             return
@@ -8515,7 +8504,7 @@ if __name__ == "__main__":
 async def log_every_staff_slash_command(interaction: discord.Interaction):
     """
     Logga automaticamente OGNI slash command usato dallo staff
-    nel canale LOG 1506321007873495070.
+    nel canale LOG 1498345679511355582.
     """
     try:
         if not interaction.guild:
