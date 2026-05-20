@@ -36,18 +36,18 @@ LEAGUE_PLAYER_ROLE_ID = "1398332847655358554"
 LEAGUE_ADMIN_ROLE_ID = "1398342848436240434"
 
 # === FC26 ISCRIZIONI AUTOMATICHE ===
-SIGNUP_REQUEST_CHANNEL_ID = "1504868857624399872"   # RICHIESTA ISCRIZIONE
-SIGNUP_STAFF_CHANNEL_ID = "1506320879015952535"     # Canale staff richieste
-SIGNUP_REJECT_CHANNEL_ID = "1506320840168308911"    # Canale richieste rifiutate
-SIGNUP_ACCEPT_CHANNEL_ID = "1506320769964183742"    # Canale richieste accettate
+SIGNUP_REQUEST_CHANNEL_ID = "1504868857624399872"   # RICHIESTE ISCRIZIONI
+SIGNUP_STAFF_CHANNEL_ID = "1506321007873495070"     # Canale staff richieste
+SIGNUP_REJECT_CHANNEL_ID = "1506321007873495070"    # Canale richieste rifiutate
+SIGNUP_ACCEPT_CHANNEL_ID = "1506321007873495070"    # Canale richieste accettate
 MEDIA_CHANNEL_ID = "1506321171493163199"              # Canale news/media FC26
-SIGNUP_PENDING_ROLE_ID = PRE_ISCRITTO_ROLE_ID        # 1505180973208440954
-SIGNUP_REGISTERED_ROLE_ID = LEAGUE_PLAYER_ROLE_ID    # 1505181066695016619
+SIGNUP_PENDING_ROLE_ID = PRE_ISCRITTO_ROLE_ID        # 1398323859056365599
+SIGNUP_REGISTERED_ROLE_ID = LEAGUE_PLAYER_ROLE_ID    # 1398332847655358554
 
 # Ruoli autorizzati a gestire ACCETTA/RIFIUTA e assegnazione club
 SIGNUP_STAFF_ROLE_IDS = {
-    "1398342848436240434",
     "1398358193197027408",
+    "1398342848436240434",
 }
 
 # Club divisi per campionato. Puoi aggiungere/togliere club liberamente.
@@ -316,15 +316,15 @@ BOT_ONLY_BYPASS_ROLE_IDS = {
 }
 
 BOT_ONLY_CHANNELS = {
-    1505147549063843980,  # calendario
-    1505147679636717610,  # risultati
-    1505147757755764817,  # classifiche
-    1505147847324991498,  # statistiche
-    1505148246031601785,  # asta
-    1505148317925900349,  # scambi
-    1505148402135072920,  # ricerca-giocatori
-    1505148506799738970,  # spam-chat
-    1505148579919171725,  # rose
+    int(CALENDAR_CHANNEL_ID),   # calendario
+    int(RESULTS_CHANNEL_ID),    # risultati
+    int(STANDINGS_CHANNEL_ID),  # classifiche
+    int(STATS_CHANNEL_ID),      # statistiche
+    int(AUCTION_CHANNEL_ID),    # asta
+    int(SCAMBI_CHANNEL_ID),     # scambi
+    int(SEARCH_CHANNEL_ID),     # ricerca-giocatori
+    int(SPAM_CHANNEL_ID),       # spam-chat
+    int(ROSE_CHANNEL_ID),       # rose
 }
 
 DEFAULT_BUDGET = 500
@@ -968,7 +968,7 @@ async def get_log_channel():
 
 async def send_auction_history_log(guild, title, description, *, color=None, embed=None):
     """
-    Storico aste/scambi nel canale 1505148650723217540.
+    Storico aste/scambi nel canale 1504830394908803142.
     """
     try:
         channel = None
@@ -1460,9 +1460,9 @@ async def get_member_safe(guild, member_id):
 
 
 # ================= BORDO CAMPO - GESTIONE RUOLI ISCRIZIONE =================
-BASE_ROLE_ID = REQUEST_ROLE_ID                 # 1495072035624325130
-PRE_SIGNUP_ROLE_ID = SIGNUP_PENDING_ROLE_ID    # 1505180973208440954
-REGISTERED_ROLE_ID = SIGNUP_REGISTERED_ROLE_ID # 1505181066695016619
+BASE_ROLE_ID = REQUEST_ROLE_ID                 # 1398323695558332604
+PRE_SIGNUP_ROLE_ID = SIGNUP_PENDING_ROLE_ID    # 1398323859056365599
+REGISTERED_ROLE_ID = SIGNUP_REGISTERED_ROLE_ID # 1398332847655358554
 
 
 async def apply_signup_role_pending(guild, member, reason="Richiesta iscrizione FC26"):
@@ -1836,12 +1836,12 @@ def is_limited_staff_member(member):
 
 
 def can_use_dangerous_commands(member):
-    # Solo ruolo 1498341567105339492 o Administrator Discord
+    # Solo ruolo 1398342848436240434 o Administrator Discord
     return is_owner_staff_member(member)
 
 
 def can_use_staff_panel(member):
-    # Staff panel SOLO ruolo 1498341567105339492 o Administrator Discord
+    # Staff panel SOLO ruolo 1398342848436240434 o Administrator Discord
     return is_owner_staff_member(member)
 
 
@@ -8497,7 +8497,7 @@ if __name__ == "__main__":
 async def log_every_staff_slash_command(interaction: discord.Interaction):
     """
     Logga automaticamente OGNI slash command usato dallo staff
-    nel canale LOG 1498345679511355582.
+    nel canale LOG 1506321007873495070.
     """
     try:
         if not interaction.guild:
