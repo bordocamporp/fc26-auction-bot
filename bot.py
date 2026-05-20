@@ -50,44 +50,9 @@ SIGNUP_STAFF_ROLE_IDS = {
     "1398358193197027408",
 }
 
-# Club divisi per campionato. Puoi aggiungere/togliere club liberamente.
-LEAGUE_CLUBS = {
-    "Serie A": [
-        "Atalanta", "Bologna", "Cagliari", "Como", "Cremonese", "Fiorentina",
-        "Genoa", "Inter", "Juventus", "Lazio", "Lecce", "Milan", "Napoli",
-        "Parma", "Pisa", "Roma", "Sassuolo", "Torino", "Udinese", "Verona"
-    ],
-    "Premier League": [
-        "Arsenal", "Aston Villa", "Bournemouth", "Brentford", "Brighton", "Burnley",
-        "Chelsea", "Crystal Palace", "Everton", "Fulham", "Leeds United", "Liverpool",
-        "Manchester City", "Manchester United", "Newcastle United", "Nottingham Forest",
-        "Sunderland", "Tottenham", "West Ham", "Wolves"
-    ],
-    "LaLiga": [
-        "Alavés", "Athletic Club", "Atletico Madrid", "Barcellona", "Celta Vigo",
-        "Elche", "Espanyol", "Getafe", "Girona", "Levante", "Mallorca", "Osasuna",
-        "Rayo Vallecano", "Real Betis", "Real Madrid", "Real Oviedo", "Real Sociedad",
-        "Sevilla", "Valencia", "Villarreal"
-    ],
-    "Bundesliga": [
-        "Augsburg", "Bayer Leverkusen", "Bayern Monaco", "Borussia Dortmund",
-        "Borussia M'gladbach", "Eintracht Francoforte", "Friburgo", "Heidenheim",
-        "Hoffenheim", "Koln", "Mainz", "RB Lipsia", "St. Pauli", "Stoccarda",
-        "Union Berlino", "Werder Brema", "Wolfsburg"
-    ],
-    "Ligue 1": [
-        "Angers", "Auxerre", "Brest", "Le Havre", "Lens", "Lille", "Lorient",
-        "Lione", "Marsiglia", "Metz", "Monaco", "Nantes", "Nizza", "Paris FC",
-        "PSG", "Rennes", "Strasburgo", "Tolosa"
-    ],
-    "Altri Campionati": [
-        "Ajax", "Benfica", "Besiktas", "Celtic", "Club Brugge", "Dinamo Zagabria",
-        "Fenerbahce", "Feyenoord", "Galatasaray", "Olympiacos", "Porto", "PSV",
-        "Rangers", "River Plate", "Boca Juniors", "Sporting CP", "Shakhtar Donetsk"
-    ]
-}
-
-FANTACALCIO_CLUBS = [club for clubs in LEAGUE_CLUBS.values() for club in clubs]
+# Club e campionati NON sono più hardcoded nel file.
+# Il database Supabase/PostgreSQL è la fonte principale dei dati.
+# Tabelle usate dal bot: fc26_clubs, championships, championship_groups, ecc.
 
 
 # ================= MEDIA SYSTEM - SOLO NEWS IMPORTANTI =================
@@ -767,16 +732,8 @@ def ensure_extra_tables():
     except Exception:
         pass
 
-    for league_name, clubs in LEAGUE_CLUBS.items():
-        for club in clubs:
-            cur.execute(
-                "INSERT INTO fc26_clubs (name, league, assigned_to) VALUES (%s, %s, NULL) ON CONFLICT (name) DO NOTHING",
-                (club, league_name)
-            )
-            cur.execute(
-                "UPDATE fc26_clubs SET league = %s WHERE name = %s AND (league IS NULL OR league = '')",
-                (league_name, club)
-            )
+    # I club e i campionati vengono letti da Supabase/PostgreSQL.
+    # Non vengono più inseriti automaticamente da liste hardcoded nel codice.
 
     # Tabelle extra: coppe, premi, hall of fame, media e offerte/controfferte
     cur.execute("""
@@ -3543,8 +3500,9 @@ def get_free_signup_clubs(league=None):
             cur.execute("SELECT name FROM fc26_clubs WHERE assigned_to IS NULL ORDER BY name ASC")
         rows = cur.fetchall()
         clubs = [r["name"] for r in rows]
-    except Exception:
-        clubs = FANTACALCIO_CLUBS[:]
+    except Exception as e:
+        print(f"[SIGNUP CLUBS] Errore lettura club da database: {e}")
+        clubs = []
     conn.close()
     return clubs
 
@@ -3562,8 +3520,9 @@ def get_free_signup_leagues():
         """)
         rows = cur.fetchall()
         leagues = [(r["league"] or "Senza campionato", r["total"]) for r in rows if r["total"] > 0]
-    except Exception:
-        leagues = [(league, len(clubs)) for league, clubs in LEAGUE_CLUBS.items()]
+    except Exception as e:
+        print(f"[SIGNUP LEAGUES] Errore lettura campionati da database: {e}")
+        leagues = []
     conn.close()
     return leagues
 
