@@ -37,9 +37,9 @@ LEAGUE_ADMIN_ROLE_ID = "1398342848436240434"
 
 # === FC26 ISCRIZIONI AUTOMATICHE ===
 SIGNUP_REQUEST_CHANNEL_ID = os.getenv("SIGNUP_REQUEST_CHANNEL_ID", "1504868857624399872")   # RICHIESTE ISCRIZIONI
-SIGNUP_STAFF_CHANNEL_ID = os.getenv("SIGNUP_STAFF_CHANNEL_ID", "1506320879015952535")     # LOG ISCRIZIONI / staff richieste
-SIGNUP_REJECT_CHANNEL_ID = os.getenv("SIGNUP_REJECT_CHANNEL_ID", "1506320879015952535")    # LOG ISCRIZIONI / richieste rifiutate
-SIGNUP_ACCEPT_CHANNEL_ID = os.getenv("SIGNUP_ACCEPT_CHANNEL_ID", "1506320879015952535")    # LOG ISCRIZIONI / richieste accettate
+SIGNUP_STAFF_CHANNEL_ID = "1506320879015952535"     # LOG ISCRIZIONI / staff richieste
+SIGNUP_REJECT_CHANNEL_ID = "1506320879015952535"    # LOG ISCRIZIONI / richieste rifiutate
+SIGNUP_ACCEPT_CHANNEL_ID = "1506320879015952535"    # LOG ISCRIZIONI / richieste accettate
 MEDIA_CHANNEL_ID = "1506321171493163199"
 SIGNUP_PENDING_ROLE_ID = PRE_ISCRITTO_ROLE_ID        # 1505180973208440954
 SIGNUP_REGISTERED_ROLE_ID = LEAGUE_PLAYER_ROLE_ID    # 1505181066695016619
@@ -3653,15 +3653,7 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     except Exception:
         pass
 
-    accept_channel_id = 1505228998668456057
-    accept_channel = guild.get_channel(accept_channel_id)
-    if accept_channel:
-        await accept_channel.send(
-            f"✅ **Richiesta accettata**\n\n"
-            f"👤 Player: {member.mention}\n"
-            f"🏟️ Club assegnato: **{club_name}**\n"
-            f"🆔 ID PSN/Xbox/EA: **{request['game_id']}**"
-        )
+    # Notifica unica: il messaggio staff originale viene aggiornato sotto.
 
     embed = discord.Embed(
         title="✅ Iscrizione completata",
@@ -3678,18 +3670,7 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     except Exception:
         await interaction.message.edit(embed=embed, view=None)
 
-    try:
-        await send_staff_log(
-            guild,
-            "✅ Iscrizione accettata",
-            f"Player: {member.mention}\nClub: **{club_name}**",
-            user=interaction.user,
-            color=discord.Color.green()
-        )
-    except Exception:
-        pass
-
-
+    # Nessuna seconda comunicazione nel log: resta solo il messaggio staff aggiornato.
 
 
 
@@ -3936,12 +3917,7 @@ class SignupClubSelect(discord.ui.Select):
         except Exception:
             pass
 
-        try:
-            accept_channel = interaction.guild.get_channel(int(SIGNUP_ACCEPT_CHANNEL_ID))
-            if accept_channel:
-                await accept_channel.send(embed=embed)
-        except Exception:
-            pass
+        # Notifica unica: aggiorna il messaggio originale nel canale LOG ISCRIZIONI.
 
         await safe_dm_signup_result(
             discord_id,
@@ -3956,16 +3932,7 @@ class SignupClubSelect(discord.ui.Select):
             discord.Color.green()
         )
 
-        try:
-            await send_staff_log(
-                interaction.guild,
-                "✅ Iscrizione accettata con squadra reale",
-                f"Richiesta #{self.request_id}\nPlayer: <@{discord_id}>\nClub: **{club_name}**\nBudget: **{budget}**\nGiocatori: **{players_count}**",
-                user=interaction.user,
-                color=discord.Color.green()
-            )
-        except Exception:
-            pass
+        # Nessuna seconda comunicazione nel log: resta solo il messaggio staff aggiornato.
 
         await interaction.followup.send(
             f"✅ Iscrizione accettata e squadra **{club_name}** assegnata.",
@@ -4140,12 +4107,7 @@ class SignupStaffView(discord.ui.View):
         except Exception:
             pass
 
-        try:
-            accept_channel = interaction.guild.get_channel(int(SIGNUP_ACCEPT_CHANNEL_ID))
-            if accept_channel:
-                await accept_channel.send(embed=embed)
-        except Exception:
-            pass
+        # Notifica unica: aggiorna il messaggio originale nel canale LOG ISCRIZIONI.
 
         await safe_dm_signup_result(
             discord_id,
@@ -4206,12 +4168,7 @@ class SignupStaffView(discord.ui.View):
         except Exception:
             pass
 
-        try:
-            reject_channel = interaction.guild.get_channel(int(SIGNUP_REJECT_CHANNEL_ID))
-            if reject_channel:
-                await reject_channel.send(embed=embed)
-        except Exception:
-            pass
+        # Notifica unica: aggiorna il messaggio originale nel canale LOG ISCRIZIONI.
 
         await safe_dm_signup_result(
             discord_id,
