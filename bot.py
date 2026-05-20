@@ -4058,42 +4058,17 @@ def sync_fc26_dataset_to_bot_tables():
     return None
 
 async def sync_pending_signup_roles_loop():
-    """Assegna automaticamente PRE ISCRITTO anche alle richieste create dal sito."""
+    """Disattivato.
+
+    Questa vecchia sincronizzazione controllava continuamente Supabase e assegnava
+    ruoli Discord ai pending. In produzione causava blocchi/deadlock PostgreSQL e
+    heartbeat Discord rallentati. I ruoli vengono ora gestiti solo quando:
+    - l'utente invia la richiesta;
+    - lo staff accetta/rifiuta la richiesta.
+    """
     await bot.wait_until_ready()
-
-    while not bot.is_closed():
-        try:
-            guild = bot.get_guild(int(GUILD_ID))
-
-            if guild:
-                conn = connect()
-                cur = conn.cursor()
-                cur.execute("""
-                    SELECT id, discord_id
-                    FROM signup_requests
-                    WHERE status = 'pending'
-                      AND discord_id IS NOT NULL
-                    ORDER BY id DESC
-                    LIMIT 50
-                """)
-                rows = cur.fetchall()
-                conn.close()
-
-                for row in rows:
-                    discord_id = str(row.get("discord_id"))
-                    member = await get_member_safe(guild, discord_id)
-
-                    if member:
-                        await apply_signup_role_pending(
-                            guild,
-                            member,
-                            reason="Richiesta iscrizione FC26 da sito/Discord"
-                        )
-
-        except Exception as e:
-            print(f"[SIGNUP ROLES] Errore sync pending: {e}")
-
-        await asyncio.sleep(15)
+    print("[SIGNUP ROLES] Loop automatico disattivato: niente polling continuo su Supabase.")
+    return
 
 
 @tree.error
@@ -4135,10 +4110,7 @@ async def on_ready():
     except Exception as e:
         print(f"[ON_READY] process_website_signup_requests_loop non avviato: {e}")
 
-    try:
-        bot.loop.create_task(sync_pending_signup_roles_loop())
-    except Exception as e:
-        print(f"[ON_READY] sync_pending_signup_roles_loop non avviato: {e}")
+    print("[ON_READY] sync_pending_signup_roles_loop disattivato per evitare deadlock Supabase.")
 
     guild = get_guild()
     if guild:
@@ -9311,7 +9283,7 @@ async def aggiorna_budget_reali(interaction: discord.Interaction):
 
 def ensure_website_signup_sync_tables():
     """Supabase è già pronto: disattiva CREATE TABLE / ALTER TABLE del sync sito per evitare deadlock."""
-    print("[WEBSITE SYNC] Migrazioni automatiche disattivate: uso solo tabelle Supabase esistenti.")
+    print("[SUPABASE] Migrazioni automatiche disattivate: uso solo tabelle esistenti.")
     return None
 
 async def register_pending_signup_views():
