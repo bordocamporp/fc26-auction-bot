@@ -36,7 +36,7 @@ LEAGUE_PLAYER_ROLE_ID = "1398332847655358554"
 LEAGUE_ADMIN_ROLE_ID = "1398342848436240434"
 
 # === FC26 ISCRIZIONI AUTOMATICHE ===
-SIGNUP_REQUEST_CHANNEL_ID = "1504868857624399872"   # RICHIESTE ISCRIZIONI
+SIGNUP_REQUEST_CHANNEL_ID = os.getenv("SIGNUP_REQUEST_CHANNEL_ID", "1504868857624399872")   # RICHIESTE ISCRIZIONI
 SIGNUP_STAFF_CHANNEL_ID = "1506321007873495070"     # Canale staff richieste
 SIGNUP_REJECT_CHANNEL_ID = "1506321007873495070"    # Canale richieste rifiutate
 SIGNUP_ACCEPT_CHANNEL_ID = "1506321007873495070"    # Canale richieste accettate
@@ -3170,18 +3170,36 @@ async def setup_iscrizioni(interaction: discord.Interaction):
             await interaction.followup.send("❌ Solo lo staff può usare questo comando.", ephemeral=True)
             return
 
+        target_channel_id = int(SIGNUP_REQUEST_CHANNEL_ID)
         channel = None
-        if interaction.guild:
-            channel = interaction.guild.get_channel(int(SIGNUP_REQUEST_CHANNEL_ID))
+        fetch_error = None
 
+        # Prima prova dalla cache del server dove hai lanciato il comando.
+        if interaction.guild:
+            channel = interaction.guild.get_channel(target_channel_id)
+
+        # Poi prova dalla cache globale del bot.
+        if not channel:
+            channel = bot.get_channel(target_channel_id)
+
+        # Ultimo tentativo: richiesta diretta a Discord.
         if not channel:
             try:
-                channel = await bot.fetch_channel(int(SIGNUP_REQUEST_CHANNEL_ID))
-            except Exception:
+                channel = await bot.fetch_channel(target_channel_id)
+            except Exception as e:
+                fetch_error = f"{type(e).__name__}: {e}"
                 channel = None
 
         if not channel:
-            await interaction.followup.send("❌ Canale richiesta iscrizione non trovato.", ephemeral=True)
+            current_guild_id = interaction.guild.id if interaction.guild else "Nessun server"
+            await interaction.followup.send(
+                "❌ Canale richiesta iscrizione non trovato.\n"
+                f"Server comando: `{current_guild_id}`\n"
+                f"Canale cercato: `{SIGNUP_REQUEST_CHANNEL_ID}`\n"
+                f"Errore Discord: `{fetch_error or 'Non disponibile'}`\n\n"
+                "Controlla che il canale sia un canale testo normale e che il bot abbia **View Channel** e **Send Messages**.",
+                ephemeral=True
+            )
             return
 
         embed = discord.Embed(
