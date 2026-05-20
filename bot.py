@@ -4686,18 +4686,21 @@ async def on_app_command_error(interaction: discord.Interaction, error):
 
 @bot.event
 async def on_ready():
-    """Avvio leggero: niente migrazioni automatiche o loop bloccanti su Supabase.
+    """Avvio leggero e sincronizzazione slash command.
 
-    Il database Supabase deve essere già pronto. Questo evita:
-    - deadlock PostgreSQL
-    - heartbeat blocked di Discord.py
-    - doppie comunicazioni iscrizioni
+    Il database Supabase deve essere già pronto. Non vengono eseguite
+    migrazioni automatiche né loop bloccanti, così evitiamo deadlock e
+    heartbeat blocked.
     """
-    print("[ON_READY] Avvio leggero: migrazioni automatiche e website sync disattivati.")
+    print("[BOOT VERSION] bot_completo_68_no_deadlock_sync_fix")
+    print("[ON_READY] Avvio leggero: migrazioni automatiche e loop Supabase disattivati.")
 
     # Views persistenti Discord
-    bot.add_view(SignupStartView())
-    bot.add_view(AuctionView())
+    try:
+        bot.add_view(SignupStartView())
+        bot.add_view(AuctionView())
+    except Exception as e:
+        print(f"[ON_READY] Errore registrazione views persistenti: {e}")
 
     # Reset leggero stato aste, senza alterare lo schema DB.
     try:
@@ -4705,21 +4708,30 @@ async def on_ready():
     except Exception as e:
         print(f"[ON_READY] reset_auction_state non bloccante fallito: {e}")
 
-    guild = get_guild()
+    # Conta i comandi caricati nel file prima del sync: deve essere circa 68.
+    try:
+        loaded_commands = tree.get_commands()
+        print(f"[SYNC] Comandi caricati nel file prima del sync: {len(loaded_commands)}")
+    except Exception as e:
+        print(f"[SYNC] Errore conteggio comandi caricati: {e}")
 
-    if guild:
-        try:
-            tree.copy_global_to(guild=guild)
-            synced = await tree.sync(guild=guild)
-            print(f"Comandi sincronizzati nel server {GUILD_ID}: {len(synced)}")
-        except Exception as e:
-            print(f"Errore sync comandi guild: {e}")
-    else:
+    # Sincronizza nel server indicato da GUILD_ID per farli apparire subito.
+    try:
+        guild_id_int = int(str(GUILD_ID).strip())
+        guild_obj = discord.Object(id=guild_id_int)
+
+        # I comandi sono definiti globalmente con @tree.command: li copiamo nella guild.
+        tree.copy_global_to(guild=guild_obj)
+        synced = await tree.sync(guild=guild_obj)
+        print(f"[SYNC OK] Comandi sincronizzati nel server {guild_id_int}: {len(synced)}")
+    except Exception as e:
+        print(f"[SYNC GUILD ERROR] {type(e).__name__}: {e}")
+        # Fallback globale: può richiedere fino a 1 ora per apparire su Discord.
         try:
             synced = await tree.sync()
-            print(f"Comandi globali sincronizzati: {len(synced)}")
-        except Exception as e:
-            print(f"Errore sync comandi globali: {e}")
+            print(f"[SYNC GLOBAL OK] Comandi globali sincronizzati: {len(synced)}")
+        except Exception as e2:
+            print(f"[SYNC GLOBAL ERROR] {type(e2).__name__}: {e2}")
 
     print(f"Bot online come {bot.user}")
 
