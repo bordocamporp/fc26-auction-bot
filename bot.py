@@ -37,9 +37,9 @@ LEAGUE_ADMIN_ROLE_ID = "1398342848436240434"
 
 # === FC26 ISCRIZIONI AUTOMATICHE ===
 SIGNUP_REQUEST_CHANNEL_ID = os.getenv("SIGNUP_REQUEST_CHANNEL_ID", "1504868857624399872")   # RICHIESTE ISCRIZIONI
-SIGNUP_STAFF_CHANNEL_ID = os.getenv("SIGNUP_STAFF_CHANNEL_ID", "1506320879015952535")     # LOG ISCRIZIONI / staff richieste
-SIGNUP_REJECT_CHANNEL_ID = os.getenv("SIGNUP_REJECT_CHANNEL_ID", "1506320879015952535")    # LOG ISCRIZIONI / richieste rifiutate
-SIGNUP_ACCEPT_CHANNEL_ID = os.getenv("SIGNUP_ACCEPT_CHANNEL_ID", "1506320879015952535")    # LOG ISCRIZIONI / richieste accettate
+SIGNUP_STAFF_CHANNEL_ID = os.getenv("SIGNUP_STAFF_CHANNEL_ID", "1506320879015952535")     # LOG staff richieste
+SIGNUP_REJECT_CHANNEL_ID = os.getenv("SIGNUP_REJECT_CHANNEL_ID", "1506320879015952535")    # LOG richieste rifiutate
+SIGNUP_ACCEPT_CHANNEL_ID = os.getenv("SIGNUP_ACCEPT_CHANNEL_ID", "1506320879015952535")    # LOG richieste accettate
 MEDIA_CHANNEL_ID = "1506321171493163199"
 SIGNUP_PENDING_ROLE_ID = PRE_ISCRITTO_ROLE_ID        # 1505180973208440954
 SIGNUP_REGISTERED_ROLE_ID = LEAGUE_PLAYER_ROLE_ID    # 1505181066695016619
@@ -50,9 +50,44 @@ SIGNUP_STAFF_ROLE_IDS = {
     "1398358193197027408",
 }
 
-# Club e campionati NON sono più hardcoded nel file.
-# Il database Supabase/PostgreSQL è la fonte principale dei dati.
-# Tabelle usate dal bot: fc26_clubs, championships, championship_groups, ecc.
+# Club divisi per campionato. Puoi aggiungere/togliere club liberamente.
+LEAGUE_CLUBS = {
+    "Serie A": [
+        "Atalanta", "Bologna", "Cagliari", "Como", "Cremonese", "Fiorentina",
+        "Genoa", "Inter", "Juventus", "Lazio", "Lecce", "Milan", "Napoli",
+        "Parma", "Pisa", "Roma", "Sassuolo", "Torino", "Udinese", "Verona"
+    ],
+    "Premier League": [
+        "Arsenal", "Aston Villa", "Bournemouth", "Brentford", "Brighton", "Burnley",
+        "Chelsea", "Crystal Palace", "Everton", "Fulham", "Leeds United", "Liverpool",
+        "Manchester City", "Manchester United", "Newcastle United", "Nottingham Forest",
+        "Sunderland", "Tottenham", "West Ham", "Wolves"
+    ],
+    "LaLiga": [
+        "Alavés", "Athletic Club", "Atletico Madrid", "Barcellona", "Celta Vigo",
+        "Elche", "Espanyol", "Getafe", "Girona", "Levante", "Mallorca", "Osasuna",
+        "Rayo Vallecano", "Real Betis", "Real Madrid", "Real Oviedo", "Real Sociedad",
+        "Sevilla", "Valencia", "Villarreal"
+    ],
+    "Bundesliga": [
+        "Augsburg", "Bayer Leverkusen", "Bayern Monaco", "Borussia Dortmund",
+        "Borussia M'gladbach", "Eintracht Francoforte", "Friburgo", "Heidenheim",
+        "Hoffenheim", "Koln", "Mainz", "RB Lipsia", "St. Pauli", "Stoccarda",
+        "Union Berlino", "Werder Brema", "Wolfsburg"
+    ],
+    "Ligue 1": [
+        "Angers", "Auxerre", "Brest", "Le Havre", "Lens", "Lille", "Lorient",
+        "Lione", "Marsiglia", "Metz", "Monaco", "Nantes", "Nizza", "Paris FC",
+        "PSG", "Rennes", "Strasburgo", "Tolosa"
+    ],
+    "Altri Campionati": [
+        "Ajax", "Benfica", "Besiktas", "Celtic", "Club Brugge", "Dinamo Zagabria",
+        "Fenerbahce", "Feyenoord", "Galatasaray", "Olympiacos", "Porto", "PSV",
+        "Rangers", "River Plate", "Boca Juniors", "Sporting CP", "Shakhtar Donetsk"
+    ]
+}
+
+FANTACALCIO_CLUBS = [club for clubs in LEAGUE_CLUBS.values() for club in clubs]
 
 
 # ================= MEDIA SYSTEM - SOLO NEWS IMPORTANTI =================
@@ -478,9 +513,364 @@ def role_label(group):
 
 
 def ensure_extra_tables():
-    """Supabase è già la source of truth: niente CREATE/ALTER automatici dal bot."""
-    print("[DB] Migrazioni automatiche disattivate: uso solo Supabase esistente.")
-    return None
+    conn = connect()
+    cur = conn.cursor()
+
+    # ================= ASTE: schema PostgreSQL/Supabase =================
+    try:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS auctions (
+            id SERIAL PRIMARY KEY,
+            player_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            highest_bid INTEGER DEFAULT 0,
+            highest_bidder_id TEXT,
+            channel_id TEXT,
+            message_id TEXT,
+            created_by TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            closed_at TIMESTAMP
+        )
+        """)
+    except Exception as e:
+        print(f"[DB] Errore creazione auctions: {e}")
+
+    for sql in [
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS player_id TEXT",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open'",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS highest_bid INTEGER DEFAULT 0",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS highest_bidder_id TEXT",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS channel_id TEXT",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS message_id TEXT",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS created_by TEXT",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE auctions ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP"
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception:
+            pass
+
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_auctions_status ON auctions(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_auctions_player ON auctions(player_id)")
+    except Exception:
+        pass
+    # ================================================================
+
+
+    # Compatibilità PostgreSQL/Supabase: alcune versioni hanno manager_name invece di name.
+    try:
+        cur.execute("ALTER TABLE managers ADD COLUMN IF NOT EXISTS name TEXT")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE managers ADD COLUMN IF NOT EXISTS manager_name TEXT")
+    except Exception:
+        pass
+    try:
+        cur.execute("UPDATE managers SET name = COALESCE(name, manager_name, discord_id) WHERE name IS NULL")
+    except Exception:
+        pass
+    try:
+        cur.execute("UPDATE managers SET manager_name = COALESCE(manager_name, name, discord_id) WHERE manager_name IS NULL")
+    except Exception:
+        pass
+
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bid_history (
+        id SERIAL PRIMARY KEY,
+        auction_id INTEGER NOT NULL,
+        player_id TEXT NOT NULL,
+        bidder_id TEXT NOT NULL,
+        bidder_name TEXT,
+        amount INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS transfer_history (
+        id SERIAL PRIMARY KEY,
+        player_id TEXT NOT NULL,
+        player_name TEXT,
+        manager_id TEXT NOT NULL,
+        manager_name TEXT,
+        price INTEGER DEFAULT 0,
+        source TEXT DEFAULT 'auction',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS blacklist_players (
+        player_id TEXT PRIMARY KEY,
+        reason TEXT,
+        created_by TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trade_offers (
+        id SERIAL PRIMARY KEY,
+        proposer_id TEXT NOT NULL,
+        proposer_name TEXT,
+        target_id TEXT NOT NULL,
+        target_name TEXT,
+        offer_player_id TEXT,
+        request_player_id TEXT,
+        credits_to_target INTEGER DEFAULT 0,
+        credits_to_proposer INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS league_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS real_team_assignments (
+        discord_id TEXT PRIMARY KEY,
+        manager_name TEXT,
+        team_name TEXT,
+        avg_overall DOUBLE PRECISION,
+        assigned_budget INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+        INSERT INTO league_settings (key, value)
+        VALUES ('mode', 'fantacalcio')
+        ON CONFLICT (key) DO NOTHING
+    """)
+
+    cur.execute("""
+        INSERT INTO league_settings (key, value)
+        VALUES ('market_open', 'closed')
+        ON CONFLICT (key) DO NOTHING
+    """)
+
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS championships (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        status TEXT DEFAULT 'active',
+        group_count INTEGER DEFAULT 1,
+        teams_per_group INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS championship_groups (
+        id SERIAL PRIMARY KEY,
+        championship_id INTEGER NOT NULL,
+        name TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS championship_players (
+        id SERIAL PRIMARY KEY,
+        championship_id INTEGER NOT NULL,
+        group_id INTEGER NOT NULL,
+        discord_id TEXT NOT NULL,
+        display_name TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS championship_matches (
+        id SERIAL PRIMARY KEY,
+        championship_id INTEGER NOT NULL,
+        group_id INTEGER NOT NULL,
+        round_number INTEGER NOT NULL,
+        home_id TEXT NOT NULL,
+        away_id TEXT NOT NULL,
+        home_name TEXT,
+        away_name TEXT,
+        home_goals INTEGER,
+        away_goals INTEGER,
+        status TEXT DEFAULT 'pending',
+        submitted_by TEXT,
+        confirm_by TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS match_scorers (
+        id SERIAL PRIMARY KEY,
+        match_id INTEGER NOT NULL,
+        scorer_player_id TEXT,
+        scorer_name TEXT NOT NULL,
+        team_owner_id TEXT NOT NULL,
+        goals INTEGER DEFAULT 1
+    )
+    """)
+
+    # Tabelle sistema iscrizioni FC26
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS signup_requests (
+        id SERIAL PRIMARY KEY,
+        discord_id TEXT NOT NULL,
+        discord_name TEXT,
+        real_name TEXT,
+        age TEXT,
+        platform TEXT,
+        game_id TEXT,
+        club_preferences TEXT,
+        status TEXT DEFAULT 'pending',
+        club_name TEXT,
+        handled_by TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        handled_at TIMESTAMP
+    )
+    """)
+
+    try:
+        cur.execute("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_preferences TEXT")
+    except Exception:
+        pass
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS fc26_clubs (
+        name TEXT PRIMARY KEY,
+        league TEXT,
+        assigned_to TEXT,
+        assigned_at TIMESTAMP,
+        previous_owner_id TEXT,
+        previous_owner_name TEXT
+    )
+    """)
+
+    # Migrazione per chi aveva già la vecchia tabella senza colonna league.
+    try:
+        cur.execute("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS league TEXT")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_id TEXT")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_name TEXT")
+    except Exception:
+        pass
+
+    for league_name, clubs in LEAGUE_CLUBS.items():
+        for club in clubs:
+            cur.execute(
+                "INSERT INTO fc26_clubs (name, league, assigned_to) VALUES (%s, %s, NULL) ON CONFLICT (name) DO NOTHING",
+                (club, league_name)
+            )
+            cur.execute(
+                "UPDATE fc26_clubs SET league = %s WHERE name = %s AND (league IS NULL OR league = '')",
+                (league_name, club)
+            )
+
+    # Tabelle extra: coppe, premi, hall of fame, media e offerte/controfferte
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS national_cups (
+        id SERIAL PRIMARY KEY,
+        championship_id INTEGER NOT NULL,
+        group_id INTEGER,
+        name TEXT NOT NULL,
+        status TEXT DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS national_cup_matches (
+        id SERIAL PRIMARY KEY,
+        cup_id INTEGER NOT NULL,
+        round_number INTEGER NOT NULL,
+        home_id TEXT,
+        away_id TEXT,
+        home_name TEXT,
+        away_name TEXT,
+        home_goals INTEGER,
+        away_goals INTEGER,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS european_cups (
+        id SERIAL PRIMARY KEY,
+        championship_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        cup_type TEXT NOT NULL,
+        season_number INTEGER DEFAULT 1,
+        qualification_mode TEXT DEFAULT 'random',
+        status TEXT DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS european_cup_players (
+        id SERIAL PRIMARY KEY,
+        cup_id INTEGER NOT NULL,
+        discord_id TEXT NOT NULL,
+        display_name TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS hall_of_fame (
+        id SERIAL PRIMARY KEY,
+        season TEXT,
+        competition TEXT,
+        winner_id TEXT,
+        winner_name TEXT,
+        club_name TEXT,
+        prize_budget INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS media_news (
+        id SERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        created_by TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS player_trade_offers (
+        id SERIAL PRIMARY KEY,
+        proposer_id TEXT NOT NULL,
+        proposer_name TEXT,
+        target_id TEXT NOT NULL,
+        target_name TEXT,
+        player_id TEXT NOT NULL,
+        player_name TEXT,
+        amount INTEGER DEFAULT 0,
+        counter_amount INTEGER,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
 
 def player_embed(player, title="FC26 Player Card"):
     sold = player["sold_price"]
@@ -2008,8 +2398,64 @@ INACTIVITY_CHECK_INTERVAL = 79200  # 22 ore
 
 
 def ensure_activity_tables():
-    """Schema player_activity già gestito su Supabase: nessuna migrazione automatica."""
-    return None
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS player_activity (
+        discord_id TEXT PRIMARY KEY,
+        last_discord_activity TIMESTAMP,
+        last_match_played TIMESTAMP,
+        last_response TIMESTAMP,
+        warnings INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    for sql in [
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS last_discord_activity TIMESTAMP",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS last_match_played TIMESTAMP",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS last_response TIMESTAMP",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS warnings INTEGER DEFAULT 0",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS warned_discord INTEGER DEFAULT 0",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS warned_match INTEGER DEFAULT 0",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS warned_response INTEGER DEFAULT 0",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
+        "ALTER TABLE player_activity ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception:
+            pass
+
+    try:
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_player_activity_discord_id ON player_activity(discord_id)")
+    except Exception:
+        pass
+
+    # Inserisce in player_activity tutti i manager/utenti iscritti senza creare duplicati.
+    try:
+        cur.execute("""
+            INSERT INTO player_activity
+                (discord_id, last_discord_activity, last_match_played, last_response, created_at)
+            SELECT x.discord_id, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            FROM (
+                SELECT discord_id FROM managers WHERE discord_id IS NOT NULL
+                UNION
+                SELECT discord_id FROM signup_requests WHERE discord_id IS NOT NULL AND status = 'accepted'
+                UNION
+                SELECT assigned_to AS discord_id FROM fc26_clubs WHERE assigned_to IS NOT NULL AND assigned_to <> ''
+            ) AS x
+            WHERE x.discord_id IS NOT NULL
+            ON CONFLICT (discord_id) DO NOTHING
+        """)
+    except Exception as e:
+        print(f"[ATTIVITA] Errore popolamento player_activity: {e}")
+
+    conn.commit()
+    conn.close()
+
 
 def update_player_activity(discord_id, activity_type="discord"):
     ensure_activity_tables()
@@ -2316,8 +2762,43 @@ async def controllo_inattivi(interaction: discord.Interaction):
 # ================= SISTEMA FINE / NUOVA STAGIONE =================
 
 def ensure_season_tables():
-    """Schema seasons già gestito su Supabase: nessuna migrazione automatica."""
-    return None
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS seasons (
+        id SERIAL PRIMARY KEY,
+        season_name TEXT,
+        name TEXT,
+        status TEXT DEFAULT 'active',
+        active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    for sql in [
+        "ALTER TABLE seasons ADD COLUMN IF NOT EXISTS name TEXT",
+        "ALTER TABLE seasons ADD COLUMN IF NOT EXISTS season_name TEXT",
+        "ALTER TABLE seasons ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
+        "ALTER TABLE seasons ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE"
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception:
+            pass
+
+    try:
+        cur.execute("""
+            UPDATE seasons
+            SET name = COALESCE(name, season_name)
+            WHERE name IS NULL
+        """)
+    except Exception:
+        pass
+
+    conn.commit()
+    conn.close()
+
 
 def get_active_season():
     ensure_season_tables()
@@ -2909,11 +3390,7 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
                 "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_by TEXT",
                 "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_at TIMESTAMP",
                 "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'",
-                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_message_id TEXT",
-                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_channel_id TEXT",
-                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS signup_source TEXT",
-                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS source TEXT"
+                "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
             ]:
                 try:
                     cur.execute(sql)
@@ -2948,8 +3425,8 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
             cur.execute("""
                 INSERT INTO signup_requests
                 (discord_id, discord_name, real_name, age, platform, game_id,
-                 ea_id, preferred_clubs, club_preferences, status, created_at, signup_source, source)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', CURRENT_TIMESTAMP, 'discord', 'discord')
+                 ea_id, preferred_clubs, club_preferences, status, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', CURRENT_TIMESTAMP)
             """, (
                 str(interaction.user.id),
                 str(interaction.user),
@@ -2986,9 +3463,50 @@ class SignupModal(discord.ui.Modal, title="Richiesta iscrizione FC26"):
                 print(f"[SIGNUP MODAL] Errore ruolo PRE-ISCRITTO: {e}")
 
             try:
-                await publish_signup_request_once(int(request_id), interaction.guild, source="discord")
+                staff_channel = interaction.guild.get_channel(int(SIGNUP_STAFF_CHANNEL_ID))
+                if not staff_channel:
+                    staff_channel = await bot.fetch_channel(int(SIGNUP_STAFF_CHANNEL_ID))
+
+                embed = discord.Embed(
+                    title="📩 Nuova richiesta iscrizione FC26",
+                    description=f"Richiesta ID: **{request_id}**",
+                    color=discord.Color.orange()
+                )
+                embed.add_field(name="Player Discord", value=interaction.user.mention, inline=False)
+                embed.add_field(name="Nome", value=real_name or "-", inline=True)
+                embed.add_field(name="Età", value=age or "-", inline=True)
+                embed.add_field(name="Piattaforma", value=platform or "-", inline=True)
+                embed.add_field(name="ID PSN/Xbox/EA", value=game_id or "-", inline=False)
+
+                if club_preferences:
+                    embed.add_field(name="Club preferiti", value=club_preferences, inline=False)
+
+                embed.add_field(name="Modalità attiva", value=get_league_mode(), inline=False)
+                embed.set_footer(text="Lo staff deve scegliere ACCETTA o RIFIUTA.")
+
+                staff_message = await staff_channel.send(embed=embed, view=SignupStaffView(int(request_id)))
+                try:
+                    conn_msg = connect()
+                    cur_msg = conn_msg.cursor()
+                    cur_msg.execute("""
+                        ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_message_id TEXT
+                    """)
+                    cur_msg.execute("""
+                        ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_channel_id TEXT
+                    """)
+                    cur_msg.execute("""
+                        UPDATE signup_requests
+                        SET staff_message_id = %s,
+                            staff_channel_id = %s,
+                            signup_source = COALESCE(signup_source, 'discord')
+                        WHERE id = %s
+                    """, (str(staff_message.id), str(staff_channel.id), int(request_id)))
+                    conn_msg.commit()
+                    conn_msg.close()
+                except Exception as e:
+                    print(f"[SIGNUP MODAL] Errore salvataggio messaggio staff: {e}")
             except Exception as e:
-                print(f"[SIGNUP MODAL] Errore invio staff unico: {e}")
+                print(f"[SIGNUP MODAL] Errore invio staff: {e}")
 
             await interaction.followup.send(
                 "✅ Richiesta inviata correttamente. Lo staff la controllerà appena possibile.",
@@ -3012,169 +3530,6 @@ def get_signup_request(request_id):
     return row
 
 
-def _row_get(row, key, default=None):
-    try:
-        value = row.get(key)
-    except Exception:
-        try:
-            value = row[key]
-        except Exception:
-            value = default
-    return default if value is None else value
-
-
-async def publish_signup_request_once(request_id: int, guild=None, *, source="discord"):
-    """Pubblica una richiesta iscrizione nel canale staff una sola volta.
-
-    Usa Supabase/PostgreSQL come unica fonte dati. Per evitare doppi messaggi,
-    acquisisce un lock direttamente nella riga signup_requests prima di inviare.
-    """
-    request_id = int(request_id)
-    staff_channel_id = str(SIGNUP_STAFF_CHANNEL_ID)
-
-    # Lock atomico: se un altro processo/deploy ha già preso in carico la richiesta,
-    # non inviamo un secondo messaggio.
-    conn = connect()
-    cur = conn.cursor()
-    locked = None
-    try:
-        # Le colonne devono essere presenti nel DB Supabase; se non lo sono, le aggiunge una sola volta.
-        # Se vuoi zero migrazioni nel bot, crea queste colonne da Supabase SQL Editor e rimuovi questi ALTER.
-        for sql in [
-            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_message_id TEXT",
-            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_channel_id TEXT",
-            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS signup_source TEXT",
-            "ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS source TEXT"
-        ]:
-            try:
-                cur.execute(sql)
-            except Exception:
-                pass
-
-        cur.execute("""
-            UPDATE signup_requests
-            SET staff_message_id = %s,
-                staff_channel_id = %s,
-                signup_source = COALESCE(NULLIF(signup_source, ''), %s),
-                source = COALESCE(NULLIF(source, ''), %s)
-            WHERE id = %s
-              AND status = 'pending'
-              AND (staff_message_id IS NULL OR staff_message_id = '')
-            RETURNING *
-        """, ("LOCKING", staff_channel_id, str(source), str(source), request_id))
-        locked = cur.fetchone()
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"[SIGNUP STAFF] Errore lock richiesta #{request_id}: {e}")
-    finally:
-        conn.close()
-
-    if not locked:
-        print(f"[SIGNUP STAFF] Richiesta #{request_id} già pubblicata o non pending: salto invio doppio.")
-        return False
-
-    req = get_signup_request(request_id) or locked
-    discord_id = str(_row_get(req, "discord_id", "") or "").strip()
-    real_name = str(_row_get(req, "real_name", _row_get(req, "discord_name", "-")) or "-")
-    age = str(_row_get(req, "age", "-") or "-")
-    platform = str(_row_get(req, "platform", "-") or "-")
-    game_id = str(_row_get(req, "game_id", _row_get(req, "psn_id", _row_get(req, "ea_id", "-"))) or "-")
-    preferred = str(_row_get(req, "preferred_clubs", _row_get(req, "club_preferences", "")) or "").strip()
-
-    try:
-        staff_channel = None
-        if guild:
-            staff_channel = guild.get_channel(int(staff_channel_id))
-        if not staff_channel:
-            staff_channel = bot.get_channel(int(staff_channel_id))
-        if not staff_channel:
-            staff_channel = await bot.fetch_channel(int(staff_channel_id))
-    except Exception as e:
-        print(f"[SIGNUP STAFF] Canale log iscrizioni non trovato ({staff_channel_id}): {e}")
-        # Sblocca la riga per poter riprovare dopo aver sistemato canale/permessi.
-        conn = connect()
-        cur = conn.cursor()
-        try:
-            cur.execute("""
-                UPDATE signup_requests
-                SET staff_message_id = NULL,
-                    staff_channel_id = NULL
-                WHERE id = %s AND staff_message_id = 'LOCKING'
-            """, (request_id,))
-            conn.commit()
-        except Exception:
-            conn.rollback()
-        finally:
-            conn.close()
-        return False
-
-    embed = discord.Embed(
-        title="📩 Nuova richiesta iscrizione FC26",
-        description=f"Richiesta ID: **{request_id}**",
-        color=discord.Color.orange()
-    )
-    if source == "website":
-        embed.description += "\nFonte: **sito web**"
-
-    if discord_id:
-        embed.add_field(name="Player Discord", value=f"<@{discord_id}>", inline=False)
-        embed.add_field(name="Discord ID", value=discord_id, inline=False)
-    else:
-        embed.add_field(name="Player Discord", value=str(_row_get(req, "discord_name", "Player")), inline=False)
-
-    embed.add_field(name="Nome", value=real_name or "-", inline=True)
-    embed.add_field(name="Età", value=age or "-", inline=True)
-    embed.add_field(name="Piattaforma", value=platform or "-", inline=True)
-    embed.add_field(name="ID PSN/Xbox/EA", value=game_id or "-", inline=False)
-    if preferred and preferred != "-":
-        embed.add_field(name="Club preferiti", value=preferred, inline=False)
-    try:
-        embed.add_field(name="Modalità attiva", value=get_league_mode(), inline=False)
-    except Exception:
-        pass
-    embed.set_footer(text="Lo staff deve scegliere ACCETTA o RIFIUTA.")
-
-    try:
-        staff_message = await staff_channel.send(embed=embed, view=SignupStaffView(request_id))
-    except Exception as e:
-        print(f"[SIGNUP STAFF] Errore invio richiesta #{request_id}: {e}")
-        conn = connect()
-        cur = conn.cursor()
-        try:
-            cur.execute("""
-                UPDATE signup_requests
-                SET staff_message_id = NULL,
-                    staff_channel_id = NULL
-                WHERE id = %s AND staff_message_id = 'LOCKING'
-            """, (request_id,))
-            conn.commit()
-        except Exception:
-            conn.rollback()
-        finally:
-            conn.close()
-        return False
-
-    conn = connect()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            UPDATE signup_requests
-            SET staff_message_id = %s,
-                staff_channel_id = %s
-            WHERE id = %s
-        """, (str(staff_message.id), str(staff_channel.id), request_id))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"[SIGNUP STAFF] Errore salvataggio messaggio richiesta #{request_id}: {e}")
-    finally:
-        conn.close()
-
-    print(f"[SIGNUP STAFF] Richiesta #{request_id} pubblicata una sola volta nel canale {staff_channel_id}.")
-    return True
-
-
 def get_free_signup_clubs(league=None):
     conn = connect()
     cur = conn.cursor()
@@ -3188,9 +3543,8 @@ def get_free_signup_clubs(league=None):
             cur.execute("SELECT name FROM fc26_clubs WHERE assigned_to IS NULL ORDER BY name ASC")
         rows = cur.fetchall()
         clubs = [r["name"] for r in rows]
-    except Exception as e:
-        print(f"[SIGNUP CLUBS] Errore lettura club da database: {e}")
-        clubs = []
+    except Exception:
+        clubs = FANTACALCIO_CLUBS[:]
     conn.close()
     return clubs
 
@@ -3208,9 +3562,8 @@ def get_free_signup_leagues():
         """)
         rows = cur.fetchall()
         leagues = [(r["league"] or "Senza campionato", r["total"]) for r in rows if r["total"] > 0]
-    except Exception as e:
-        print(f"[SIGNUP LEAGUES] Errore lettura campionati da database: {e}")
-        leagues = []
+    except Exception:
+        leagues = [(league, len(clubs)) for league, clubs in LEAGUE_CLUBS.items()]
     conn.close()
     return leagues
 
@@ -3341,7 +3694,15 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     except Exception:
         pass
 
-    # Notifica unica: il messaggio staff originale viene aggiornato sotto.
+    accept_channel_id = 1505228998668456057
+    accept_channel = guild.get_channel(accept_channel_id)
+    if accept_channel:
+        await accept_channel.send(
+            f"✅ **Richiesta accettata**\n\n"
+            f"👤 Player: {member.mention}\n"
+            f"🏟️ Club assegnato: **{club_name}**\n"
+            f"🆔 ID PSN/Xbox/EA: **{request['game_id']}**"
+        )
 
     embed = discord.Embed(
         title="✅ Iscrizione completata",
@@ -3358,7 +3719,18 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     except Exception:
         await interaction.message.edit(embed=embed, view=None)
 
-    # Nessuna seconda comunicazione nel log: resta solo il messaggio staff aggiornato.
+    try:
+        await send_staff_log(
+            guild,
+            "✅ Iscrizione accettata",
+            f"Player: {member.mention}\nClub: **{club_name}**",
+            user=interaction.user,
+            color=discord.Color.green()
+        )
+    except Exception:
+        pass
+
+
 
 
 
@@ -3605,7 +3977,12 @@ class SignupClubSelect(discord.ui.Select):
         except Exception:
             pass
 
-        # Notifica unica: aggiorna il messaggio originale nel canale LOG ISCRIZIONI.
+        try:
+            accept_channel = interaction.guild.get_channel(int(SIGNUP_ACCEPT_CHANNEL_ID))
+            if accept_channel:
+                await accept_channel.send(embed=embed)
+        except Exception:
+            pass
 
         await safe_dm_signup_result(
             discord_id,
@@ -3620,7 +3997,16 @@ class SignupClubSelect(discord.ui.Select):
             discord.Color.green()
         )
 
-        # Nessuna seconda comunicazione nel log: resta solo il messaggio staff aggiornato.
+        try:
+            await send_staff_log(
+                interaction.guild,
+                "✅ Iscrizione accettata con squadra reale",
+                f"Richiesta #{self.request_id}\nPlayer: <@{discord_id}>\nClub: **{club_name}**\nBudget: **{budget}**\nGiocatori: **{players_count}**",
+                user=interaction.user,
+                color=discord.Color.green()
+            )
+        except Exception:
+            pass
 
         await interaction.followup.send(
             f"✅ Iscrizione accettata e squadra **{club_name}** assegnata.",
@@ -3795,7 +4181,12 @@ class SignupStaffView(discord.ui.View):
         except Exception:
             pass
 
-        # Notifica unica: aggiorna il messaggio originale nel canale LOG ISCRIZIONI.
+        try:
+            accept_channel = interaction.guild.get_channel(int(SIGNUP_ACCEPT_CHANNEL_ID))
+            if accept_channel:
+                await accept_channel.send(embed=embed)
+        except Exception:
+            pass
 
         await safe_dm_signup_result(
             discord_id,
@@ -3856,7 +4247,12 @@ class SignupStaffView(discord.ui.View):
         except Exception:
             pass
 
-        # Notifica unica: aggiorna il messaggio originale nel canale LOG ISCRIZIONI.
+        try:
+            reject_channel = interaction.guild.get_channel(int(SIGNUP_REJECT_CHANNEL_ID))
+            if reject_channel:
+                await reject_channel.send(embed=embed)
+        except Exception:
+            pass
 
         await safe_dm_signup_result(
             discord_id,
@@ -4053,21 +4449,220 @@ class SignupStartView(discord.ui.View):
 # ===========================================================
 
 def sync_fc26_dataset_to_bot_tables():
-    """Disattivato: il sito/Supabase gestisce già players, players_fc26 e club."""
-    print("[FC26 SYNC] Disattivato: uso direttamente i dati già presenti su Supabase.")
-    return None
+    """
+    Sincronizza il dataset completo FC26 importato in Supabase.
+
+    Il bot storicamente usa la tabella `players` per aste, rose e mercato.
+    Il sito importa il CSV completo in `players_fc26`.
+
+    Questa funzione copia/aggiorna i dati principali da `players_fc26` a `players`
+    senza cancellare owner_discord_id e sold_price già presenti.
+    Poi aggiorna `fc26_clubs` con tutti i club reali presenti nel dataset.
+    """
+    conn = connect()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT to_regclass('public.players_fc26') AS table_name")
+        row = cur.fetchone()
+        if not row or not row.get("table_name"):
+            print("[FC26 SYNC] Tabella players_fc26 non trovata. Importa prima il CSV sul sito.")
+            conn.close()
+            return
+
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'players_fc26'
+        """)
+        available_columns = {str(r["column_name"]) for r in cur.fetchall()}
+
+        def pick(*names):
+            for name in names:
+                if name in available_columns:
+                    return name
+            return None
+
+        column_map = {
+            "id": pick("id", "ID"),
+            "name": pick("name", "Name"),
+            "team": pick("team", "Team", "club", "Club"),
+            "league": pick("league", "League"),
+            "position": pick("position", "Position"),
+            "overall": pick("overall", "OVR", "ovr"),
+            "pace": pick("pace", "pac", "PAC"),
+            "shooting": pick("shooting", "sho", "SHO"),
+            "passing": pick("passing", "pas", "PAS"),
+            "dribbling": pick("dribbling", "dri", "DRI"),
+            "defending": pick("defending", "def", "DEF"),
+            "physical": pick("physical", "phy", "PHY"),
+            "nation": pick("nation", "Nation"),
+            "age": pick("age", "Age"),
+            "weak_foot": pick("weak_foot", "Weak foot", "weak foot"),
+            "skill_moves": pick("skill_moves", "Skill moves", "skill moves"),
+        }
+
+        required = ["id", "name"]
+        missing_required = [key for key in required if not column_map.get(key)]
+        if missing_required:
+            print(f"[FC26 SYNC] Colonne obbligatorie mancanti in players_fc26: {missing_required}")
+            conn.close()
+            return
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS players (
+                id BIGINT PRIMARY KEY,
+                name TEXT,
+                team TEXT,
+                league TEXT,
+                position TEXT,
+                overall INTEGER,
+                pace INTEGER,
+                shooting INTEGER,
+                passing INTEGER,
+                dribbling INTEGER,
+                defending INTEGER,
+                physical INTEGER,
+                nation TEXT,
+                age INTEGER,
+                weak_foot INTEGER,
+                skill_moves INTEGER,
+                owner_discord_id TEXT,
+                sold_price INTEGER
+            )
+        """)
+
+        for sql in [
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS name TEXT",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS team TEXT",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS league TEXT",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS position TEXT",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS overall INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS pace INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS shooting INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS passing INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS dribbling INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS defending INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS physical INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS nation TEXT",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS age INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS weak_foot INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS skill_moves INTEGER",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS owner_discord_id TEXT",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS sold_price INTEGER",
+            "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS league TEXT",
+            "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_to TEXT",
+            "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP",
+            "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_id TEXT",
+            "ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_name TEXT",
+        ]:
+            try:
+                cur.execute(sql)
+            except Exception:
+                pass
+
+        def expr(key, default="NULL"):
+            col = column_map.get(key)
+            if not col:
+                return default
+            return f'"{col}"'
+
+        # Copia/aggiorna tutti i giocatori del dataset completo nella tabella operativa del bot.
+        # Non sovrascrive owner_discord_id e sold_price, così le rose già assegnate restano valide.
+        cur.execute(f"""
+            INSERT INTO players (
+                id, name, team, league, position, overall,
+                pace, shooting, passing, dribbling, defending, physical,
+                nation, age, weak_foot, skill_moves
+            )
+            SELECT
+                NULLIF(TRIM({expr('id')}::text), '')::bigint AS id,
+                {expr('name')}::text AS name,
+                {expr('team')}::text AS team,
+                {expr('league')}::text AS league,
+                {expr('position')}::text AS position,
+                NULLIF({expr('overall', "NULL")}::text, '')::integer AS overall,
+                NULLIF({expr('pace', "NULL")}::text, '')::integer AS pace,
+                NULLIF({expr('shooting', "NULL")}::text, '')::integer AS shooting,
+                NULLIF({expr('passing', "NULL")}::text, '')::integer AS passing,
+                NULLIF({expr('dribbling', "NULL")}::text, '')::integer AS dribbling,
+                NULLIF({expr('defending', "NULL")}::text, '')::integer AS defending,
+                NULLIF({expr('physical', "NULL")}::text, '')::integer AS physical,
+                {expr('nation')}::text AS nation,
+                NULLIF({expr('age', "NULL")}::text, '')::integer AS age,
+                NULLIF({expr('weak_foot', "NULL")}::text, '')::integer AS weak_foot,
+                NULLIF({expr('skill_moves', "NULL")}::text, '')::integer AS skill_moves
+            FROM players_fc26
+            WHERE {expr('id')} IS NOT NULL
+              AND TRIM({expr('id')}::text) <> ''
+            ON CONFLICT (id) DO UPDATE SET
+                name = EXCLUDED.name,
+                team = EXCLUDED.team,
+                league = EXCLUDED.league,
+                position = EXCLUDED.position,
+                overall = EXCLUDED.overall,
+                pace = EXCLUDED.pace,
+                shooting = EXCLUDED.shooting,
+                passing = EXCLUDED.passing,
+                dribbling = EXCLUDED.dribbling,
+                defending = EXCLUDED.defending,
+                physical = EXCLUDED.physical,
+                nation = EXCLUDED.nation,
+                age = EXCLUDED.age,
+                weak_foot = EXCLUDED.weak_foot,
+                skill_moves = EXCLUDED.skill_moves
+        """)
+
+        team_col = column_map.get("team")
+        league_col = column_map.get("league")
+        if team_col:
+            if league_col:
+                cur.execute(f"""
+                    INSERT INTO fc26_clubs (name, league)
+                    SELECT
+                        "{team_col}"::text AS name,
+                        MIN("{league_col}"::text) AS league
+                    FROM players_fc26
+                    WHERE "{team_col}" IS NOT NULL
+                      AND TRIM("{team_col}"::text) <> ''
+                    GROUP BY "{team_col}"
+                    ON CONFLICT (name) DO UPDATE SET
+                        league = COALESCE(EXCLUDED.league, fc26_clubs.league)
+                """)
+            else:
+                cur.execute(f"""
+                    INSERT INTO fc26_clubs (name)
+                    SELECT DISTINCT "{team_col}"::text AS name
+                    FROM players_fc26
+                    WHERE "{team_col}" IS NOT NULL
+                      AND TRIM("{team_col}"::text) <> ''
+                    ON CONFLICT (name) DO NOTHING
+                """)
+
+        conn.commit()
+
+        cur.execute("SELECT COUNT(*) AS total FROM players")
+        total_players = cur.fetchone()["total"]
+        cur.execute("SELECT COUNT(*) AS total FROM fc26_clubs")
+        total_clubs = cur.fetchone()["total"]
+        print(f"[FC26 SYNC] Sincronizzazione completata: {total_players} giocatori, {total_clubs} club.")
+
+    except Exception as e:
+        conn.rollback()
+        print(f"[FC26 SYNC] Errore sincronizzazione dataset FC26: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+# ===========================================================
+
 
 async def sync_pending_signup_roles_loop():
-    """Disattivato.
-
-    Questa vecchia sincronizzazione controllava continuamente Supabase e assegnava
-    ruoli Discord ai pending. In produzione causava blocchi/deadlock PostgreSQL e
-    heartbeat Discord rallentati. I ruoli vengono ora gestiti solo quando:
-    - l'utente invia la richiesta;
-    - lo staff accetta/rifiuta la richiesta.
-    """
-    await bot.wait_until_ready()
-    print("[SIGNUP ROLES] Loop automatico disattivato: niente polling continuo su Supabase.")
+    """Disattivato: causava deadlock Supabase e heartbeat blocked."""
+    print("[DISABLED] sync_pending_signup_roles_loop disattivato per evitare deadlock Supabase.")
     return
 
 
@@ -4091,30 +4686,30 @@ async def on_app_command_error(interaction: discord.Interaction, error):
 
 @bot.event
 async def on_ready():
-    # Avvio pulito: nessuna migrazione/ALTER/CREATE automatica su Supabase.
+    """Avvio leggero: niente migrazioni automatiche o loop bloccanti su Supabase.
+
+    Il database Supabase deve essere già pronto. Questo evita:
+    - deadlock PostgreSQL
+    - heartbeat blocked di Discord.py
+    - doppie comunicazioni iscrizioni
+    """
+    print("[ON_READY] Avvio leggero: migrazioni automatiche e website sync disattivati.")
+
+    # Views persistenti Discord
     bot.add_view(SignupStartView())
     bot.add_view(AuctionView())
 
+    # Reset leggero stato aste, senza alterare lo schema DB.
     try:
-        await register_pending_signup_views()
+        await asyncio.to_thread(reset_auction_state)
     except Exception as e:
-        print(f"[ON_READY] register_pending_signup_views fallito: {e}")
-
-    try:
-        bot.loop.create_task(process_website_signup_actions_loop())
-    except Exception as e:
-        print(f"[ON_READY] process_website_signup_actions_loop non avviato: {e}")
-
-    try:
-        bot.loop.create_task(process_website_signup_requests_loop())
-    except Exception as e:
-        print(f"[ON_READY] process_website_signup_requests_loop non avviato: {e}")
-
-    print("[ON_READY] sync_pending_signup_roles_loop disattivato per evitare deadlock Supabase.")
+        print(f"[ON_READY] reset_auction_state non bloccante fallito: {e}")
 
     guild = get_guild()
+
     if guild:
         try:
+            tree.copy_global_to(guild=guild)
             synced = await tree.sync(guild=guild)
             print(f"Comandi sincronizzati nel server {GUILD_ID}: {len(synced)}")
         except Exception as e:
@@ -4127,6 +4722,7 @@ async def on_ready():
             print(f"Errore sync comandi globali: {e}")
 
     print(f"Bot online come {bot.user}")
+
 
 @tree.command(name="registra", description="Staff: registra un player pre-iscritto")
 async def registra(interaction: discord.Interaction):
@@ -9282,35 +9878,15 @@ async def aggiorna_budget_reali(interaction: discord.Interaction):
 # ===========================================================
 
 def ensure_website_signup_sync_tables():
-    """Supabase è già pronto: disattiva CREATE TABLE / ALTER TABLE del sync sito per evitare deadlock."""
-    print("[SUPABASE] Migrazioni automatiche disattivate: uso solo tabelle esistenti.")
-    return None
+    """Disattivato: lo schema Supabase deve essere gestito dal sito/SQL, non dal bot."""
+    print("[DISABLED] ensure_website_signup_sync_tables disattivato per evitare deadlock Supabase.")
+    return
+
 
 async def register_pending_signup_views():
-    try:
-        conn = connect()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id
-            FROM signup_requests
-            WHERE status IN ('pending', 'choosing_club')
-            ORDER BY id DESC
-            LIMIT 100
-        """)
-        rows = cur.fetchall()
-        conn.close()
-
-        count = 0
-        for row in rows:
-            try:
-                bot.add_view(SignupStaffView(int(row["id"])))
-                count += 1
-            except Exception:
-                pass
-
-        print(f"[WEBSITE SYNC] View iscrizioni pending registrate: {count}")
-    except Exception as e:
-        print(f"[WEBSITE SYNC] Errore registrazione view pending: {e}")
+    """Disattivato per evitare registrazioni duplicate delle view iscrizioni."""
+    print("[DISABLED] register_pending_signup_views disattivato.")
+    return
 
 
 def _sync_signup_accept_db(req, request_id, club_name, handled_by, handled_by_name):
@@ -9602,8 +10178,26 @@ async def update_original_signup_message(request_id, req, action, club_name=None
 
 
 async def publish_signup_result_channels(req, action, club_name=None, handled_by_name=None, request_id=None, assigned_players=None, budget=None):
-    """Non invia messaggi extra: il messaggio staff originale viene solo aggiornato."""
-    return True
+    embed = build_signup_result_embed(
+        req,
+        action,
+        club_name=club_name,
+        handled_by_name=handled_by_name,
+        request_id=request_id,
+        assigned_players=assigned_players,
+        budget=budget
+    )
+
+    target_channel_id = SIGNUP_ACCEPT_CHANNEL_ID if action == "accepted" else SIGNUP_REJECT_CHANNEL_ID
+
+    try:
+        channel = bot.get_channel(int(target_channel_id))
+        if not channel:
+            channel = await bot.fetch_channel(int(target_channel_id))
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"[WEBSITE SYNC] Errore invio canale esito: {e}")
+
 
 async def apply_signup_accept_from_website(req, request_id, club_name, handled_by, handled_by_name):
     discord_id = str(req.get("discord_id") or "").strip()
@@ -9793,6 +10387,12 @@ async def process_website_signup_action(action_row):
 async def publish_website_signup_request_to_discord(req):
     request_id = int(req["id"])
     discord_id = str(req.get("discord_id") or "").strip()
+    discord_name = str(req.get("discord_name") or req.get("real_name") or discord_id or "Player")
+    real_name = str(req.get("real_name") or req.get("discord_name") or "-")
+    age = str(req.get("age") or "-")
+    platform = str(req.get("platform") or "-")
+    game_id = str(req.get("game_id") or req.get("psn_id") or req.get("ea_id") or "-")
+    preferred = str(req.get("preferred_clubs") or req.get("club_preferences") or "-")
 
     guild = bot.get_guild(int(GUILD_ID))
     member = await get_member_safe(guild, discord_id) if guild and discord_id else None
@@ -9807,20 +10407,65 @@ async def publish_website_signup_request_to_discord(req):
         except Exception as e:
             print(f"[WEBSITE REQUEST SYNC] Errore ruolo PRE ISCRITTO: {e}")
 
-    published = await publish_signup_request_once(request_id, guild, source="website")
-    if not published:
+    try:
+        staff_channel = bot.get_channel(int(SIGNUP_STAFF_CHANNEL_ID))
+        if not staff_channel:
+            staff_channel = await bot.fetch_channel(int(SIGNUP_STAFF_CHANNEL_ID))
+    except Exception as e:
+        print(f"[WEBSITE REQUEST SYNC] Canale staff non trovato: {e}")
         return False
 
+    embed = discord.Embed(
+        title="📩 Nuova richiesta iscrizione FC26",
+        description=f"Richiesta ID: **{request_id}**\nFonte: **sito web**",
+        color=discord.Color.orange()
+    )
+
     if discord_id:
-        await safe_dm_signup_result(
-            discord_id,
-            "📩 Richiesta iscrizione ricevuta",
-            (
-                "La tua richiesta di iscrizione a **BC FC** è stata ricevuta correttamente.\n"
-                "Lo staff la controllerà appena possibile."
-            ),
-            discord.Color.orange()
-        )
+        embed.add_field(name="Player Discord", value=f"<@{discord_id}>", inline=False)
+        embed.add_field(name="Discord ID", value=discord_id, inline=False)
+    else:
+        embed.add_field(name="Player Discord", value=discord_name, inline=False)
+
+    embed.add_field(name="Nome", value=real_name, inline=True)
+    embed.add_field(name="Età", value=age, inline=True)
+    embed.add_field(name="Piattaforma", value=platform, inline=True)
+    embed.add_field(name="ID PSN/Xbox/EA", value=game_id, inline=False)
+
+    if preferred and preferred != "-":
+        embed.add_field(name="Club preferiti", value=preferred, inline=False)
+
+    embed.set_footer(text="Lo staff può gestire questa richiesta da Discord o dal sito.")
+
+    staff_message = await staff_channel.send(embed=embed, view=SignupStaffView(request_id))
+
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE signup_requests
+            SET staff_message_id = %s,
+                staff_channel_id = %s,
+                signup_source = 'website',
+                source = 'website'
+            WHERE id = %s
+        """, (str(staff_message.id), str(staff_channel.id), request_id))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[WEBSITE REQUEST SYNC] Errore salvataggio staff_message_id: {e}")
+    finally:
+        conn.close()
+
+    await safe_dm_signup_result(
+        discord_id,
+        "📩 Richiesta iscrizione ricevuta",
+        (
+            "La tua richiesta di iscrizione a **BC FC** è stata ricevuta correttamente.\n"
+            "Lo staff la controllerà appena possibile."
+        ),
+        discord.Color.orange()
+    )
 
     print(f"[WEBSITE REQUEST SYNC] Richiesta sito #{request_id} pubblicata su Discord.")
     return True
@@ -9871,39 +10516,15 @@ def _fetch_all_player_activity_rows():
 
 
 async def process_website_signup_requests_loop():
-    await bot.wait_until_ready()
-    await asyncio.to_thread(ensure_website_signup_sync_tables)
-
-    while not bot.is_closed():
-        try:
-            rows = await asyncio.to_thread(_fetch_pending_website_signup_requests)
-            for row in rows:
-                try:
-                    await publish_website_signup_request_to_discord(row)
-                except Exception as e:
-                    print(f"[WEBSITE REQUEST SYNC] Errore pubblicazione richiesta #{row.get('id')}: {e}")
-        except Exception as e:
-            print(f"[WEBSITE REQUEST LOOP] Errore: {e}")
-
-        await asyncio.sleep(5)
+    """Disattivato: evitava doppie richieste e deadlock Supabase."""
+    print("[DISABLED] process_website_signup_requests_loop disattivato: uso solo flusso Discord/Supabase diretto.")
+    return
 
 
 async def process_website_signup_actions_loop():
-    await bot.wait_until_ready()
-    await asyncio.to_thread(ensure_website_signup_sync_tables)
-
-    while not bot.is_closed():
-        try:
-            rows = await asyncio.to_thread(_fetch_pending_website_signup_actions)
-            for row in rows:
-                try:
-                    await process_website_signup_action(row)
-                except Exception as e:
-                    print(f"[WEBSITE SIGNUP ACTION LOOP] Errore singola azione #{row.get('id')}: {e}")
-        except Exception as e:
-            print(f"[WEBSITE SIGNUP ACTION LOOP] Errore: {e}")
-
-        await asyncio.sleep(5)
+    """Disattivato: evitava doppie azioni e deadlock Supabase."""
+    print("[DISABLED] process_website_signup_actions_loop disattivato: gestione staff da Discord.")
+    return
 
 # ===========================================================
 # FINE WEBSITE/DISCORD SIGNUP SYNC PATCH v4
@@ -9917,6 +10538,7 @@ async def reset_league_roles_background(guild_id: int):
     if not guild:
         return
 
+    base_role = guild.get_role(int(BASE_ROLE_ID)) if BASE_ROLE_ID else None
     pre_role = guild.get_role(int(PRE_SIGNUP_ROLE_ID)) if PRE_SIGNUP_ROLE_ID else None
     registered_role = guild.get_role(int(REGISTERED_ROLE_ID)) if REGISTERED_ROLE_ID else None
 
@@ -9934,13 +10556,15 @@ async def reset_league_roles_background(guild_id: int):
             if registered_role and registered_role in member.roles:
                 roles_to_remove.append(registered_role)
 
-            if not roles_to_remove:
-                continue
-
             try:
-                await member.remove_roles(*roles_to_remove, reason="Reset totale competizione BC FC")
-                changed += 1
-                await asyncio.sleep(0.35)
+                if roles_to_remove:
+                    await member.remove_roles(*roles_to_remove, reason="Reset totale competizione BC FC")
+                    await asyncio.sleep(0.25)
+                if base_role and base_role not in member.roles:
+                    await member.add_roles(base_role, reason="Reset iscrizioni BC FC: ritorno a richiesta iscrizione")
+                    await asyncio.sleep(0.25)
+                if roles_to_remove or (base_role and base_role in member.roles):
+                    changed += 1
             except Exception:
                 failed += 1
                 await asyncio.sleep(1.5)
