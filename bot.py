@@ -10270,11 +10270,8 @@ async def risultato(interaction: discord.Interaction):
         embed = discord.Embed(
             title="⚽ Inserisci risultato",
             description=(
-                "Scegli la competizione a cui stai partecipando.
-
-"
-                "Poi selezioni la partita attiva e inserisci gol + marcatori.
-"
+                "Scegli la competizione a cui stai partecipando.\\n\\n"
+                "Poi selezioni la partita attiva e inserisci gol + marcatori.\\n"
                 "Formato marcatori: `Mbappe 3, Rodri 2`."
             ),
             color=discord.Color.blue(),
