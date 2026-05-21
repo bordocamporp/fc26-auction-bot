@@ -15,6 +15,7 @@ from card_generator import create_player_card
 
 load_dotenv()
 print("[BOOT] Avvio bot.py")
+print("[PATCH] Fix iscrizioni squadre reali: players.id::text e parametri stringa")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID", "1392747701308751943")
@@ -1335,8 +1336,8 @@ def sync_real_team_roster_to_manager(discord_id, club_name):
             UPDATE players
             SET owner_discord_id = %s,
                 sold_price = 0
-            WHERE id = %s
-        """, (discord_id, pid))
+            WHERE id::text = %s
+        """, (discord_id, str(pid)))
         assigned_count += 1
 
     # Crea/aggiorna manager
@@ -3682,7 +3683,7 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
             for p in players:
                 cur.execute(
                     "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id::text = %s",
-                    (str(member.id), 0, p["id"])
+                    (str(member.id), 0, str(p["id"]))
                 )
 
     cur.execute(
@@ -4818,7 +4819,7 @@ class SquadraRealeModal(discord.ui.Modal, title="Assegna squadra reale"):
         for p in players:
             cur.execute(
                 "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id::text = %s",
-                (str(member.id), 0, p["id"])
+                (str(member.id), 0, str(p["id"]))
             )
 
         cur.execute(
