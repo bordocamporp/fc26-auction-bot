@@ -1558,7 +1558,7 @@ async def get_open_auction_for_message(message_id=None):
             SELECT a.*, p.name AS player_name, p.id AS player_id, p.position AS player_position,
                    p.team AS player_team, p.overall AS player_overall
             FROM auctions a
-            JOIN players p ON p.id = a.player_id
+            JOIN players p ON p.id::text = a.player_id::text
             WHERE a.status = 'open'
               AND a.message_id = %s
             LIMIT 1
@@ -1574,7 +1574,7 @@ async def get_open_auction_for_message(message_id=None):
         SELECT a.*, p.name AS player_name, p.id AS player_id, p.position AS player_position,
                p.team AS player_team, p.overall AS player_overall
         FROM auctions a
-        JOIN players p ON p.id = a.player_id
+        JOIN players p ON p.id::text = a.player_id::text
         WHERE a.status = 'open'
         ORDER BY a.id DESC
         LIMIT 1
@@ -1657,7 +1657,7 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
     cur.execute("""
         SELECT a.*, p.*
         FROM auctions a
-        JOIN players p ON p.id = a.player_id
+        JOIN players p ON p.id::text = a.player_id::text
         WHERE a.id = %s
     """, (auction["id"],))
     updated = cur.fetchone()
@@ -5301,7 +5301,7 @@ async def start_auction_for_player(interaction: discord.Interaction, player_id: 
     cur.execute("""
         SELECT a.*, p.*
         FROM auctions a
-        JOIN players p ON p.id = a.player_id
+        JOIN players p ON p.id::text = a.player_id::text
         WHERE a.id = %s
     """, (auction_id,))
     auction_row = cur.fetchone()
@@ -5698,7 +5698,7 @@ async def run_auction_countdown(channel, auction_id: int, message):
         cur.execute("""
             SELECT a.*, p.*
             FROM auctions a
-            JOIN players p ON p.id = a.player_id
+            JOIN players p ON p.id::text = a.player_id::text
             WHERE a.id = %s AND a.status = 'open'
         """, (auction_id,))
         row = cur.fetchone()
@@ -5728,7 +5728,7 @@ async def close_auction(channel, auction_id: int, message=None):
     cur.execute("""
         SELECT a.*, p.name AS player_name, p.id AS player_id, p.position AS player_position
         FROM auctions a
-        JOIN players p ON p.id = a.player_id
+        JOIN players p ON p.id::text = a.player_id::text
         WHERE a.id = %s AND a.status = 'open'
     """, (auction_id,))
     auction = cur.fetchone()
@@ -6013,7 +6013,7 @@ async def asta_info(interaction: discord.Interaction):
     cur.execute("""
         SELECT a.*, p.name AS player_name, p.team, p.position, p.overall
         FROM auctions a
-        JOIN players p ON p.id = a.player_id
+        JOIN players p ON p.id::text = a.player_id::text
         WHERE a.status = 'open'
         ORDER BY a.id DESC
         LIMIT 1
