@@ -12,6 +12,8 @@ from discord import app_commands
 from dotenv import load_dotenv
 from db import connect, init_db, reset_auction_state
 from card_generator import create_player_card
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 load_dotenv()
 print("[BOOT] Avvio bot.py")
@@ -9630,7 +9632,7 @@ class ChampionshipCupSelectView(discord.ui.View):
         self.add_item(ChampionshipCupSelect(championships))
 
 def generator_championship_options():
-    conn = get_db_connection()
+    conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
     cur.execute("""
@@ -9655,10 +9657,10 @@ def generator_championship_options():
         )
 
     return options
-    
-@tree.command(name="genera_campionato", description="Staff: genera un campionato con calendario andata/ritorno")
-async def genera_campionato(interaction: discord.Interaction):
-    if not is_league_admin(interaction):
+
+
+@tree.command(name="genera_coppa_nazionale", description="Staff: genera una coppa nazionale dal campionato scelto")
+async def genera_coppa_nazionale(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
     await interaction.response.send_modal(CompetitionNameModal())
