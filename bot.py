@@ -7,9 +7,11 @@ from pathlib import Path
 from datetime import datetime, UTC
 from PIL import Image, ImageDraw, ImageFont
 import discord
+import psycopg2
 from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
+from psycopg2.extras import RealDictCursor
 from db import connect, init_db, reset_auction_state
 from card_generator import create_player_card
 
@@ -8977,7 +8979,7 @@ class GuidedCompetitionSelect(discord.ui.Select):
             description="Scegli la partita attiva da compilare.",
             color=discord.Color.blue(),
         )
-        await interaction.response.edit_message(embed=embed, view=GuidedMatchSelectView(competition_key, matches), content=None)
+        await interaction.followup.send(embed=embed, view=GuidedMatchSelectView(matches), ephemeral=True)
 
 
 class GuidedCompetitionView(discord.ui.View):
@@ -9708,6 +9710,542 @@ async def avvia_ritorno(interaction: discord.Interaction):
 
 # ================= FINE RISULTATI GUIDATI =================
 
+
+# ================= RISULTATI/CALENDARIO - FIX COMPLETO =================
+
+def db_url_value():
+    return (
+        globals().get("DATABASE_URL")
+        or os.getenv("DATABASE_URL")
+        or os.getenv("POSTGRES_URL")
+        or os.getenv("SUPABASE_DB_URL")
+    )
+
+def db_connect_safe():
+    # Il progetto usa già connect() dal file db.py: è la sorgente corretta.
+    try:
+        return connect()
+    except Exception:
+        url = db_url_value()
+        if not url:
+            raise RuntimeError("DATABASE_URL/POSTGRES_URL non configurato e connect() non disponibile.")
+        return psycopg2.connect(url)
+
+def row_get(row, key, default=None):
+    try:
+        return row.get(key, default)
+    except Exception:
+        try:
+            return row[key]
+        except Exception:
+            return default
+
+def ensure_results_calendar_tables():
+    conn = db_connect_safe()
+    cur = conn.cursor()
+
+    # Tabelle principali già usate dal sito.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS fixtures (
+        id BIGSERIAL PRIMARY KEY,
+        competition_name TEXT,
+        competition_type TEXT,
+        round TEXT,
+        leg TEXT,
+        home_user_id TEXT,
+        away_user_id TEXT,
+        home_club TEXT,
+        away_club TEXT,
+        home_goals INTEGER DEFAULT 0,
+        away_goals INTEGER DEFAULT 0,
+        played BOOLEAN DEFAULT FALSE,
+        active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    for sql in [
+        "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS competition_name TEXT",
+        "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS competition_type TEXT",
+        "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS round TEXT",
+        "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS leg TEXT",
+        "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS home_user_id TEXT",
+        "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS away_user_id TEXT",
+        "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS home_club TEXT",
+        "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS away_club TEXT",
+        "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS home_goals INTEGER DEFAULT 0",
+        "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS away_goals INTEGER DEFAULT 0",
+        "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS played BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE",
+        "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception as e:
+            print(f"[FIXTURES ALTER] {e}")
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS match_results (
+        id BIGSERIAL PRIMARY KEY,
+        source_table TEXT,
+        source_match_id TEXT,
+        competition_name TEXT,
+        competition_type TEXT,
+        round TEXT,
+        home_team TEXT,
+        away_team TEXT,
+        home_score INTEGER DEFAULT 0,
+        away_score INTEGER DEFAULT 0,
+        winner TEXT,
+        status TEXT DEFAULT 'played',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS goalscorers (
+        id BIGSERIAL PRIMARY KEY,
+        fixture_id BIGINT,
+        user_id TEXT,
+        club_name TEXT,
+        player_name TEXT,
+        goals INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS standings (
+        id BIGSERIAL PRIMARY KEY,
+        competition_name TEXT,
+        competition_type TEXT,
+        club_name TEXT,
+        logo_url TEXT,
+        played INTEGER DEFAULT 0,
+        wins INTEGER DEFAULT 0,
+        draws INTEGER DEFAULT 0,
+        losses INTEGER DEFAULT 0,
+        goals_for INTEGER DEFAULT 0,
+        goals_against INTEGER DEFAULT 0,
+        points INTEGER DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cup_matches (
+        id BIGSERIAL PRIMARY KEY,
+        source_table TEXT,
+        source_match_id TEXT,
+        competition_name TEXT,
+        round TEXT,
+        home_team TEXT,
+        away_team TEXT,
+        home_score INTEGER DEFAULT 0,
+        away_score INTEGER DEFAULT 0,
+        winner TEXT,
+        status TEXT DEFAULT 'played',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+def competition_group_from_type(value):
+    v = normalize_text(value or "")
+    if "nazionale" in v or ("coppa" in v and "europe" not in v):
+        return "Coppa Nazionale"
+    if "champions" in v or "europa" in v or "conference" in v or "europe" in v:
+        return "Coppe Europee"
+    return "Campionati"
+
+def get_active_leg_safe():
+    try:
+        return get_active_leg()
+    except Exception:
+        return "andata"
+
+def get_manager_club_for_user(discord_id):
+    conn = db_connect_safe()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT club_name FROM managers WHERE discord_id = %s LIMIT 1", (str(discord_id),))
+        row = cur.fetchone()
+        if row:
+            club = row_get(row, "club_name") or (row[0] if not hasattr(row, "get") else None)
+            if club:
+                return str(club)
+        cur.execute("SELECT team_name FROM real_team_assignments WHERE discord_id = %s LIMIT 1", (str(discord_id),))
+        row = cur.fetchone()
+        if row:
+            club = row_get(row, "team_name") or (row[0] if not hasattr(row, "get") else None)
+            if club:
+                return str(club)
+    finally:
+        conn.close()
+    return None
+
+def get_guided_competition_options(discord_id):
+    ensure_results_calendar_tables()
+    club = get_manager_club_for_user(discord_id)
+    active_leg = get_active_leg_safe()
+
+    conn = db_connect_safe()
+    cur = conn.cursor()
+    params = []
+    where = "played = FALSE AND COALESCE(active, TRUE) = TRUE"
+
+    if active_leg:
+        where += " AND (leg IS NULL OR LOWER(leg) = LOWER(%s) OR LOWER(leg) = 'unica')"
+        params.append(str(active_leg))
+
+    # Se il manager ha club, mostra solo sue partite. Se non lo troviamo, mostra comunque le attive.
+    if club:
+        where += " AND (LOWER(home_club) = LOWER(%s) OR LOWER(away_club) = LOWER(%s) OR home_user_id = %s OR away_user_id = %s)"
+        params.extend([club, club, str(discord_id), str(discord_id)])
+
+    cur.execute(f"""
+        SELECT competition_name, competition_type, COUNT(*) AS total
+        FROM fixtures
+        WHERE {where}
+        GROUP BY competition_name, competition_type
+        ORDER BY competition_type, competition_name
+    """, tuple(params))
+    rows = cur.fetchall()
+    conn.close()
+
+    options = []
+    used = set()
+    for r in rows:
+        cname = str(row_get(r, "competition_name", "") or "")
+        ctype = str(row_get(r, "competition_type", "") or "")
+        total = row_get(r, "total", 0)
+        if not cname:
+            continue
+        value = f"{ctype}|||{cname}"
+        if value in used:
+            continue
+        used.add(value)
+
+        group = competition_group_from_type(ctype or cname)
+        emoji = "🏆"
+        if group == "Coppa Nazionale":
+            emoji = "🇮🇹"
+        elif group == "Coppe Europee":
+            emoji = "🌍"
+
+        label = cname[:100]
+        desc = f"{group} • {total} partite attive"
+        options.append(discord.SelectOption(label=label, value=value[:100], description=desc[:100], emoji=emoji))
+
+    # Discord max 25 option.
+    return options[:25]
+
+def get_matches_for_competition(discord_id, competition_key):
+    ensure_results_calendar_tables()
+    parts = str(competition_key).split("|||", 1)
+    if len(parts) == 2:
+        ctype, cname = parts
+    else:
+        ctype, cname = "", competition_key
+
+    club = get_manager_club_for_user(discord_id)
+    active_leg = get_active_leg_safe()
+
+    conn = db_connect_safe()
+    cur = conn.cursor()
+
+    params = [cname]
+    where = "played = FALSE AND COALESCE(active, TRUE) = TRUE AND competition_name = %s"
+
+    if ctype:
+        where += " AND (competition_type = %s OR competition_type IS NULL)"
+        params.append(ctype)
+
+    if active_leg:
+        where += " AND (leg IS NULL OR LOWER(leg) = LOWER(%s) OR LOWER(leg) = 'unica')"
+        params.append(str(active_leg))
+
+    if club:
+        where += " AND (LOWER(home_club) = LOWER(%s) OR LOWER(away_club) = LOWER(%s) OR home_user_id = %s OR away_user_id = %s)"
+        params.extend([club, club, str(discord_id), str(discord_id)])
+
+    cur.execute(f"""
+        SELECT *
+        FROM fixtures
+        WHERE {where}
+        ORDER BY competition_type, competition_name, round, id
+        LIMIT 25
+    """, tuple(params))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def get_players_for_club_or_user(club_name=None, user_id=None):
+    conn = db_connect_safe()
+    cur = conn.cursor()
+    try:
+        if user_id:
+            cur.execute("""
+                SELECT id, name, position, overall
+                FROM players
+                WHERE owner_discord_id = %s
+                ORDER BY overall DESC NULLS LAST, name ASC
+                LIMIT 25
+            """, (str(user_id),))
+            rows = cur.fetchall()
+            if rows:
+                return rows
+
+        if club_name:
+            cur.execute("""
+                SELECT id, name, position, overall
+                FROM players
+                WHERE LOWER(team) = LOWER(%s)
+                ORDER BY overall DESC NULLS LAST, name ASC
+                LIMIT 25
+            """, (str(club_name),))
+            return cur.fetchall()
+    finally:
+        conn.close()
+    return []
+
+def upsert_standing_row(cur, competition_name, competition_type, club_name, gf, ga):
+    gf = safe_int(gf)
+    ga = safe_int(ga)
+    win = 1 if gf > ga else 0
+    draw = 1 if gf == ga else 0
+    loss = 1 if gf < ga else 0
+    pts = 3 if win else (1 if draw else 0)
+
+    cur.execute("""
+        SELECT id FROM standings
+        WHERE LOWER(competition_name) = LOWER(%s)
+          AND LOWER(competition_type) = LOWER(%s)
+          AND LOWER(club_name) = LOWER(%s)
+        LIMIT 1
+    """, (competition_name, competition_type, club_name))
+    existing = cur.fetchone()
+
+    if existing:
+        sid = row_get(existing, "id") or existing[0]
+        cur.execute("""
+            UPDATE standings
+            SET played = COALESCE(played,0) + 1,
+                wins = COALESCE(wins,0) + %s,
+                draws = COALESCE(draws,0) + %s,
+                losses = COALESCE(losses,0) + %s,
+                goals_for = COALESCE(goals_for,0) + %s,
+                goals_against = COALESCE(goals_against,0) + %s,
+                points = COALESCE(points,0) + %s,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """, (win, draw, loss, gf, ga, pts, sid))
+    else:
+        cur.execute("""
+            INSERT INTO standings (
+                competition_name, competition_type, club_name,
+                played, wins, draws, losses, goals_for, goals_against, points, updated_at
+            )
+            VALUES (%s,%s,%s,1,%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP)
+        """, (competition_name, competition_type, club_name, win, draw, loss, gf, ga, pts))
+
+def save_fixture_result_and_sync(fixture_id, home_goals, away_goals, home_scorers=None, away_scorers=None):
+    ensure_results_calendar_tables()
+    home_scorers = home_scorers or []
+    away_scorers = away_scorers or []
+
+    conn = db_connect_safe()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT * FROM fixtures WHERE id = %s LIMIT 1", (str(fixture_id),))
+        fixture = cur.fetchone()
+        if not fixture:
+            raise RuntimeError("Partita non trovata.")
+
+        competition_name = row_get(fixture, "competition_name", "")
+        competition_type = row_get(fixture, "competition_type", "")
+        round_name = row_get(fixture, "round", "")
+        home_club = row_get(fixture, "home_club", "")
+        away_club = row_get(fixture, "away_club", "")
+        home_user = row_get(fixture, "home_user_id", "")
+        away_user = row_get(fixture, "away_user_id", "")
+
+        hg = safe_int(home_goals)
+        ag = safe_int(away_goals)
+        winner = home_club if hg > ag else (away_club if ag > hg else "Pareggio")
+
+        cur.execute("""
+            UPDATE fixtures
+            SET home_goals = %s,
+                away_goals = %s,
+                played = TRUE,
+                active = FALSE,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """, (hg, ag, str(fixture_id)))
+
+        cur.execute("""
+            INSERT INTO match_results (
+                source_table, source_match_id, competition_name, competition_type, round,
+                home_team, away_team, home_score, away_score, winner, status, created_at, updated_at
+            )
+            VALUES ('fixtures', %s, %s, %s, %s, %s, %s, %s, %s, %s, 'played', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """, (str(fixture_id), competition_name, competition_type, round_name, home_club, away_club, hg, ag, winner))
+
+        group = competition_group_from_type(competition_type or competition_name)
+        # Campionati + gironi europei aggiornano standings. Coppa nazionale/tabellone aggiorna cup_matches.
+        if group == "Campionati" or (group == "Coppe Europee" and "girone" in normalize_text(round_name)):
+            upsert_standing_row(cur, competition_name, competition_type, home_club, hg, ag)
+            upsert_standing_row(cur, competition_name, competition_type, away_club, ag, hg)
+        else:
+            cur.execute("""
+                INSERT INTO cup_matches (
+                    source_table, source_match_id, competition_name, round,
+                    home_team, away_team, home_score, away_score, winner, status, created_at, updated_at
+                )
+                VALUES ('fixtures', %s, %s, %s, %s, %s, %s, %s, %s, 'played', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (str(fixture_id), competition_name, round_name, home_club, away_club, hg, ag, winner))
+
+        cur.execute("DELETE FROM goalscorers WHERE fixture_id = %s", (str(fixture_id),))
+
+        for name, goals in home_scorers:
+            cur.execute("""
+                INSERT INTO goalscorers (fixture_id, user_id, club_name, player_name, goals)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (str(fixture_id), str(home_user or ""), home_club, str(name), safe_int(goals, 1)))
+
+        for name, goals in away_scorers:
+            cur.execute("""
+                INSERT INTO goalscorers (fixture_id, user_id, club_name, player_name, goals)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (str(fixture_id), str(away_user or ""), away_club, str(name), safe_int(goals, 1)))
+
+        conn.commit()
+        return fixture
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def parse_scorers_text(raw):
+    # Formato: "Mbappe 3, Rodri 2" oppure "Mbappe, Rodri"
+    results = []
+    for part in str(raw or "").split(","):
+        item = part.strip()
+        if not item:
+            continue
+        pieces = item.rsplit(" ", 1)
+        if len(pieces) == 2 and pieces[1].strip().isdigit():
+            name = pieces[0].strip()
+            goals = int(pieces[1].strip())
+        else:
+            name = item
+            goals = 1
+        if name:
+            results.append((name, max(1, goals)))
+    return results
+
+class GuidedMatchResultModal(discord.ui.Modal, title="Inserisci risultato"):
+    home_goals = discord.ui.TextInput(label="Gol casa", placeholder="Es: 2", required=True, max_length=2)
+    away_goals = discord.ui.TextInput(label="Gol trasferta", placeholder="Es: 1", required=True, max_length=2)
+    home_scorers = discord.ui.TextInput(label="Marcatori casa", placeholder="Es: Mbappe 2, Rodri 1", required=False, max_length=300)
+    away_scorers = discord.ui.TextInput(label="Marcatori trasferta", placeholder="Es: Lautaro 1", required=False, max_length=300)
+
+    def __init__(self, fixture_id):
+        super().__init__()
+        self.fixture_id = fixture_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await safe_defer(interaction, ephemeral=True, thinking=True)
+        try:
+            fixture = save_fixture_result_and_sync(
+                self.fixture_id,
+                self.home_goals.value,
+                self.away_goals.value,
+                parse_scorers_text(self.home_scorers.value),
+                parse_scorers_text(self.away_scorers.value),
+            )
+
+            await interaction.followup.send(
+                (
+                    "✅ Risultato salvato e sincronizzato col sito.\\n"
+                    f"**{row_get(fixture, 'home_club')} {self.home_goals.value} - {self.away_goals.value} {row_get(fixture, 'away_club')}**"
+                ),
+                ephemeral=True
+            )
+        except Exception as e:
+            print(f"[RESULT MODAL ERROR] {type(e).__name__}: {e}")
+            await interaction.followup.send(f"❌ Errore salvataggio risultato: `{type(e).__name__}`", ephemeral=True)
+
+class GuidedMatchSelect(discord.ui.Select):
+    def __init__(self, matches):
+        options = []
+        for m in matches[:25]:
+            mid = str(row_get(m, "id"))
+            home = str(row_get(m, "home_club", "Casa"))
+            away = str(row_get(m, "away_club", "Trasferta"))
+            round_name = str(row_get(m, "round", "") or "")
+            leg = str(row_get(m, "leg", "") or "")
+            label = f"{home} vs {away}"[:100]
+            desc = f"{round_name} {leg}".strip()[:100]
+            options.append(discord.SelectOption(label=label, value=mid, description=desc or "Partita attiva"))
+        if not options:
+            options = [discord.SelectOption(label="Nessuna partita disponibile", value="none", description="Lo staff deve generare/avviare le partite")]
+        super().__init__(placeholder="Scegli la partita...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "none":
+            await interaction.response.send_message("❌ Nessuna partita disponibile.", ephemeral=True)
+            return
+        await interaction.response.send_modal(GuidedMatchResultModal(self.values[0]))
+
+class GuidedMatchSelectView(discord.ui.View):
+    def __init__(self, matches):
+        super().__init__(timeout=300)
+        self.add_item(GuidedMatchSelect(matches))
+
+class GuidedCompetitionSelect(discord.ui.Select):
+    def __init__(self, options):
+        super().__init__(placeholder="Scegli la competizione...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            matches = get_matches_for_competition(interaction.user.id, self.values[0])
+            if not matches:
+                await interaction.followup.send("❌ Non ci sono partite attive per questa competizione.", ephemeral=True)
+                return
+
+            embed = discord.Embed(
+                title="📅 Scegli la partita",
+                description="Seleziona la partita attiva per inserire risultato e marcatori.",
+                color=discord.Color.green()
+            )
+            await interaction.followup.send(embed=embed, view=GuidedMatchSelectView(matches), ephemeral=True)
+        except Exception as e:
+            print(f"[GUIDED COMPETITION CALLBACK ERROR] {type(e).__name__}: {e}")
+            await interaction.followup.send(f"❌ Errore: `{type(e).__name__}`", ephemeral=True)
+
+class GuidedCompetitionView(discord.ui.View):
+    def __init__(self, *args):
+        super().__init__(timeout=300)
+        # compatibilità: GuidedCompetitionView(options) oppure GuidedCompetitionView(user_id, options)
+        if len(args) == 1:
+            options = args[0]
+        else:
+            options = args[1]
+        self.add_item(GuidedCompetitionSelect(options))
+
+# ========================================================================
+
 @tree.command(name="risultato", description="Inserisci un risultato guidato: competizione, partita, gol e marcatori")
 async def risultato(interaction: discord.Interaction):
     await safe_defer(interaction, ephemeral=True, thinking=True)
@@ -9724,7 +10262,7 @@ async def risultato(interaction: discord.Interaction):
 
         if not options:
             await interaction.followup.send(
-                "❌ Non hai partite attive da inserire. Lo staff deve prima usare `/genera_campionato`, `/genera_coppa_nazionale` o `/genera_coppa_europea`, poi `/avvia_andata` o `/avvia_ritorno`.",
+                "❌ Non hai partite attive da inserire. Lo staff deve prima generare le competizioni e usare `/avvia_andata` o `/avvia_ritorno`.",
                 ephemeral=True
             )
             return
@@ -9732,13 +10270,16 @@ async def risultato(interaction: discord.Interaction):
         embed = discord.Embed(
             title="⚽ Inserisci risultato",
             description=(
-                "Scegli la competizione a cui stai partecipando.\\n\\n"
-                "Poi selezioni la partita attiva e inserisci gol + marcatori.\\n"
-                "Formato marcatori consigliato: `Mbappe 3, Rodri 2`."
+                "Scegli la competizione a cui stai partecipando.
+
+"
+                "Poi selezioni la partita attiva e inserisci gol + marcatori.
+"
+                "Formato marcatori: `Mbappe 3, Rodri 2`."
             ),
             color=discord.Color.blue(),
         )
-        embed.set_footer(text=f"Fase campionato attiva: {get_active_leg().upper()}")
+        embed.set_footer(text=f"Fase attiva: {get_active_leg_safe().upper()}")
 
         await interaction.followup.send(
             embed=embed,
