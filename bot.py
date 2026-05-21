@@ -9924,27 +9924,14 @@ async def cerca_testo_autocomplete(interaction: discord.Interaction, current: st
         conn = connect()
         cur = conn.cursor()
 
-        # ================= CLUB: STEP 1, CAMPIONATI =================
+        # ================= CLUB: STEP 1, SOLO CAMPIONATI =================
         if str(tipo_value) == "club":
-            # Se l'utente ha già scelto un campionato nello stesso campo, mostra i club.
+            # IMPORTANTE: Discord consente massimo 25 scelte in autocomplete.
+            # Per non mostrare solo i primi 25 club, qui mostriamo SEMPRE e SOLO i campionati.
+            # Dopo aver selezionato un campionato, il comando apre un menu paginato con i club.
             if current_clean.startswith(LEAGUE_PREFIX):
-                league = current_clean[len(LEAGUE_PREFIX):].strip()
-                if league:
-                    cur.execute("""
-                        SELECT name, assigned_to
-                        FROM fc26_clubs
-                        WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
-                        ORDER BY name ASC
-                        LIMIT 25
-                    """, (league,))
-                    rows = cur.fetchall()
-                    return [
-                        app_commands.Choice(
-                            name=_choice_label(f"{_row_get(r, 'name')} • {'assegnato' if _row_get(r, 'assigned_to') else 'libero'}"),
-                            value=str(_row_get(r, 'name'))[:100]
-                        )
-                        for r in rows[:25]
-                    ]
+                current_clean = current_clean[len(LEAGUE_PREFIX):].strip()
+                like = f"%{current_clean.lower()}%"
 
             # Mostra campionati, non club, così non perdi club oltre i primi 25.
             if current_clean:
@@ -10062,7 +10049,6 @@ def _get_clubs_for_league(league_name: str):
             FROM fc26_clubs
             WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
             ORDER BY name ASC
-            LIMIT 25
         """, (str(league_name),))
         rows = cur.fetchall()
     except Exception:
@@ -10075,7 +10061,6 @@ def _get_clubs_for_league(league_name: str):
             WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
               AND team IS NOT NULL AND team <> ''
             ORDER BY team ASC
-            LIMIT 25
         """, (str(league_name),))
         rows = cur.fetchall()
     conn.close()
@@ -10130,10 +10115,18 @@ def _build_club_players_embed(club_name: str):
 
 
 class ClubSearchSelect(discord.ui.Select):
-    def __init__(self, league_name: str, clubs):
+    def __init__(self, view_ref, league_name: str, clubs, page: int = 0):
+        self.view_ref = view_ref
         self.league_name = league_name
+        self.clubs = list(clubs or [])
+        self.page = max(0, int(page or 0))
+
+        start = self.page * 25
+        end = start + 25
+        page_rows = self.clubs[start:end]
+
         options = []
-        for r in clubs[:25]:
+        for r in page_rows:
             name = str(_row_get(r, "name", "") or "").strip()
             if not name:
                 continue
@@ -10147,8 +10140,9 @@ class ClubSearchSelect(discord.ui.Select):
         if not options:
             options = [discord.SelectOption(label="Nessun club trovato", value="__none__")]
 
+        total_pages = max(1, (len(self.clubs) + 24) // 25)
         super().__init__(
-            placeholder=f"Scegli club in {league_name}",
+            placeholder=f"Scegli club in {league_name} • pagina {self.page + 1}/{total_pages}",
             min_values=1,
             max_values=1,
             options=options
@@ -10173,15 +10167,57 @@ class ClubSearchSelect(discord.ui.Select):
 
 
 class ClubSearchView(discord.ui.View):
-    def __init__(self, league_name: str, clubs):
+    def __init__(self, league_name: str, clubs, page: int = 0):
         super().__init__(timeout=180)
-        self.add_item(ClubSearchSelect(league_name, clubs))
+        self.league_name = league_name
+        self.clubs = list(clubs or [])
+        self.page = max(0, int(page or 0))
+        self.total_pages = max(1, (len(self.clubs) + 24) // 25)
+        self._render_items()
+
+    def _render_items(self):
+        self.clear_items()
+        self.add_item(ClubSearchSelect(self, self.league_name, self.clubs, self.page))
+
+        prev_button = discord.ui.Button(
+            label="⬅️ Indietro",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.page <= 0
+        )
+        next_button = discord.ui.Button(
+            label="Avanti ➡️",
+            style=discord.ButtonStyle.primary,
+            disabled=self.page >= self.total_pages - 1
+        )
+
+        async def prev_callback(interaction: discord.Interaction):
+            self.page = max(0, self.page - 1)
+            self._render_items()
+            await interaction.response.edit_message(
+                content=f"Campionato selezionato: **{self.league_name}**\nScegli il club dal menu. Pagina **{self.page + 1}/{self.total_pages}**.",
+                view=self
+            )
+
+        async def next_callback(interaction: discord.Interaction):
+            self.page = min(self.total_pages - 1, self.page + 1)
+            self._render_items()
+            await interaction.response.edit_message(
+                content=f"Campionato selezionato: **{self.league_name}**\nScegli il club dal menu. Pagina **{self.page + 1}/{self.total_pages}**.",
+                view=self
+            )
+
+        prev_button.callback = prev_callback
+        next_button.callback = next_callback
+
+        if self.total_pages > 1:
+            self.add_item(prev_button)
+            self.add_item(next_button)
 
 
 @tree.command(name="cerca", description="Cerca giocatori per nome oppure per club")
 @app_commands.describe(
     tipo="Scegli se cercare per nome giocatore o per club",
-    testo="Per giocatore: nome. Per club: scegli prima il campionato dal menu.",
+    testo="Giocatore: scrivi nome. Club: scegli un campionato dal menu, poi scegli il club.",
 )
 @app_commands.choices(tipo=[
     app_commands.Choice(name="Nome giocatore", value="player"),
@@ -10203,15 +10239,11 @@ async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str]
         if not clubs:
             await interaction.followup.send(f"❌ Nessun club trovato per il campionato **{league_name}**.", ephemeral=True)
             return
-        embed = discord.Embed(
-            title="Ricerca club",
-            description=(
-                f"Campionato selezionato: **{league_name}**\n"
-                "Ora scegli il club dal menu qui sotto."
-            ),
-            color=discord.Color.blurple()
+        await interaction.followup.send(
+            content=f"Campionato selezionato: **{league_name}**\nScegli il club dal menu. Pagina **1/{max(1, (len(clubs) + 24) // 25)}**.",
+            view=ClubSearchView(league_name, clubs),
+            ephemeral=True
         )
-        await interaction.followup.send(embed=embed, view=ClubSearchView(league_name, clubs), ephemeral=True)
         return
 
     query = normalize_text(testo).strip()
@@ -10321,7 +10353,7 @@ async def cerca_club(interaction: discord.Interaction, campionato: str, club: st
 @tree.command(name="cerc", description="Alias rapido: cerca giocatori per nome oppure club")
 @app_commands.describe(
     tipo="Scegli se cercare per nome giocatore o per club",
-    testo="Per giocatore: nome. Per club: scegli prima il campionato dal menu."
+    testo="Giocatore: scrivi nome. Club: scegli un campionato dal menu, poi scegli il club."
 )
 @app_commands.choices(tipo=[
     app_commands.Choice(name="Nome giocatore", value="player"),
