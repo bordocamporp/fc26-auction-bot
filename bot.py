@@ -9629,7 +9629,33 @@ class ChampionshipCupSelectView(discord.ui.View):
         super().__init__(timeout=300)
         self.add_item(ChampionshipCupSelect(championships))
 
+def generator_championship_options():
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
 
+    cur.execute("""
+        SELECT id, name
+        FROM championships
+        ORDER BY id DESC
+    """)
+
+    data = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    options = []
+
+    for row in data:
+        options.append(
+            discord.SelectOption(
+                label=row["name"],
+                value=str(row["id"])
+            )
+        )
+
+    return options
+    
 @tree.command(name="genera_campionato", description="Staff: genera un campionato con calendario andata/ritorno")
 async def genera_campionato(interaction: discord.Interaction):
     if not is_league_admin(interaction):
