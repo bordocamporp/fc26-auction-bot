@@ -2757,7 +2757,10 @@ async def risultati_lista(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Errore risultati: `{type(e).__name__}`", ephemeral=True)
 
 
-bot.run()
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN non configurato nelle variabili ambiente.")
+
+bot.run(TOKEN)
 # e quindi non venivano mai caricati prima dell'avvio del bot.
 def _fetch_all_player_activity_rows():
     """Legge i dati attività giocatori da Supabase.
