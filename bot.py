@@ -9640,13 +9640,22 @@ async def genera_campionato(interaction: discord.Interaction):
 
 @tree.command(name="genera_coppa_nazionale", description="Staff: genera una coppa nazionale dal campionato scelto")
 async def genera_coppa_nazionale(interaction: discord.Interaction):
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
     if not is_league_admin(interaction):
-        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        await interaction.followup.send(
+            "❌ Solo lo staff può usare questo comando.",
+            ephemeral=True
+        )
         return
+
     ensure_competition_generator_tables()
-    await interaction.response.send_message("🇮🇹 Scegli il campionato: la coppa userà solo gli iscritti di quel campionato.", view=ChampionshipCupSelectView(generator_championship_choices()), ephemeral=True)
 
-
+    await interaction.followup.send(
+        "🏆 Scegli il campionato: la coppa userà solo gli iscritti di quel campionato.",
+        view=ChampionshipCupSelectView(generator_championship_options()),
+        ephemeral=True
+    )
 @tree.command(name="genera_coppa_europea", description="Staff: genera Champions/Europa/Conference con gironi")
 async def genera_coppa_europea(interaction: discord.Interaction):
     if not is_league_admin(interaction):
