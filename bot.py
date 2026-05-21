@@ -7650,6 +7650,22 @@ async def dashboard_admin(interaction: discord.Interaction):
 def active_championship():
     conn = connect()
     cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT *
+            FROM championships
+            WHERE status = 'active'
+              AND LOWER(COALESCE(type, 'campionato')) IN ('campionato', 'campionati', 'league')
+            ORDER BY id DESC
+            LIMIT 1
+        """)
+        row = cur.fetchone()
+        if row:
+            conn.close()
+            return row
+    except Exception:
+        pass
+
     cur.execute("SELECT * FROM championships WHERE status = 'active' ORDER BY id DESC LIMIT 1")
     row = cur.fetchone()
     conn.close()
@@ -8898,22 +8914,17 @@ def get_available_matches_for_competition(discord_id, competition_key):
         conn.close()
         return []
 
-    champ = active_championship()
-    if not champ:
-        conn.close()
-        return []
-
     cur.execute("""
         SELECT m.*, g.name AS group_name, c.name AS competition_name
         FROM championship_matches m
         LEFT JOIN championship_groups g ON g.id = m.group_id
         LEFT JOIN championships c ON c.id = m.championship_id
         WHERE m.status = 'pending'
+          AND COALESCE(c.status, 'active') = 'active'
           AND (m.home_id = %s OR m.away_id = %s)
-          AND m.championship_id = %s
         ORDER BY m.round_number ASC, m.id ASC
-        LIMIT 50
-    """, (discord_id, discord_id, champ["id"]))
+        LIMIT 100
+    """, (discord_id, discord_id))
     rows = cur.fetchall()
     conn.close()
 
@@ -9271,6 +9282,381 @@ class GuidedResultConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="⚠️ Risultato contestato. Staff richiesto.", embed=embed, view=None)
 
 
+
+
+# ================= GENERATORI COMPETIZIONI STAFF =================
+# Comandi aggiunti: /genera_campionato, /genera_coppa_nazionale, /genera_coppa_europea
+
+def ensure_competition_generator_tables():
+    conn = connect()
+    cur = conn.cursor()
+    for sql in [
+        "ALTER TABLE championships ADD COLUMN IF NOT EXISTS type TEXT DEFAULT 'campionato'",
+        "ALTER TABLE championships ADD COLUMN IF NOT EXISTS participants INTEGER DEFAULT 0",
+        "ALTER TABLE championships ADD COLUMN IF NOT EXISTS european_pass INTEGER DEFAULT 0",
+        "ALTER TABLE championship_players ADD COLUMN IF NOT EXISTS club_name TEXT",
+        "ALTER TABLE championship_matches ADD COLUMN IF NOT EXISTS leg TEXT DEFAULT 'andata'",
+        "ALTER TABLE national_cups ADD COLUMN IF NOT EXISTS parent_championship_id INTEGER",
+        "ALTER TABLE national_cup_matches ADD COLUMN IF NOT EXISTS leg TEXT DEFAULT 'andata'",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS competition_name TEXT",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS competition_type TEXT",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS club_name TEXT",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS played INTEGER DEFAULT 0",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS wins INTEGER DEFAULT 0",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS draws INTEGER DEFAULT 0",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS losses INTEGER DEFAULT 0",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS goals_for INTEGER DEFAULT 0",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS goals_against INTEGER DEFAULT 0",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS points INTEGER DEFAULT 0",
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception as e:
+            print(f"[GENERATOR TABLES] {e}")
+    conn.commit()
+    conn.close()
+
+
+def generator_fetch_participants():
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT discord_id,
+               COALESCE(NULLIF(manager_name, ''), NULLIF(name, ''), discord_id) AS display_name,
+               COALESCE(NULLIF(club_name, ''), NULLIF(name, ''), discord_id) AS club_name
+        FROM managers
+        WHERE discord_id IS NOT NULL
+        ORDER BY club_name ASC, display_name ASC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    cleaned = []
+    seen = set()
+    for r in rows:
+        did = str(r.get("discord_id") or "").strip()
+        if not did or did in seen:
+            continue
+        seen.add(did)
+        cleaned.append({"discord_id": did, "display_name": str(r.get("display_name") or did), "club_name": str(r.get("club_name") or r.get("display_name") or did)})
+    return cleaned
+
+
+def generator_round_robin(teams, double_round=True):
+    teams = list(teams)
+    if len(teams) < 2:
+        return []
+    if len(teams) % 2 == 1:
+        teams.append(None)
+    n = len(teams)
+    arr = list(teams)
+    rounds = []
+    for rnd in range(n - 1):
+        pairs = []
+        for i in range(n // 2):
+            a = arr[i]
+            b = arr[n - 1 - i]
+            if a is None or b is None:
+                continue
+            home, away = (a, b) if (rnd + i) % 2 == 0 else (b, a)
+            pairs.append((home, away))
+        rounds.append(pairs)
+        arr = [arr[0]] + [arr[-1]] + arr[1:-1]
+    if double_round:
+        rounds = rounds + [[(away, home) for home, away in pairs] for pairs in rounds]
+    return rounds
+
+
+def generator_insert_initial_standings(cur, competition_name, competition_type, teams):
+    try:
+        cur.execute("DELETE FROM standings WHERE competition_name = %s AND competition_type = %s", (competition_name, competition_type))
+    except Exception:
+        pass
+    for team in teams:
+        cur.execute("""
+            INSERT INTO standings
+            (competition_name, competition_type, club_name, played, wins, draws, losses, goals_for, goals_against, points)
+            VALUES (%s, %s, %s, 0, 0, 0, 0, 0, 0, 0)
+        """, (competition_name, competition_type, team["club_name"]))
+
+
+def generator_insert_championship(name, teams, *, competition_type="campionato", group_count=1, teams_per_group=0, european_pass=0):
+    ensure_competition_generator_tables()
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO championships (name, status, group_count, teams_per_group, type, participants, european_pass)
+        VALUES (%s, 'active', %s, %s, %s, %s, %s)
+        RETURNING id
+    """, (name, group_count, teams_per_group or len(teams), competition_type, len(teams), european_pass))
+    championship_id = cur.fetchone()["id"]
+    if group_count <= 1:
+        grouped = [("Girone Unico", teams)]
+    else:
+        shuffled = list(teams)
+        random.shuffle(shuffled)
+        grouped = [(f"Girone {chr(65+i)}", shuffled[i::group_count]) for i in range(group_count)]
+    groups = []
+    for group_name, group_teams in grouped:
+        cur.execute("INSERT INTO championship_groups (championship_id, name) VALUES (%s, %s) RETURNING id", (championship_id, group_name))
+        group_id = cur.fetchone()["id"]
+        groups.append((group_id, group_name, group_teams))
+        for t in group_teams:
+            cur.execute("""
+                INSERT INTO championship_players (championship_id, group_id, discord_id, display_name, club_name)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (championship_id, group_id, t["discord_id"], t["display_name"], t["club_name"]))
+        rounds = generator_round_robin(group_teams, double_round=True)
+        first_leg_last = len(rounds) // 2
+        for round_idx, pairs in enumerate(rounds, start=1):
+            leg = "andata" if round_idx <= first_leg_last else "ritorno"
+            for home, away in pairs:
+                cur.execute("""
+                    INSERT INTO championship_matches
+                    (championship_id, group_id, round_number, home_id, away_id, home_name, away_name, status, leg)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s)
+                """, (championship_id, group_id, round_idx, home["discord_id"], away["discord_id"], home["club_name"], away["club_name"], leg))
+    if competition_type == "campionato":
+        generator_insert_initial_standings(cur, name, "Campionati", teams)
+    elif competition_type == "europea":
+        generator_insert_initial_standings(cur, name, "Coppe Europee", teams)
+    conn.commit()
+    conn.close()
+    return championship_id, groups
+
+
+def generator_create_national_cup(championship_id):
+    ensure_competition_generator_tables()
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM championships WHERE id = %s", (championship_id,))
+    champ = cur.fetchone()
+    if not champ:
+        conn.close()
+        raise ValueError("Campionato non trovato")
+    cur.execute("""
+        SELECT discord_id, COALESCE(NULLIF(club_name, ''), display_name, discord_id) AS club_name, COALESCE(display_name, discord_id) AS display_name
+        FROM championship_players
+        WHERE championship_id = %s
+        ORDER BY id ASC
+    """, (championship_id,))
+    rows = cur.fetchall()
+    teams = []
+    seen = set()
+    for r in rows:
+        did = str(r.get("discord_id") or "").strip()
+        if did and did not in seen:
+            seen.add(did)
+            teams.append({"discord_id": did, "display_name": str(r.get("display_name") or did), "club_name": str(r.get("club_name") or r.get("display_name") or did)})
+    if len(teams) < 2:
+        conn.close()
+        raise ValueError("Servono almeno 2 squadre nel campionato scelto")
+    cup_name = f"Coppa Nazionale - {champ['name']}"
+    cur.execute("""
+        INSERT INTO national_cups (championship_id, parent_championship_id, name, status)
+        VALUES (%s, %s, %s, 'active')
+        RETURNING id
+    """, (championship_id, championship_id, cup_name))
+    cup_id = cur.fetchone()["id"]
+    random.shuffle(teams)
+    matches = 0
+    for i in range(0, len(teams) - 1, 2):
+        home, away = teams[i], teams[i + 1]
+        cur.execute("""
+            INSERT INTO national_cup_matches (cup_id, round_number, home_id, away_id, home_name, away_name, status, leg)
+            VALUES (%s, 1, %s, %s, %s, %s, 'pending', 'andata')
+        """, (cup_id, home["discord_id"], away["discord_id"], home["club_name"], away["club_name"]))
+        matches += 1
+    generator_insert_initial_standings(cur, cup_name, "Coppa Nazionale", teams)
+    conn.commit()
+    conn.close()
+    return cup_id, cup_name, len(teams), matches
+
+
+def generator_championship_choices():
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, name, COALESCE(type, 'campionato') AS type
+        FROM championships
+        WHERE COALESCE(status, 'active') = 'active'
+        ORDER BY id DESC
+        LIMIT 25
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+class CompetitionNameModal(discord.ui.Modal, title="Genera Campionato"):
+    nome = discord.ui.TextInput(label="Nome campionato", placeholder="Esempio: Serie A", required=True, max_length=80)
+    async def on_submit(self, interaction: discord.Interaction):
+        participants = generator_fetch_participants()
+        if len(participants) < 2:
+            await interaction.response.send_message("❌ Servono almeno 2 manager con club assegnato.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"🏆 **{self.nome.value}**\nSeleziona i partecipanti. Puoi cambiare pagina se sono più di 25.", view=PagedParticipantSelectView("campionato", str(self.nome.value), participants), ephemeral=True)
+
+
+class EuropeanCupModal(discord.ui.Modal, title="Genera Coppa Europea"):
+    nome = discord.ui.TextInput(label="Nome competizione", placeholder="Champions League / Europa League / Conference League", required=True, max_length=80)
+    partecipanti = discord.ui.TextInput(label="Numero partecipanti", placeholder="Esempio: 32", required=True, max_length=3)
+    gironi = discord.ui.TextInput(label="Numero gironi", placeholder="Esempio: 8", required=True, max_length=2)
+    passano = discord.ui.TextInput(label="Quante squadre passano per girone", placeholder="Esempio: 2", required=True, max_length=2)
+    async def on_submit(self, interaction: discord.Interaction):
+        total, groups, advance = safe_int(self.partecipanti.value), safe_int(self.gironi.value), safe_int(self.passano.value)
+        if total < 2 or groups < 1 or advance < 1:
+            await interaction.response.send_message("❌ Numeri non validi.", ephemeral=True)
+            return
+        participants = generator_fetch_participants()
+        if len(participants) < total:
+            await interaction.response.send_message(f"❌ Hai chiesto {total} partecipanti ma disponibili sono {len(participants)}.", ephemeral=True)
+            return
+        payload = f"{self.nome.value}||{total}||{groups}||{advance}"
+        await interaction.response.send_message(f"🌍 **{self.nome.value}**\nSeleziona **{total}** partecipanti. Se sono più di 25 usa le pagine.", view=PagedParticipantSelectView("europea", payload, participants), ephemeral=True)
+
+
+class PagedParticipantSelect(discord.ui.Select):
+    def __init__(self, parent):
+        self.parent_view = parent
+        start = parent.page * 25
+        page_items = parent.participants[start:start + 25]
+        options = []
+        for p in page_items:
+            selected = "✅ " if p["discord_id"] in parent.selected else ""
+            options.append(discord.SelectOption(label=f"{selected}{p['club_name']}"[:100], value=p["discord_id"], description=f"@{p['display_name']}"[:100]))
+        if not options:
+            options = [discord.SelectOption(label="Nessun partecipante", value="none")]
+        super().__init__(placeholder=f"Partecipanti pagina {parent.page + 1}/{parent.max_page + 1}", min_values=0, max_values=min(25, len(options)), options=options)
+    async def callback(self, interaction: discord.Interaction):
+        if "none" in self.values:
+            await interaction.response.defer()
+            return
+        for value in self.values:
+            if value in self.parent_view.selected:
+                self.parent_view.selected.remove(value)
+            else:
+                self.parent_view.selected.add(value)
+        await self.parent_view.refresh(interaction)
+
+
+class PagedParticipantSelectView(discord.ui.View):
+    def __init__(self, mode, payload, participants):
+        super().__init__(timeout=900)
+        self.mode, self.payload, self.participants = mode, payload, participants
+        self.selected = set()
+        self.page = 0
+        self.max_page = max(0, (len(participants) - 1) // 25)
+        self.rebuild()
+    def rebuild(self):
+        self.clear_items()
+        self.add_item(PagedParticipantSelect(self))
+        self.add_item(PrevPageButton())
+        self.add_item(NextPageButton())
+        self.add_item(GenerateCompetitionButton())
+    async def refresh(self, interaction):
+        self.rebuild()
+        await interaction.response.edit_message(content=self.status_text(), view=self)
+    def status_text(self):
+        if self.mode == "campionato":
+            return f"🏆 **{self.payload}**\nSelezionati: **{len(self.selected)}**."
+        name, total, groups, advance = self.payload.split("||")
+        return f"🌍 **{name}**\nSelezionati: **{len(self.selected)}/{total}** • Gironi: **{groups}** • Passano: **{advance}**."
+    def selected_participants(self):
+        by_id = {p["discord_id"]: p for p in self.participants}
+        return [by_id[x] for x in self.selected if x in by_id]
+
+
+class PrevPageButton(discord.ui.Button):
+    def __init__(self): super().__init__(label="◀ Pagina", style=discord.ButtonStyle.secondary)
+    async def callback(self, interaction: discord.Interaction):
+        self.view.page = max(0, self.view.page - 1)
+        await self.view.refresh(interaction)
+
+
+class NextPageButton(discord.ui.Button):
+    def __init__(self): super().__init__(label="Pagina ▶", style=discord.ButtonStyle.secondary)
+    async def callback(self, interaction: discord.Interaction):
+        self.view.page = min(self.view.max_page, self.view.page + 1)
+        await self.view.refresh(interaction)
+
+
+class GenerateCompetitionButton(discord.ui.Button):
+    def __init__(self): super().__init__(label="✅ Genera", style=discord.ButtonStyle.success)
+    async def callback(self, interaction: discord.Interaction):
+        if not is_league_admin(interaction):
+            await interaction.response.send_message("❌ Solo lo staff può generare competizioni.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        view = self.view
+        selected = view.selected_participants()
+        if view.mode == "campionato":
+            if len(selected) < 2:
+                await interaction.followup.send("❌ Seleziona almeno 2 partecipanti.", ephemeral=True)
+                return
+            champ_id, groups = generator_insert_championship(view.payload, selected, competition_type="campionato", group_count=1)
+            total_matches = sum(len(pairs) for _gid, _gname, group_teams in groups for pairs in generator_round_robin(group_teams, True))
+            await interaction.followup.send(f"✅ Campionato **{view.payload}** generato.\nPartecipanti: **{len(selected)}**\nPartite create: **{total_matches}**\nOra puoi usare `/genera_coppa_nazionale` e poi `/avvia_andata`.", ephemeral=True)
+            return
+        name, total_raw, groups_raw, advance_raw = view.payload.split("||")
+        total, group_count, advance = safe_int(total_raw), safe_int(groups_raw), safe_int(advance_raw)
+        if len(selected) != total:
+            await interaction.followup.send(f"❌ Devi selezionare esattamente {total} partecipanti. Ora sono {len(selected)}.", ephemeral=True)
+            return
+        champ_id, groups = generator_insert_championship(name, selected, competition_type="europea", group_count=group_count, teams_per_group=max(1, total // max(1, group_count)), european_pass=advance)
+        await interaction.followup.send(f"✅ Coppa europea **{name}** generata.\nPartecipanti: **{len(selected)}** • Gironi: **{group_count}** • Passano: **{advance}**.\nFase gironi creata con andata/ritorno. Il tabellone knockout sarà gestito dopo la fase a gironi.", ephemeral=True)
+
+
+class ChampionshipCupSelect(discord.ui.Select):
+    def __init__(self, championships):
+        options = [discord.SelectOption(label=str(c.get("name") or f"Campionato {c.get('id')}")[:100], value=str(c.get("id")), description=f"ID {c.get('id')} • {c.get('type') or 'campionato'}"[:100]) for c in championships[:25]]
+        if not options:
+            options = [discord.SelectOption(label="Nessun campionato", value="none")]
+        super().__init__(placeholder="Scegli il campionato per la Coppa Nazionale...", min_values=1, max_values=1, options=options)
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "none":
+            await interaction.response.send_message("❌ Nessun campionato disponibile.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            cup_id, cup_name, teams, matches = generator_create_national_cup(int(self.values[0]))
+            await interaction.followup.send(f"✅ **{cup_name}** generata.\nPartecipanti: **{teams}**\nPartite primo turno: **{matches}**\nFormato: **partita secca / solo andata**.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Errore generazione coppa: `{type(e).__name__}: {e}`", ephemeral=True)
+
+
+class ChampionshipCupSelectView(discord.ui.View):
+    def __init__(self, championships):
+        super().__init__(timeout=300)
+        self.add_item(ChampionshipCupSelect(championships))
+
+
+@tree.command(name="genera_campionato", description="Staff: genera un campionato con calendario andata/ritorno")
+async def genera_campionato(interaction: discord.Interaction):
+    if not is_league_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+    await interaction.response.send_modal(CompetitionNameModal())
+
+
+@tree.command(name="genera_coppa_nazionale", description="Staff: genera una coppa nazionale dal campionato scelto")
+async def genera_coppa_nazionale(interaction: discord.Interaction):
+    if not is_league_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+    ensure_competition_generator_tables()
+    await interaction.response.send_message("🇮🇹 Scegli il campionato: la coppa userà solo gli iscritti di quel campionato.", view=ChampionshipCupSelectView(generator_championship_choices()), ephemeral=True)
+
+
+@tree.command(name="genera_coppa_europea", description="Staff: genera Champions/Europa/Conference con gironi")
+async def genera_coppa_europea(interaction: discord.Interaction):
+    if not is_league_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+    await interaction.response.send_modal(EuropeanCupModal())
+
+# ================= FINE GENERATORI COMPETIZIONI STAFF =================
+
+
 @tree.command(name="avvia_andata", description="Staff: abilita l'inserimento risultati dell'andata")
 async def avvia_andata(interaction: discord.Interaction):
     await safe_defer(interaction, ephemeral=True, thinking=True)
@@ -9308,7 +9694,7 @@ async def risultato(interaction: discord.Interaction):
 
         if not options:
             await interaction.followup.send(
-                "❌ Non hai partite attive da inserire. Lo staff deve prima usare `/avvia_andata` o `/avvia_ritorno`, oppure generare/attivare le coppe.",
+                "❌ Non hai partite attive da inserire. Lo staff deve prima usare `/genera_campionato`, `/genera_coppa_nazionale` o `/genera_coppa_europea`, poi `/avvia_andata` o `/avvia_ritorno`.",
                 ephemeral=True
             )
             return
