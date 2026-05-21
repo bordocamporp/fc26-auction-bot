@@ -1236,7 +1236,7 @@ def market_status_label():
 
 def budget_from_team_overall(avg_ovr):
     avg_ovr = float(avg_ovr or 0)
-
+    
     # Budget modalità squadre reali
     # Top club: pochi crediti, club più deboli: più crediti.
     if avg_ovr >= 85:
@@ -9294,31 +9294,31 @@ async def avvia_ritorno(interaction: discord.Interaction):
 
 @tree.command(name="risultato", description="Inserisci un risultato guidato: competizione, partita, gol e marcatori")
 async def risultato(interaction: discord.Interaction):
-    if not is_results_channel(interaction):
-        await interaction.response.send_message("❌ I risultati si inseriscono solo nel canale RISULTATI.", delete_after=10)
-        return
 
-    options = get_guided_competition_options(interaction.user.id)
-    if not options:
-        await interaction.response.send_message(
-            "❌ Non hai partite attive da inserire. Lo staff deve prima usare `/avvia_andata` o `/avvia_ritorno`, oppure generare/attivare le coppe.",
-            ephemeral=True,
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if not is_results_channel(interaction):
+        await interaction.followup.send(
+            "❌ I risultati si inseriscono solo nel canale RISULTATI.",
+            ephemeral=True
         )
         return
 
-    embed = discord.Embed(
-        title="⚽ Inserisci risultato",
-        description=(
-            "Scegli la competizione a cui stai partecipando.\n\n"
-            "Poi selezioni la partita attiva e inserisci gol + marcatori.\n"
-            "Formato marcatori consigliato: `Mbappe 3, Rodri 2`."
-        ),
-        color=discord.Color.blue(),
+    options = get_guided_competition_options(interaction.user.id)
+
+    if not options:
+        await interaction.followup.send(
+            "❌ Non hai partite attive da inserire. Lo staff deve prima usare `/avvia_andata` o `/avvia_ritorno`, oppure generare/attivare le coppe.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.followup.send(
+        "⚽ Seleziona la competizione:",
+        view=GuidedCompetitionView(interaction.user.id, options),
+        ephemeral=True
     )
-    embed.set_footer(text=f"Fase campionato attiva: {get_active_leg().upper()}")
-    await interaction.response.send_message(embed=embed, view=GuidedCompetitionView(options), ephemeral=True)
-
-
+        
 @tree.command(name="risultato_campionato", description="Staff: inserisce un risultato campionato e aggiorna sito/classifica")
 @app_commands.describe(
     competizione="Nome campionato/girone, es: Serie A",
