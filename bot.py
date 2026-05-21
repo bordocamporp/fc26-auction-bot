@@ -301,10 +301,10 @@ ANTI_SNIPE_THRESHOLD = 10
 ANTI_SNIPE_EXTENSION = 20
 MARKET_TAX = 5
 
-MAX_GK = 2
-MAX_DEF = 6
-MAX_MID = 6
-MAX_ATT = 4
+MAX_GK = 4
+MAX_DEF = 10
+MAX_MID = 10
+MAX_ATT = 10
 
 intents = discord.Intents.default()
 # Necessario per recuperare i membri del server quando lo staff accetta/rifiuta
@@ -1781,7 +1781,7 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
         UPDATE auctions
         SET highest_bid = %s,
             highest_bidder_id = %s
-        WHERE id = CAST(%s AS BIGINT)
+        WHERE id = %s
           AND status = 'open'
     """, (new_bid, str(interaction.user.id), auction["id"]))
     conn.commit()
@@ -3812,7 +3812,7 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     cur.execute("""
         UPDATE signup_requests
         SET status = 'accepted', club_name = %s, handled_by = %s, handled_at = CURRENT_TIMESTAMP
-        WHERE id = CAST(%s AS BIGINT)
+        WHERE id = %s
     """, (club_name, str(interaction.user.id), int(request_id)))
 
     conn.commit()
@@ -5570,7 +5570,7 @@ async def start_auction_for_player(interaction: discord.Interaction, player_id: 
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("UPDATE auctions SET message_id = %s WHERE id = CAST(%s AS BIGINT)", (str(message.id), auction_id))
+    cur.execute("UPDATE auctions SET message_id = %s WHERE id = %s", (str(message.id), auction_id))
     conn.commit()
     conn.close()
 
@@ -6000,7 +6000,7 @@ async def close_auction(channel, auction_id: int, message=None):
                 (auction["highest_bidder_id"], final_price, auction["player_id"])
             )
             cur.execute(
-                "UPDATE auctions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = CAST(%s AS BIGINT)",
+                "UPDATE auctions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = %s",
                 (auction_id,)
             )
             conn.commit()
@@ -7054,7 +7054,7 @@ class TradeView(discord.ui.View):
         conn = connect()
         cur = conn.cursor()
 
-        cur.execute("SELECT * FROM trade_offers WHERE id = CAST(%s AS BIGINT) AND status = 'pending'", (self.trade_id,))
+        cur.execute("SELECT * FROM trade_offers WHERE id = %s AND status = 'pending'", (self.trade_id,))
         trade = cur.fetchone()
 
         if not trade:
@@ -7131,7 +7131,7 @@ class TradeView(discord.ui.View):
         if request_player_id:
             cur.execute("UPDATE players SET owner_discord_id = %s WHERE id = CAST(%s AS BIGINT)", (proposer_id, request_player_id))
 
-        cur.execute("UPDATE trade_offers SET status = 'accepted' WHERE id = CAST(%s AS BIGINT)", (self.trade_id,))
+        cur.execute("UPDATE trade_offers SET status = 'accepted' WHERE id = %s", (self.trade_id,))
         conn.commit()
         conn.close()
 
@@ -7793,7 +7793,7 @@ def generate_single_elimination_pairs(players):
 def create_national_cups_for_groups(cur, championship_id, groups):
     created = 0
     for group_id, players in groups.items():
-        cur.execute("SELECT name FROM championship_groups WHERE id = CAST(%s AS BIGINT)", (group_id,))
+        cur.execute("SELECT name FROM championship_groups WHERE id = %s", (group_id,))
         g = cur.fetchone()
         group_name = g["name"] if g else f"Girone {group_id}"
         cup_name = f"Coppa Nazionale {group_name}"
@@ -8655,42 +8655,668 @@ class ResultConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="⚠️ Risultato contestato. Staff richiesto.", embed=embed, view=None)
 
 
-@tree.command(name="risultato", description="Inserisci un risultato del tuo girone")
+
+
+# ================= RISULTATI GUIDATI DISCORD -> SITO =================
+# Flusso:
+# /avvia_andata o /avvia_ritorno decide quali partite di campionato sono inseribili.
+# /risultato mostra menu competizione -> menu partita -> modal gol/marcatori -> conferma avversario -> sync sito.
+
+RESULT_COMPETITIONS = {
+    "campionato": {
+        "label": "Campionato",
+        "description": "Partite del campionato attivo",
+        "emoji": "🏆",
+    },
+    "coppa_nazionale": {
+        "label": "Coppa Nazionale",
+        "description": "Tabellone coppa nazionale",
+        "emoji": "🇮🇹",
+    },
+    "champions": {
+        "label": "Champions League",
+        "description": "Coppa europea: Champions League",
+        "emoji": "⭐",
+    },
+    "europa": {
+        "label": "Europa League",
+        "description": "Coppa europea: Europa League",
+        "emoji": "🟠",
+    },
+    "conference": {
+        "label": "Conference League",
+        "description": "Coppa europea: Conference League",
+        "emoji": "🟢",
+    },
+}
+
+
+def set_active_leg(value: str):
+    value = "ritorno" if str(value).lower().strip() == "ritorno" else "andata"
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO league_settings (key, value)
+        VALUES ('active_leg', %s)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    """, (value,))
+    conn.commit()
+    conn.close()
+    return value
+
+
+def get_active_leg():
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM league_settings WHERE key = 'active_leg'")
+    row = cur.fetchone()
+    conn.close()
+    return (row["value"] if row else "andata") or "andata"
+
+
+def get_first_leg_last_round(championship_id):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT MAX(round_number) AS max_round
+        FROM championship_matches
+        WHERE championship_id = %s
+    """, (championship_id,))
+    row = cur.fetchone()
+    conn.close()
+    max_round = safe_int(row["max_round"] if row else 0)
+    return max_round // 2 if max_round else 0, max_round
+
+
+def get_manager_club_name_by_discord(discord_id, fallback_name=None):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT club_name, manager_name, name FROM managers WHERE discord_id = %s", (str(discord_id),))
+    manager = cur.fetchone()
+    if manager and manager.get("club_name"):
+        conn.close()
+        return manager["club_name"]
+
+    cur.execute("SELECT club_name FROM signup_requests WHERE discord_id = %s AND status = 'accepted' ORDER BY handled_at DESC NULLS LAST LIMIT 1", (str(discord_id),))
+    signup = cur.fetchone()
+    if signup and signup.get("club_name"):
+        conn.close()
+        return signup["club_name"]
+
+    cur.execute("SELECT team_name FROM real_team_assignments WHERE discord_id = %s", (str(discord_id),))
+    real = cur.fetchone()
+    conn.close()
+    if real and real.get("team_name"):
+        return real["team_name"]
+
+    return fallback_name or str(discord_id)
+
+
+def get_roster_names_for_manager(discord_id, limit=25):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT name
+        FROM players
+        WHERE owner_discord_id = %s
+        ORDER BY overall DESC NULLS LAST, name ASC
+        LIMIT %s
+    """, (str(discord_id), int(limit)))
+    rows = cur.fetchall()
+    conn.close()
+    return [r["name"] for r in rows if r.get("name")]
+
+
+def parse_scorers_input(raw: str):
+    """Accetta formati: Mbappe 3, Rodri 2 oppure Mbappe=3; Rodri=2 oppure Mbappe, Mbappe, Rodri."""
+    raw = str(raw or "").strip()
+    if not raw:
+        return []
+
+    raw = raw.replace(";", ",").replace("\n", ",")
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    result = []
+
+    for part in parts:
+        goals = 1
+        name = part
+        if "=" in part:
+            name, goals_txt = part.rsplit("=", 1)
+            goals = safe_int(goals_txt, 1)
+        else:
+            tokens = part.split()
+            if len(tokens) > 1 and tokens[-1].isdigit():
+                goals = safe_int(tokens[-1], 1)
+                name = " ".join(tokens[:-1])
+
+        name = str(name).strip()
+        goals = max(1, safe_int(goals, 1))
+        if name:
+            result.append((name, goals))
+
+    return result
+
+
+def scorers_total(scorers):
+    return sum(max(1, safe_int(goals, 1)) for _, goals in scorers)
+
+
+def insert_scorers_for_match(cur, match_id, owner_id, scorers):
+    counts = {}
+    for name, goals in scorers:
+        name = str(name).strip()
+        if not name:
+            continue
+        counts[name] = counts.get(name, 0) + safe_int(goals, 1)
+
+    for name, goals in counts.items():
+        cur.execute("""
+            INSERT INTO match_scorers (match_id, scorer_name, team_owner_id, goals)
+            VALUES (%s, %s, %s, %s)
+        """, (match_id, name, str(owner_id), safe_int(goals, 1)))
+
+
+def get_guided_competition_options(discord_id):
+    options = []
+    for key, meta in RESULT_COMPETITIONS.items():
+        if get_available_matches_for_competition(discord_id, key):
+            options.append(discord.SelectOption(
+                label=meta["label"],
+                value=key,
+                description=meta["description"],
+                emoji=meta["emoji"],
+            ))
+    return options
+
+
+def get_available_matches_for_competition(discord_id, competition_key):
+    discord_id = str(discord_id)
+    conn = connect()
+    cur = conn.cursor()
+
+    if competition_key == "campionato":
+        champ = active_championship()
+        if not champ:
+            conn.close()
+            return []
+
+        first_last, max_round = get_first_leg_last_round(champ["id"])
+        active_leg = get_active_leg()
+        if active_leg == "ritorno" and max_round:
+            round_min = first_last + 1
+            round_max = max_round
+        else:
+            round_min = 1
+            round_max = first_last or max_round or 999
+
+        cur.execute("""
+            SELECT m.*, g.name AS group_name, c.name AS competition_name
+            FROM championship_matches m
+            LEFT JOIN championship_groups g ON g.id = m.group_id
+            LEFT JOIN championships c ON c.id = m.championship_id
+            WHERE m.championship_id = %s
+              AND m.status = 'pending'
+              AND m.round_number BETWEEN %s AND %s
+              AND (m.home_id = %s OR m.away_id = %s)
+            ORDER BY m.round_number ASC, m.id ASC
+            LIMIT 25
+        """, (champ["id"], round_min, round_max, discord_id, discord_id))
+        rows = cur.fetchall()
+        conn.close()
+        for r in rows:
+            r["requester_id"] = str(discord_id)
+            r["_result_kind"] = "championship"
+            r["_competition_label"] = r.get("group_name") or r.get("competition_name") or "Campionato"
+        return rows
+
+    if competition_key == "coppa_nazionale":
+        cur.execute("""
+            SELECT m.*, c.name AS competition_name
+            FROM national_cup_matches m
+            LEFT JOIN national_cups c ON c.id = m.cup_id
+            WHERE COALESCE(m.status, 'pending') IN ('pending', 'active')
+              AND (m.home_id = %s OR m.away_id = %s)
+            ORDER BY m.round_number ASC, m.id ASC
+            LIMIT 25
+        """, (discord_id, discord_id))
+        rows = cur.fetchall()
+        conn.close()
+        for r in rows:
+            r["requester_id"] = str(discord_id)
+            r["_result_kind"] = "national_cup"
+            r["_competition_label"] = r.get("competition_name") or "Coppa Nazionale"
+        return rows
+
+    # Coppe europee: per ora leggiamo eventuali match da championship_matches filtrando per nome gruppo/campionato.
+    keywords = {
+        "champions": ["champions", "champion"],
+        "europa": ["europa league", "europa"],
+        "conference": ["conference"],
+    }.get(competition_key, [])
+
+    if not keywords:
+        conn.close()
+        return []
+
+    champ = active_championship()
+    if not champ:
+        conn.close()
+        return []
+
+    cur.execute("""
+        SELECT m.*, g.name AS group_name, c.name AS competition_name
+        FROM championship_matches m
+        LEFT JOIN championship_groups g ON g.id = m.group_id
+        LEFT JOIN championships c ON c.id = m.championship_id
+        WHERE m.status = 'pending'
+          AND (m.home_id = %s OR m.away_id = %s)
+          AND m.championship_id = %s
+        ORDER BY m.round_number ASC, m.id ASC
+        LIMIT 50
+    """, (discord_id, discord_id, champ["id"]))
+    rows = cur.fetchall()
+    conn.close()
+
+    filtered = []
+    for r in rows:
+        check = normalize_text(f"{r.get('group_name')} {r.get('competition_name')}")
+        if any(normalize_text(k) in check for k in keywords):
+            r["requester_id"] = str(discord_id)
+            r["_result_kind"] = "european_group"
+            r["_competition_label"] = r.get("group_name") or RESULT_COMPETITIONS[competition_key]["label"]
+            filtered.append(r)
+    return filtered[:25]
+
+
+def format_guided_match_label(match, requester_id):
+    requester_id = str(requester_id)
+    home_id = str(match.get("home_id") or "")
+    away_id = str(match.get("away_id") or "")
+    is_home = requester_id == home_id
+    opponent_id = away_id if is_home else home_id
+    opponent_name = match.get("away_name") if is_home else match.get("home_name")
+    opponent_club = get_manager_club_name_by_discord(opponent_id, opponent_name)
+    casa_trasferta = "Casa" if is_home else "Trasferta"
+    round_number = match.get("round_number") or match.get("round") or "?"
+    return f"{casa_trasferta} vs {opponent_club}"[:100], f"Turno/Giornata {round_number} • @{opponent_name or opponent_id}"[:100]
+
+
+class GuidedCompetitionSelect(discord.ui.Select):
+    def __init__(self, options):
+        super().__init__(
+            placeholder="Scegli la competizione...",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        competition_key = self.values[0]
+        matches = get_available_matches_for_competition(interaction.user.id, competition_key)
+        if not matches:
+            await interaction.response.edit_message(
+                content="❌ Non hai partite disponibili per questa competizione.",
+                embed=None,
+                view=None,
+            )
+            return
+
+        embed = discord.Embed(
+            title=f"⚽ {RESULT_COMPETITIONS[competition_key]['label']}",
+            description="Scegli la partita attiva da compilare.",
+            color=discord.Color.blue(),
+        )
+        await interaction.response.edit_message(embed=embed, view=GuidedMatchSelectView(competition_key, matches), content=None)
+
+
+class GuidedCompetitionView(discord.ui.View):
+    def __init__(self, options):
+        super().__init__(timeout=180)
+        self.add_item(GuidedCompetitionSelect(options))
+
+
+class GuidedMatchSelect(discord.ui.Select):
+    def __init__(self, competition_key, matches):
+        self.competition_key = competition_key
+        options = []
+        for m in matches[:25]:
+            label, desc = format_guided_match_label(m, m.get("requester_id") or "")
+            # requester_id viene aggiunto sotto
+            options.append(discord.SelectOption(
+                label=label,
+                value=f"{m['_result_kind']}:{m['id']}",
+                description=desc,
+            ))
+        super().__init__(placeholder="Scegli avversario/partita...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        kind, raw_id = self.values[0].split(":", 1)
+        match_id = safe_int(raw_id)
+        await interaction.response.send_modal(GuidedResultModal(kind, match_id))
+
+
+class GuidedMatchSelectView(discord.ui.View):
+    def __init__(self, competition_key, matches):
+        super().__init__(timeout=180)
+        # aggiunge requester_id per label corrette
+        self.add_item(GuidedMatchSelect(competition_key, matches))
+
+
+class GuidedResultModal(discord.ui.Modal, title="Risultato partita"):
+    gol_miei = discord.ui.TextInput(label="Gol tuoi", placeholder="Esempio: 5", required=True, max_length=2)
+    gol_avversario = discord.ui.TextInput(label="Gol avversario", placeholder="Esempio: 2", required=True, max_length=2)
+    marcatori_miei = discord.ui.TextInput(
+        label="Marcatori tuoi",
+        placeholder="Esempio: Mbappe 3, Rodri 2",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=900,
+    )
+    marcatori_avversario = discord.ui.TextInput(
+        label="Marcatori avversario",
+        placeholder="Esempio: Lautaro 2",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=900,
+    )
+
+    def __init__(self, kind, match_id):
+        super().__init__()
+        self.kind = kind
+        self.match_id = int(match_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            my_goals = safe_int(self.gol_miei.value)
+            opp_goals = safe_int(self.gol_avversario.value)
+        except Exception:
+            await interaction.response.send_message("I gol devono essere numeri.", ephemeral=True)
+            return
+
+        my_scorers = parse_scorers_input(str(self.marcatori_miei.value))
+        opp_scorers = parse_scorers_input(str(self.marcatori_avversario.value))
+
+        if my_goals == 0 and opp_goals == 0:
+            my_scorers = []
+            opp_scorers = []
+        else:
+            if scorers_total(my_scorers) != my_goals:
+                await interaction.response.send_message(
+                    f"❌ I tuoi marcatori sommano **{scorers_total(my_scorers)}** gol, ma hai inserito **{my_goals}** gol.",
+                    ephemeral=True,
+                )
+                return
+            if scorers_total(opp_scorers) != opp_goals:
+                await interaction.response.send_message(
+                    f"❌ I marcatori avversari sommano **{scorers_total(opp_scorers)}** gol, ma hai inserito **{opp_goals}** gol avversari.",
+                    ephemeral=True,
+                )
+                return
+
+        if self.kind in ("championship", "european_group"):
+            await self._submit_championship(interaction, my_goals, opp_goals, my_scorers, opp_scorers)
+        elif self.kind == "national_cup":
+            await self._submit_national_cup(interaction, my_goals, opp_goals, my_scorers, opp_scorers)
+        else:
+            await interaction.response.send_message("Tipo partita non riconosciuto.", ephemeral=True)
+
+    async def _submit_championship(self, interaction, my_goals, opp_goals, my_scorers, opp_scorers):
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM championship_matches WHERE id = %s AND status = 'pending'", (self.match_id,))
+        match = cur.fetchone()
+
+        if not match:
+            conn.close()
+            await interaction.response.send_message("Partita non trovata o già inserita.", ephemeral=True)
+            return
+
+        user_id = str(interaction.user.id)
+        if user_id not in (str(match["home_id"]), str(match["away_id"])):
+            conn.close()
+            await interaction.response.send_message("Non fai parte di questa partita.", ephemeral=True)
+            return
+
+        is_home = user_id == str(match["home_id"])
+        home_goals = my_goals if is_home else opp_goals
+        away_goals = opp_goals if is_home else my_goals
+        confirm_by = match["away_id"] if is_home else match["home_id"]
+
+        home_scorers = my_scorers if is_home else opp_scorers
+        away_scorers = opp_scorers if is_home else my_scorers
+
+        cur.execute("""
+            UPDATE championship_matches
+            SET home_goals = %s,
+                away_goals = %s,
+                status = 'awaiting_confirmation',
+                submitted_by = %s,
+                confirm_by = %s
+            WHERE id = %s
+        """, (home_goals, away_goals, user_id, str(confirm_by), self.match_id))
+
+        cur.execute("DELETE FROM match_scorers WHERE match_id = %s", (self.match_id,))
+        insert_scorers_for_match(cur, self.match_id, match["home_id"], home_scorers)
+        insert_scorers_for_match(cur, self.match_id, match["away_id"], away_scorers)
+
+        conn.commit()
+        conn.close()
+
+        embed = build_result_embed(self.match_id)
+        await interaction.response.send_message(
+            content=f"<@{confirm_by}> devi confermare o contestare il risultato.",
+            embed=embed,
+            view=GuidedResultConfirmView("championship", self.match_id, str(confirm_by)),
+        )
+
+    async def _submit_national_cup(self, interaction, my_goals, opp_goals, my_scorers, opp_scorers):
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT m.*, c.name AS competition_name
+            FROM national_cup_matches m
+            LEFT JOIN national_cups c ON c.id = m.cup_id
+            WHERE m.id = %s
+              AND COALESCE(m.status, 'pending') IN ('pending', 'active')
+        """, (self.match_id,))
+        match = cur.fetchone()
+
+        if not match:
+            conn.close()
+            await interaction.response.send_message("Partita di coppa non trovata o già inserita.", ephemeral=True)
+            return
+
+        user_id = str(interaction.user.id)
+        if user_id not in (str(match["home_id"]), str(match["away_id"])):
+            conn.close()
+            await interaction.response.send_message("Non fai parte di questa partita.", ephemeral=True)
+            return
+
+        is_home = user_id == str(match["home_id"])
+        home_goals = my_goals if is_home else opp_goals
+        away_goals = opp_goals if is_home else my_goals
+        confirm_by = match["away_id"] if is_home else match["home_id"]
+
+        cur.execute("""
+            UPDATE national_cup_matches
+            SET home_goals = %s,
+                away_goals = %s,
+                status = 'awaiting_confirmation'
+            WHERE id = %s
+        """, (home_goals, away_goals, self.match_id))
+        conn.commit()
+        conn.close()
+
+        embed = build_guided_cup_embed(self.match_id)
+        await interaction.response.send_message(
+            content=f"<@{confirm_by}> devi confermare o contestare il risultato.",
+            embed=embed,
+            view=GuidedResultConfirmView("national_cup", self.match_id, str(confirm_by)),
+        )
+
+
+def build_guided_cup_embed(match_id):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT m.*, c.name AS competition_name
+        FROM national_cup_matches m
+        LEFT JOIN national_cups c ON c.id = m.cup_id
+        WHERE m.id = %s
+    """, (match_id,))
+    m = cur.fetchone()
+    conn.close()
+
+    if not m:
+        return discord.Embed(title="Coppa", description="Partita non trovata.", color=discord.Color.red())
+
+    home = get_manager_club_name_by_discord(m.get("home_id"), m.get("home_name"))
+    away = get_manager_club_name_by_discord(m.get("away_id"), m.get("away_name"))
+    status_label = {
+        "awaiting_confirmation": "⏳ In attesa conferma",
+        "confirmed": "✅ Ufficiale",
+        "contested": "⚠️ Contestato",
+        "pending": "📅 Da giocare",
+        "active": "📅 Attiva",
+    }.get(str(m.get("status") or "pending"), str(m.get("status") or "pending"))
+
+    embed = discord.Embed(
+        title=f"🏆 {m.get('competition_name') or 'Coppa Nazionale'} — Turno {m.get('round_number')}",
+        description=f"**{home} {safe_int(m.get('home_goals'))} - {safe_int(m.get('away_goals'))} {away}**",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="Stato", value=status_label, inline=False)
+    embed.set_footer(text=f"ID coppa: {match_id}")
+    return embed
+
+
+class GuidedResultConfirmView(discord.ui.View):
+    def __init__(self, kind, match_id, confirm_by):
+        super().__init__(timeout=86400)
+        self.kind = kind
+        self.match_id = int(match_id)
+        self.confirm_by = str(confirm_by)
+
+    @discord.ui.button(label="Conferma", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.confirm_by:
+            await interaction.response.send_message("Solo l'avversario può confermare questo risultato.", ephemeral=True)
+            return
+
+        conn = connect()
+        cur = conn.cursor()
+
+        if self.kind in ("championship", "european_group"):
+            cur.execute("UPDATE championship_matches SET status = 'confirmed' WHERE id = %s", (self.match_id,))
+            conn.commit()
+            conn.close()
+            sync_site_after_confirmed_match(self.match_id)
+            embed = build_result_embed(self.match_id)
+            await interaction.response.edit_message(content="✅ Risultato confermato e sito aggiornato.", embed=embed, view=None)
+            return
+
+        if self.kind == "national_cup":
+            cur.execute("""
+                UPDATE national_cup_matches
+                SET status = 'confirmed'
+                WHERE id = %s
+            """, (self.match_id,))
+            cur.execute("""
+                SELECT m.*, c.name AS competition_name
+                FROM national_cup_matches m
+                LEFT JOIN national_cups c ON c.id = m.cup_id
+                WHERE m.id = %s
+            """, (self.match_id,))
+            m = cur.fetchone()
+            conn.commit()
+            conn.close()
+
+            if m:
+                home = get_manager_club_name_by_discord(m.get("home_id"), m.get("home_name"))
+                away = get_manager_club_name_by_discord(m.get("away_id"), m.get("away_name"))
+                sync_site_cup_result(
+                    m.get("competition_name") or "Coppa Nazionale",
+                    f"Turno {m.get('round_number')}",
+                    home,
+                    away,
+                    safe_int(m.get("home_goals")),
+                    safe_int(m.get("away_goals")),
+                )
+            embed = build_guided_cup_embed(self.match_id)
+            await interaction.response.edit_message(content="✅ Risultato coppa confermato e sito aggiornato.", embed=embed, view=None)
+            return
+
+        conn.close()
+        await interaction.response.send_message("Tipo risultato non riconosciuto.", ephemeral=True)
+
+    @discord.ui.button(label="Contesta", style=discord.ButtonStyle.danger)
+    async def contest(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.confirm_by:
+            await interaction.response.send_message("Solo l'avversario può contestare questo risultato.", ephemeral=True)
+            return
+
+        conn = connect()
+        cur = conn.cursor()
+        if self.kind in ("championship", "european_group"):
+            cur.execute("UPDATE championship_matches SET status = 'contested' WHERE id = %s", (self.match_id,))
+            conn.commit()
+            conn.close()
+            embed = build_result_embed(self.match_id)
+        else:
+            cur.execute("UPDATE national_cup_matches SET status = 'contested' WHERE id = %s", (self.match_id,))
+            conn.commit()
+            conn.close()
+            embed = build_guided_cup_embed(self.match_id)
+
+        await interaction.response.edit_message(content="⚠️ Risultato contestato. Staff richiesto.", embed=embed, view=None)
+
+
+@tree.command(name="avvia_andata", description="Staff: abilita l'inserimento risultati dell'andata")
+async def avvia_andata(interaction: discord.Interaction):
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+    if not is_league_admin(interaction):
+        await interaction.followup.send("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+    set_active_leg("andata")
+    await interaction.followup.send("✅ Andata attivata: i player vedranno solo le partite di andata in `/risultato`.", ephemeral=True)
+
+
+@tree.command(name="avvia_ritorno", description="Staff: abilita l'inserimento risultati del ritorno")
+async def avvia_ritorno(interaction: discord.Interaction):
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+    if not is_league_admin(interaction):
+        await interaction.followup.send("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+    set_active_leg("ritorno")
+    await interaction.followup.send("✅ Ritorno attivato: i player vedranno solo le partite di ritorno in `/risultato`.", ephemeral=True)
+
+# ================= FINE RISULTATI GUIDATI =================
+
+@tree.command(name="risultato", description="Inserisci un risultato guidato: competizione, partita, gol e marcatori")
 async def risultato(interaction: discord.Interaction):
     if not is_results_channel(interaction):
         await interaction.response.send_message("❌ I risultati si inseriscono solo nel canale RISULTATI.", delete_after=10)
         return
 
-    champ = active_championship()
-    if not champ:
-        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
-        return
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT *, %s AS requester_id
-        FROM championship_matches
-        WHERE championship_id = %s
-          AND status = 'pending'
-          AND (home_id = %s OR away_id = %s)
-        ORDER BY round_number ASC
-        LIMIT 25
-    """, (str(interaction.user.id), champ["id"], str(interaction.user.id), str(interaction.user.id)))
-    matches = cur.fetchall()
-    conn.close()
-
-    if not matches:
-        await interaction.response.send_message("Non hai partite da inserire.", ephemeral=True)
+    options = get_guided_competition_options(interaction.user.id)
+    if not options:
+        await interaction.response.send_message(
+            "❌ Non hai partite attive da inserire. Lo staff deve prima usare `/avvia_andata` o `/avvia_ritorno`, oppure generare/attivare le coppe.",
+            ephemeral=True,
+        )
         return
 
     embed = discord.Embed(
         title="⚽ Inserisci risultato",
-        description="Scegli dalla tendina la partita da aggiornare.",
-        color=discord.Color.blue()
+        description=(
+            "Scegli la competizione a cui stai partecipando.\n\n"
+            "Poi selezioni la partita attiva e inserisci gol + marcatori.\n"
+            "Formato marcatori consigliato: `Mbappe 3, Rodri 2`."
+        ),
+        color=discord.Color.blue(),
     )
-
-    await interaction.response.send_message(embed=embed, view=ResultOpponentView(matches), ephemeral=True)
+    embed.set_footer(text=f"Fase campionato attiva: {get_active_leg().upper()}")
+    await interaction.response.send_message(embed=embed, view=GuidedCompetitionView(options), ephemeral=True)
 
 
 @tree.command(name="risultato_campionato", description="Staff: inserisce un risultato campionato e aggiorna sito/classifica")
@@ -9590,7 +10216,7 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
         cur.execute("""
             UPDATE players
             SET owner_discord_id = %s, sold_price = %s
-            WHERE id = CAST(%s AS BIGINT)
+            WHERE id = %s
         """, (str(utente.id), 0, p["id"]))
 
     # Manager con budget corretto
@@ -10515,7 +11141,7 @@ class TradeOfferResponseView(discord.ui.View):
             cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (amount, proposer_id))
             cur.execute("UPDATE managers SET budget = budget + %s WHERE discord_id = %s", (amount, target_id))
 
-        cur.execute("UPDATE player_trade_offers SET status = 'accepted', updated_at = CURRENT_TIMESTAMP WHERE id = CAST(%s AS BIGINT)", (self.offer_id,))
+        cur.execute("UPDATE player_trade_offers SET status = 'accepted', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (self.offer_id,))
         conn.commit()
         conn.close()
 
@@ -11595,7 +12221,7 @@ def _sync_signup_accept_db(req, request_id, club_name, handled_by, handled_by_na
                 club_name = %s,
                 handled_by = %s,
                 handled_at = CURRENT_TIMESTAMP
-            WHERE id = CAST(%s AS BIGINT)
+            WHERE id = %s
         """, (club_name or None, str(handled_by), int(request_id)))
 
         try:
@@ -11872,7 +12498,7 @@ async def process_website_signup_action(action_row):
     cur = conn.cursor()
 
     try:
-        cur.execute("SELECT * FROM signup_requests WHERE id = CAST(%s AS BIGINT) LIMIT 1", (request_id,))
+        cur.execute("SELECT * FROM signup_requests WHERE id = %s LIMIT 1", (request_id,))
         req = cur.fetchone()
 
         if not req:
