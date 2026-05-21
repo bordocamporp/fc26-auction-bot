@@ -9917,6 +9917,10 @@ def ensure_results_calendar_tables():
     """)
 
     for sql in [
+        "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS user_id TEXT",
+        "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS club_name TEXT",
+        "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS player_name TEXT",
+        "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS goals INTEGER DEFAULT 1",
         "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS source_table TEXT",
         "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS source_match_id TEXT",
     ]:
@@ -10130,7 +10134,8 @@ def unified_pending_matches(discord_id=None, only_user=True):
                 "away_club": away_club,
             })
     except Exception as e:
-        print(f"[UNIFIED european_cup_matches] {e}")
+        if "does not exist" not in str(e):
+            print(f"[UNIFIED european_cup_matches] {e}")
 
     conn.close()
     return out
@@ -10337,13 +10342,20 @@ def get_players_for_club_or_user(club_name=None, user_id=None):
         if user_id:
             try:
                 cur.execute("""
-                    SELECT id, name, position, overall
+                    SELECT *
                     FROM players
-                    WHERE owner_discord_id = %s
                     ORDER BY overall DESC NULLS LAST, name ASC
-                    LIMIT 25
-                """, (str(user_id),))
-                rows = cur.fetchall()
+                """)
+                all_rows = cur.fetchall()
+
+                rows = []
+                for rr in all_rows:
+                    owner = str(row_get(rr, "owner_discord_id", "") or row_get(rr, "discord_id", "") or "")
+                    if owner == str(user_id):
+                        rows.append(rr)
+
+                rows = rows[:25]
+
                 if rows:
                     return rows
             except Exception as e:
