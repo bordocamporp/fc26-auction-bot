@@ -12,8 +12,6 @@ from discord import app_commands
 from dotenv import load_dotenv
 from db import connect, init_db, reset_auction_state
 from card_generator import create_player_card
-import psycopg2
-from psycopg2.extras import RealDictCursor
 
 load_dotenv()
 print("[BOOT] Avvio bot.py")
@@ -9293,6 +9291,17 @@ def ensure_competition_generator_tables():
     conn = connect()
     cur = conn.cursor()
     for sql in [
+        "ALTER TABLE championships ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
+        "ALTER TABLE championships ADD COLUMN IF NOT EXISTS group_count INTEGER DEFAULT 1",
+        "ALTER TABLE championships ADD COLUMN IF NOT EXISTS teams_per_group INTEGER DEFAULT 0",
+        "ALTER TABLE championships ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE championship_groups ADD COLUMN IF NOT EXISTS championship_id INTEGER",
+        "ALTER TABLE championship_groups ADD COLUMN IF NOT EXISTS name TEXT",
+        "ALTER TABLE championship_groups ADD COLUMN IF NOT EXISTS group_name TEXT",
+        "ALTER TABLE championship_players ADD COLUMN IF NOT EXISTS championship_id INTEGER",
+        "ALTER TABLE championship_players ADD COLUMN IF NOT EXISTS group_id INTEGER",
+        "ALTER TABLE championship_players ADD COLUMN IF NOT EXISTS discord_id TEXT",
+        "ALTER TABLE championship_players ADD COLUMN IF NOT EXISTS display_name TEXT",
         "ALTER TABLE championships ADD COLUMN IF NOT EXISTS type TEXT DEFAULT 'campionato'",
         "ALTER TABLE championships ADD COLUMN IF NOT EXISTS participants INTEGER DEFAULT 0",
         "ALTER TABLE championships ADD COLUMN IF NOT EXISTS european_pass INTEGER DEFAULT 0",
@@ -9315,6 +9324,17 @@ def ensure_competition_generator_tables():
             cur.execute(sql)
         except Exception as e:
             print(f"[GENERATOR TABLES] {e}")
+    # Compatibilità con vecchie tabelle: alcune avevano group_name NOT NULL.
+    for sql in [
+        "ALTER TABLE championship_groups ALTER COLUMN group_name DROP NOT NULL",
+        "UPDATE championship_groups SET name = COALESCE(name, group_name, 'Girone Unico') WHERE name IS NULL",
+        "UPDATE championship_groups SET group_name = COALESCE(group_name, name, 'Girone Unico') WHERE group_name IS NULL",
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception as e:
+            print(f"[GENERATOR TABLES COMPAT] {e}")
+
     conn.commit()
     conn.close()
 
@@ -9399,7 +9419,7 @@ def generator_insert_championship(name, teams, *, competition_type="campionato",
         grouped = [(f"Girone {chr(65+i)}", shuffled[i::group_count]) for i in range(group_count)]
     groups = []
     for group_name, group_teams in grouped:
-        cur.execute("INSERT INTO championship_groups (championship_id, name) VALUES (%s, %s) RETURNING id", (championship_id, group_name))
+        cur.execute("INSERT INTO championship_groups (championship_id, name, group_name) VALUES (%s, %s, %s) RETURNING id", (championship_id, group_name, group_name))
         group_id = cur.fetchone()["id"]
         groups.append((group_id, group_name, group_teams))
         for t in group_teams:
@@ -9631,52 +9651,32 @@ class ChampionshipCupSelectView(discord.ui.View):
         super().__init__(timeout=300)
         self.add_item(ChampionshipCupSelect(championships))
 
-def generator_championship_options():
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    cur.execute("""
-        SELECT id, name
-        FROM championships
-        ORDER BY id DESC
-    """)
+@tree.command(name="genera_campionato", description="Staff: genera un campionato con calendario andata/ritorno")
+async def genera_campionato(interaction: discord.Interaction):
+    if not is_league_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+    await interaction.response.send_modal(CompetitionNameModal())
 
-    data = cur.fetchall()
 
-    cur.close()
-    conn.close()
-
-    options = []
-
-    for row in data:
-        options.append(
-            discord.SelectOption(
-                label=row["name"],
-                value=str(row["id"])
-            )
-        )
-
-    return options
- 
 @tree.command(name="genera_coppa_nazionale", description="Staff: genera una coppa nazionale dal campionato scelto")
 async def genera_coppa_nazionale(interaction: discord.Interaction):
     await safe_defer(interaction, ephemeral=True, thinking=True)
 
     if not is_league_admin(interaction):
-        await interaction.followup.send(
-            "❌ Solo lo staff può usare questo comando.",
-            ephemeral=True
-        )
+        await interaction.followup.send("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
     ensure_competition_generator_tables()
-
+    choices = generator_championship_choices()
     await interaction.followup.send(
-        "🏆 Scegli il campionato: la coppa userà solo gli iscritti di quel campionato.",
-        view=ChampionshipCupSelectView(generator_championship_options()),
-        ephemeral=True
+        "🇮🇹 Scegli il campionato: la coppa userà solo gli iscritti di quel campionato.",
+        view=ChampionshipCupSelectView(choices),
+        ephemeral=True,
     )
-    
+
+
 @tree.command(name="genera_coppa_europea", description="Staff: genera Champions/Europa/Conference con gironi")
 async def genera_coppa_europea(interaction: discord.Interaction):
     if not is_league_admin(interaction):
