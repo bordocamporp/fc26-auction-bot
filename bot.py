@@ -9732,21 +9732,187 @@ class TradeOfferResponseView(discord.ui.View):
 # ================= RICERCA GIOCATORI: NOME O CLUB =================
 
 # ================= AUTOCOMPLETE RICERCA =================
-# Nota Discord: i menu a tendina/autocomplete degli slash command possono mostrare al massimo 25 risultati.
-# Per questo non si possono mostrare TUTTI i giocatori/club contemporaneamente: il menu si aggiorna mentre scrivi.
+# Nota Discord: autocomplete e select menu possono mostrare massimo 25 opzioni per volta.
+# Per evitare liste incomplete di club, la ricerca club ora è a 2 step:
+# 1) scegli/filtra il campionato;
+# 2) il bot mostra il menu dei club di quel campionato;
+# 3) scegli il club e vedi la rosa/giocatori.
+
+LEAGUE_PREFIX = "league::"
+
+
+def _row_get(row, key, default=None):
+    try:
+        return row.get(key, default)
+    except Exception:
+        try:
+            return row[key]
+        except Exception:
+            return default
+
+
+def _choice_label(value: str, max_len: int = 100) -> str:
+    value = str(value or "").strip()
+    return value[:max_len] if value else "Senza nome"
+
+
+async def cerca_campionato_autocomplete(interaction: discord.Interaction, current: str):
+    """Mostra i campionati disponibili da Supabase/PostgreSQL."""
+    conn = None
+    try:
+        current_clean = str(current or "").strip().lower()
+        like = f"%{current_clean}%"
+        conn = connect()
+        cur = conn.cursor()
+
+        # Fonte principale: fc26_clubs.league. Fallback: players.league.
+        try:
+            if current_clean:
+                cur.execute("""
+                    SELECT DISTINCT COALESCE(league, 'Senza campionato') AS league
+                    FROM fc26_clubs
+                    WHERE league IS NOT NULL AND league <> '' AND LOWER(league) LIKE %s
+                    ORDER BY league ASC
+                    LIMIT 25
+                """, (like,))
+            else:
+                cur.execute("""
+                    SELECT DISTINCT COALESCE(league, 'Senza campionato') AS league
+                    FROM fc26_clubs
+                    WHERE league IS NOT NULL AND league <> ''
+                    ORDER BY league ASC
+                    LIMIT 25
+                """)
+            rows = cur.fetchall()
+        except Exception:
+            rows = []
+
+        if not rows:
+            if current_clean:
+                cur.execute("""
+                    SELECT DISTINCT COALESCE(league, 'Gioco') AS league
+                    FROM players
+                    WHERE league IS NOT NULL AND league <> '' AND LOWER(league) LIKE %s
+                    ORDER BY league ASC
+                    LIMIT 25
+                """, (like,))
+            else:
+                cur.execute("""
+                    SELECT DISTINCT COALESCE(league, 'Gioco') AS league
+                    FROM players
+                    WHERE league IS NOT NULL AND league <> ''
+                    ORDER BY league ASC
+                    LIMIT 25
+                """)
+            rows = cur.fetchall()
+
+        choices = []
+        seen = set()
+        for r in rows[:25]:
+            league = str(_row_get(r, "league", "") or "").strip()
+            if not league or league.lower() in seen:
+                continue
+            seen.add(league.lower())
+            choices.append(app_commands.Choice(name=_choice_label(league), value=league[:100]))
+        return choices
+    except Exception as e:
+        print(f"[AUTOCOMPLETE CAMPIONATO] Errore: {type(e).__name__}: {e}")
+        return []
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+async def cerca_club_autocomplete(interaction: discord.Interaction, current: str):
+    """Mostra club filtrati dal campionato scelto nel comando /cerca_club."""
+    conn = None
+    try:
+        league = str(getattr(interaction.namespace, "campionato", "") or "").strip()
+        current_clean = str(current or "").strip().lower()
+        like = f"%{current_clean}%"
+
+        if not league:
+            # Discord mostra max 25 scelte: prima va selezionato il campionato.
+            return [app_commands.Choice(name="Seleziona prima il campionato", value="")]
+
+        conn = connect()
+        cur = conn.cursor()
+
+        try:
+            if current_clean:
+                cur.execute("""
+                    SELECT name, assigned_to
+                    FROM fc26_clubs
+                    WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
+                      AND LOWER(name) LIKE %s
+                    ORDER BY name ASC
+                    LIMIT 25
+                """, (league, like))
+            else:
+                cur.execute("""
+                    SELECT name, assigned_to
+                    FROM fc26_clubs
+                    WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
+                    ORDER BY name ASC
+                    LIMIT 25
+                """, (league,))
+            rows = cur.fetchall()
+        except Exception:
+            rows = []
+
+        if not rows:
+            if current_clean:
+                cur.execute("""
+                    SELECT DISTINCT team AS name, NULL AS assigned_to
+                    FROM players
+                    WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
+                      AND team IS NOT NULL AND team <> ''
+                      AND LOWER(team) LIKE %s
+                    ORDER BY team ASC
+                    LIMIT 25
+                """, (league, like))
+            else:
+                cur.execute("""
+                    SELECT DISTINCT team AS name, NULL AS assigned_to
+                    FROM players
+                    WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
+                      AND team IS NOT NULL AND team <> ''
+                    ORDER BY team ASC
+                    LIMIT 25
+                """, (league,))
+            rows = cur.fetchall()
+
+        choices = []
+        seen = set()
+        for r in rows[:25]:
+            name = str(_row_get(r, "name", "") or "").strip()
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            status = "assegnato" if _row_get(r, "assigned_to") else "libero"
+            choices.append(app_commands.Choice(name=_choice_label(f"{name} • {status}"), value=name[:100]))
+        return choices
+    except Exception as e:
+        print(f"[AUTOCOMPLETE CLUB] Errore: {type(e).__name__}: {e}")
+        return []
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
 
 async def cerca_testo_autocomplete(interaction: discord.Interaction, current: str):
     """
-    Autocomplete dinamico e leggero per /cerca e /cerc.
+    Autocomplete per /cerca e /cerc.
 
-    IMPORTANTE: Discord permette massimo 25 opzioni per volta.
-    Quindi il menu mostra le prime 25 corrispondenze e si aggiorna mentre scrivi.
-
-    - tipo = Nome club  -> mostra campionato + club da fc26_clubs.
-    - tipo = Nome player -> mostra giocatori da players.
-
-    Questa versione evita query pesanti con JOIN/COUNT, così Discord non mostra più
-    "Impossibile caricare le opzioni".
+    - Nome giocatore: mostra giocatori.
+    - Nome club: mostra prima i campionati. Dopo aver scelto il campionato,
+      il comando apre un menu con i club di quel campionato.
     """
     conn = None
     try:
@@ -9758,68 +9924,77 @@ async def cerca_testo_autocomplete(interaction: discord.Interaction, current: st
         conn = connect()
         cur = conn.cursor()
 
-        # ================= CLUB / CAMPIONATI =================
+        # ================= CLUB: STEP 1, CAMPIONATI =================
         if str(tipo_value) == "club":
-            # Prima fonte: tabella Supabase fc26_clubs.
-            # Mostra campionato + club. Query volutamente leggera per evitare timeout Discord.
+            # Se l'utente ha già scelto un campionato nello stesso campo, mostra i club.
+            if current_clean.startswith(LEAGUE_PREFIX):
+                league = current_clean[len(LEAGUE_PREFIX):].strip()
+                if league:
+                    cur.execute("""
+                        SELECT name, assigned_to
+                        FROM fc26_clubs
+                        WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
+                        ORDER BY name ASC
+                        LIMIT 25
+                    """, (league,))
+                    rows = cur.fetchall()
+                    return [
+                        app_commands.Choice(
+                            name=_choice_label(f"{_row_get(r, 'name')} • {'assegnato' if _row_get(r, 'assigned_to') else 'libero'}"),
+                            value=str(_row_get(r, 'name'))[:100]
+                        )
+                        for r in rows[:25]
+                    ]
+
+            # Mostra campionati, non club, così non perdi club oltre i primi 25.
             if current_clean:
                 cur.execute("""
-                    SELECT
-                        name,
-                        COALESCE(league, 'Senza campionato') AS league,
-                        assigned_to
+                    SELECT DISTINCT COALESCE(league, 'Senza campionato') AS league
                     FROM fc26_clubs
-                    WHERE LOWER(name) LIKE %s
-                       OR LOWER(COALESCE(league, '')) LIKE %s
-                    ORDER BY COALESCE(league, 'Senza campionato') ASC, name ASC
+                    WHERE league IS NOT NULL AND league <> '' AND LOWER(league) LIKE %s
+                    ORDER BY league ASC
                     LIMIT 25
-                """, (like, like))
+                """, (like,))
             else:
                 cur.execute("""
-                    SELECT
-                        name,
-                        COALESCE(league, 'Senza campionato') AS league,
-                        assigned_to
+                    SELECT DISTINCT COALESCE(league, 'Senza campionato') AS league
                     FROM fc26_clubs
-                    ORDER BY COALESCE(league, 'Senza campionato') ASC, name ASC
+                    WHERE league IS NOT NULL AND league <> ''
+                    ORDER BY league ASC
                     LIMIT 25
                 """)
-
             rows = cur.fetchall()
 
-            # Fallback: se fc26_clubs è vuota, usa i club presenti nei giocatori.
             if not rows:
                 if current_clean:
                     cur.execute("""
-                        SELECT DISTINCT
-                            team AS name,
-                            COALESCE(league, 'Gioco') AS league,
-                            NULL AS assigned_to
+                        SELECT DISTINCT COALESCE(league, 'Gioco') AS league
                         FROM players
-                        WHERE team IS NOT NULL
-                          AND team <> ''
-                          AND (LOWER(team) LIKE %s OR LOWER(COALESCE(league, '')) LIKE %s)
-                        ORDER BY COALESCE(league, 'Gioco') ASC, team ASC
+                        WHERE league IS NOT NULL AND league <> '' AND LOWER(league) LIKE %s
+                        ORDER BY league ASC
                         LIMIT 25
-                    """, (like, like))
+                    """, (like,))
                 else:
                     cur.execute("""
-                        SELECT DISTINCT
-                            team AS name,
-                            COALESCE(league, 'Gioco') AS league,
-                            NULL AS assigned_to
+                        SELECT DISTINCT COALESCE(league, 'Gioco') AS league
                         FROM players
-                        WHERE team IS NOT NULL AND team <> ''
-                        ORDER BY COALESCE(league, 'Gioco') ASC, team ASC
+                        WHERE league IS NOT NULL AND league <> ''
+                        ORDER BY league ASC
                         LIMIT 25
                     """)
                 rows = cur.fetchall()
 
             choices = []
+            seen = set()
             for r in rows[:25]:
-                status = "assegnato" if r["assigned_to"] else "libero"
-                label = f"{r['league']} • {r['name']} • {status}"
-                choices.append(app_commands.Choice(name=label[:100], value=str(r["name"])[:100]))
+                league = str(_row_get(r, "league", "") or "").strip()
+                if not league or league.lower() in seen:
+                    continue
+                seen.add(league.lower())
+                choices.append(app_commands.Choice(
+                    name=_choice_label(f"📁 {league}"),
+                    value=f"{LEAGUE_PREFIX}{league}"[:100]
+                ))
             return choices
 
         # ================= GIOCATORI =================
@@ -9862,9 +10037,9 @@ async def cerca_testo_autocomplete(interaction: discord.Interaction, current: st
 
         choices = []
         for p in rows[:25]:
-            stato = "venduto" if p["owner_discord_id"] else "libero"
-            label = f"{p['name']} • OVR {p['overall']} • {p['position']} • {p['current_club']} • {stato}"
-            choices.append(app_commands.Choice(name=label[:100], value=str(p["id"])[:100]))
+            stato = "venduto" if _row_get(p, "owner_discord_id") else "libero"
+            label = f"{_row_get(p, 'name')} • OVR {_row_get(p, 'overall')} • {_row_get(p, 'position')} • {_row_get(p, 'current_club')} • {stato}"
+            choices.append(app_commands.Choice(name=_choice_label(label), value=str(_row_get(p, "id"))[:100]))
         return choices
 
     except Exception as e:
@@ -9877,10 +10052,136 @@ async def cerca_testo_autocomplete(interaction: discord.Interaction, current: st
         except Exception:
             pass
 
+
+def _get_clubs_for_league(league_name: str):
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT name, assigned_to
+            FROM fc26_clubs
+            WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
+            ORDER BY name ASC
+            LIMIT 25
+        """, (str(league_name),))
+        rows = cur.fetchall()
+    except Exception:
+        rows = []
+
+    if not rows:
+        cur.execute("""
+            SELECT DISTINCT team AS name, NULL AS assigned_to
+            FROM players
+            WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
+              AND team IS NOT NULL AND team <> ''
+            ORDER BY team ASC
+            LIMIT 25
+        """, (str(league_name),))
+        rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def _build_club_players_embed(club_name: str):
+    query = normalize_text(club_name).strip()
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT p.*, COALESCE(m.club_name, p.team) AS current_club
+        FROM players p
+        LEFT JOIN managers m ON m.discord_id = p.owner_discord_id
+        ORDER BY p.overall DESC NULLS LAST
+    """)
+    all_players = cur.fetchall()
+    conn.close()
+
+    matched = [
+        p for p in all_players
+        if query in normalize_text(_row_get(p, "current_club", _row_get(p, "team", "")) or _row_get(p, "team", ""))
+    ]
+
+    if not matched:
+        return None, 0
+
+    embed = discord.Embed(
+        title="Risultati ricerca club",
+        description=f"Club cercato: **{club_name}**\nGiocatori trovati: **{len(matched)}**",
+        color=discord.Color.green()
+    )
+
+    for p in matched[:25]:
+        owner = _row_get(p, "owner_discord_id")
+        status = f"Assegnato a <@{owner}>" if owner else "Libero"
+        embed.add_field(
+            name=f"{_row_get(p, 'name')} — OVR {_row_get(p, 'overall')}",
+            value=(
+                f"Club attuale: **{_row_get(p, 'current_club', _row_get(p, 'team'))}**\n"
+                f"Club originale: **{_row_get(p, 'team')}**\n"
+                f"Ruolo: **{_row_get(p, 'position')}**\n"
+                f"Stato: **{status}**\n"
+                f"ID: `{_row_get(p, 'id')}`"
+            ),
+            inline=False
+        )
+
+    if len(matched) > 25:
+        embed.set_footer(text=f"Mostrati 25 giocatori su {len(matched)} trovati.")
+    return embed, len(matched)
+
+
+class ClubSearchSelect(discord.ui.Select):
+    def __init__(self, league_name: str, clubs):
+        self.league_name = league_name
+        options = []
+        for r in clubs[:25]:
+            name = str(_row_get(r, "name", "") or "").strip()
+            if not name:
+                continue
+            status = "assegnato" if _row_get(r, "assigned_to") else "libero"
+            options.append(discord.SelectOption(
+                label=name[:100],
+                value=name[:100],
+                description=f"{league_name} • {status}"[:100]
+            ))
+
+        if not options:
+            options = [discord.SelectOption(label="Nessun club trovato", value="__none__")]
+
+        super().__init__(
+            placeholder=f"Scegli club in {league_name}",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        club_name = self.values[0]
+        if club_name == "__none__":
+            await interaction.response.send_message("❌ Nessun club disponibile per questo campionato.", ephemeral=True)
+            return
+
+        embed, count = _build_club_players_embed(club_name)
+        if not embed:
+            await interaction.response.edit_message(
+                content=f"❌ Nessun giocatore trovato per **{club_name}**.",
+                embed=None,
+                view=None
+            )
+            return
+
+        await interaction.response.edit_message(content=None, embed=embed, view=None)
+
+
+class ClubSearchView(discord.ui.View):
+    def __init__(self, league_name: str, clubs):
+        super().__init__(timeout=180)
+        self.add_item(ClubSearchSelect(league_name, clubs))
+
+
 @tree.command(name="cerca", description="Cerca giocatori per nome oppure per club")
 @app_commands.describe(
     tipo="Scegli se cercare per nome giocatore o per club",
-    testo="Scrivi il nome del giocatore o del club"
+    testo="Per giocatore: nome. Per club: scegli prima il campionato dal menu.",
 )
 @app_commands.choices(tipo=[
     app_commands.Choice(name="Nome giocatore", value="player"),
@@ -9893,6 +10194,24 @@ async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str]
             f"❌ Puoi usare questo comando solo nel canale <#{SEARCH_CHANNEL_ID}>.",
             ephemeral=True
         )
+        return
+
+    if tipo.value == "club" and str(testo).startswith(LEAGUE_PREFIX):
+        await safe_defer(interaction, ephemeral=True, thinking=True)
+        league_name = str(testo)[len(LEAGUE_PREFIX):].strip()
+        clubs = _get_clubs_for_league(league_name)
+        if not clubs:
+            await interaction.followup.send(f"❌ Nessun club trovato per il campionato **{league_name}**.", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title="Ricerca club",
+            description=(
+                f"Campionato selezionato: **{league_name}**\n"
+                "Ora scegli il club dal menu qui sotto."
+            ),
+            color=discord.Color.blurple()
+        )
+        await interaction.followup.send(embed=embed, view=ClubSearchView(league_name, clubs), ephemeral=True)
         return
 
     query = normalize_text(testo).strip()
@@ -9944,16 +10263,16 @@ async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str]
         )
 
         for p in rows:
-            owner = p["owner_discord_id"]
+            owner = _row_get(p, "owner_discord_id")
             status = f"Assegnato a <@{owner}>" if owner else "Libero"
             embed.add_field(
-                name=f"{p['name']} — OVR {p['overall']}",
+                name=f"{_row_get(p, 'name')} — OVR {_row_get(p, 'overall')}",
                 value=(
-                    f"Club attuale: **{p.get('current_club', p['team']) if hasattr(p, 'get') else p['team']}**\n"
-                    f"Club originale: **{p['team']}**\n"
-                    f"Ruolo: **{p['position']}**\n"
+                    f"Club attuale: **{_row_get(p, 'current_club', _row_get(p, 'team'))}**\n"
+                    f"Club originale: **{_row_get(p, 'team')}**\n"
+                    f"Ruolo: **{_row_get(p, 'position')}**\n"
                     f"Stato: **{status}**\n"
-                    f"ID: `{p['id']}`"
+                    f"ID: `{_row_get(p, 'id')}`"
                 ),
                 inline=False
             )
@@ -9961,59 +10280,48 @@ async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str]
         await interaction.followup.send(embed=embed, ephemeral=True)
         return
 
-    # Ricerca per club: usa il club ATTUALE del proprietario, così i trasferimenti sono aggiornati.
-    cur.execute("""
-        SELECT p.*, COALESCE(m.club_name, p.team) AS current_club
-        FROM players p
-        LEFT JOIN managers m ON m.discord_id = p.owner_discord_id
-        ORDER BY p.overall DESC NULLS LAST
-    """)
-    all_players = cur.fetchall()
+    # Ricerca diretta per club manuale.
     conn.close()
-
-    matched = [
-        p for p in all_players
-        if query in normalize_text(p.get("current_club", p["team"]) if hasattr(p, "get") else p["team"])
-    ]
-
-    if not matched:
+    embed, count = _build_club_players_embed(testo)
+    if not embed:
         await interaction.followup.send(
-            "❌ Nessun giocatore trovato per questo club. Prova con un nome diverso, esempio `Arsenal`, `Inter`, `Real Madrid`.",
+            "❌ Nessun giocatore trovato per questo club. Scegli prima un campionato dal menu oppure prova con un nome club diverso.",
+            ephemeral=True
+        )
+        return
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="cerca_club", description="Cerca club in due step: campionato e club")
+@app_commands.describe(
+    campionato="Scegli il campionato",
+    club="Scegli il club del campionato selezionato"
+)
+@app_commands.autocomplete(campionato=cerca_campionato_autocomplete, club=cerca_club_autocomplete)
+async def cerca_club(interaction: discord.Interaction, campionato: str, club: str):
+    if not is_search_channel(interaction):
+        await interaction.response.send_message(
+            f"❌ Puoi usare questo comando solo nel canale <#{SEARCH_CHANNEL_ID}>.",
             ephemeral=True
         )
         return
 
-    embed = discord.Embed(
-        title="Risultati ricerca club",
-        description=f"Club cercato: **{testo}**\nGiocatori trovati: **{len(matched)}**",
-        color=discord.Color.green()
-    )
+    if not club:
+        await interaction.response.send_message("❌ Seleziona prima il campionato e poi il club.", ephemeral=True)
+        return
 
-    for p in matched[:25]:
-        owner = p["owner_discord_id"]
-        status = f"Assegnato a <@{owner}>" if owner else "Libero"
-        embed.add_field(
-            name=f"{p['name']} — OVR {p['overall']}",
-            value=(
-                f"Club attuale: **{p.get('current_club', p['team']) if hasattr(p, 'get') else p['team']}**\n"
-                f"Club originale: **{p['team']}**\n"
-                f"Ruolo: **{p['position']}**\n"
-                f"Stato: **{status}**\n"
-                f"ID: `{p['id']}`"
-            ),
-            inline=False
-        )
-
-    if len(matched) > 25:
-        embed.set_footer(text=f"Mostrati 25 giocatori su {len(matched)} trovati.")
-
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+    embed, count = _build_club_players_embed(club)
+    if not embed:
+        await interaction.followup.send(f"❌ Nessun giocatore trovato per **{club}**.", ephemeral=True)
+        return
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @tree.command(name="cerc", description="Alias rapido: cerca giocatori per nome oppure club")
 @app_commands.describe(
     tipo="Scegli se cercare per nome giocatore o per club",
-    testo="Scrivi il nome del giocatore o del club"
+    testo="Per giocatore: nome. Per club: scegli prima il campionato dal menu."
 )
 @app_commands.choices(tipo=[
     app_commands.Choice(name="Nome giocatore", value="player"),
