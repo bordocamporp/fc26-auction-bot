@@ -826,6 +826,131 @@ def ensure_extra_tables():
     )
     """)
 
+
+    # ================= SITO WEB: classifiche / risultati / tabellone =================
+    # Queste tabelle sono lette da Next.js su Vercel.
+    # Il bot aggiorna qui i risultati confermati e il sito si aggiorna automaticamente.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS standings (
+        id SERIAL PRIMARY KEY,
+        competition_name TEXT,
+        competition_type TEXT,
+        club_name TEXT,
+        logo_url TEXT,
+        played INTEGER DEFAULT 0,
+        wins INTEGER DEFAULT 0,
+        draws INTEGER DEFAULT 0,
+        losses INTEGER DEFAULT 0,
+        goals_for INTEGER DEFAULT 0,
+        goals_against INTEGER DEFAULT 0,
+        points INTEGER DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    for sql in [
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS competition_name TEXT",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS competition_type TEXT",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS club_name TEXT",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS logo_url TEXT",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS played INTEGER DEFAULT 0",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS wins INTEGER DEFAULT 0",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS draws INTEGER DEFAULT 0",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS losses INTEGER DEFAULT 0",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS goals_for INTEGER DEFAULT 0",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS goals_against INTEGER DEFAULT 0",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS points INTEGER DEFAULT 0",
+        "ALTER TABLE standings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception as e:
+            print(f"[SITE SYNC] Errore alter standings: {e}")
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS match_results (
+        id SERIAL PRIMARY KEY,
+        source_table TEXT,
+        source_match_id TEXT,
+        competition_name TEXT NOT NULL,
+        competition_type TEXT NOT NULL,
+        round TEXT,
+        home_team TEXT NOT NULL,
+        away_team TEXT NOT NULL,
+        home_score INTEGER DEFAULT 0,
+        away_score INTEGER DEFAULT 0,
+        winner TEXT,
+        status TEXT DEFAULT 'played',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    for sql in [
+        "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS source_table TEXT",
+        "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS source_match_id TEXT",
+        "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS competition_name TEXT",
+        "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS competition_type TEXT",
+        "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS round TEXT",
+        "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS home_team TEXT",
+        "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS away_team TEXT",
+        "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS home_score INTEGER DEFAULT 0",
+        "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS away_score INTEGER DEFAULT 0",
+        "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS winner TEXT",
+        "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'played'",
+        "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception as e:
+            print(f"[SITE SYNC] Errore alter match_results: {e}")
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cup_matches (
+        id SERIAL PRIMARY KEY,
+        source_table TEXT,
+        source_match_id TEXT,
+        competition_name TEXT,
+        round TEXT,
+        home_team TEXT,
+        away_team TEXT,
+        home_score INTEGER DEFAULT 0,
+        away_score INTEGER DEFAULT 0,
+        winner TEXT,
+        status TEXT DEFAULT 'played',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    for sql in [
+        "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS source_table TEXT",
+        "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS source_match_id TEXT",
+        "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS competition_name TEXT",
+        "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS round TEXT",
+        "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS home_team TEXT",
+        "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS away_team TEXT",
+        "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS home_score INTEGER DEFAULT 0",
+        "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS away_score INTEGER DEFAULT 0",
+        "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS winner TEXT",
+        "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'played'",
+        "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception as e:
+            print(f"[SITE SYNC] Errore alter cup_matches: {e}")
+
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_standings_comp ON standings(competition_name, competition_type)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_match_results_source ON match_results(source_table, source_match_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_cup_matches_source ON cup_matches(source_table, source_match_id)")
+    except Exception:
+        pass
+    # ======================================================================
+
     conn.commit()
     conn.close()
 
@@ -7575,6 +7700,7 @@ def calculate_group_standings(championship_id, group_id):
     table = {}
     for p in players:
         table[p["discord_id"]] = {
+            "discord_id": str(p["discord_id"]),
             "name": p["display_name"],
             "pg": 0,
             "w": 0,
@@ -8056,6 +8182,440 @@ def build_result_embed(match_id):
     return embed
 
 
+
+# ================= SYNC RISULTATI DISCORD -> SITO =================
+
+def site_winner_name(home_name, away_name, home_goals, away_goals):
+    hg = safe_int(home_goals)
+    ag = safe_int(away_goals)
+    if hg > ag:
+        return home_name
+    if ag > hg:
+        return away_name
+    return None
+
+
+def get_site_club_name(discord_id, fallback_name=None):
+    """Restituisce il club assegnato al manager, se presente, altrimenti il nome Discord."""
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT name
+            FROM fc26_clubs
+            WHERE assigned_to = %s
+            LIMIT 1
+        """, (str(discord_id),))
+        row = cur.fetchone()
+        if row and row.get("name"):
+            return row["name"]
+    except Exception:
+        pass
+
+    try:
+        cur.execute("""
+            SELECT club_name, manager_name, name
+            FROM managers
+            WHERE discord_id = %s
+            LIMIT 1
+        """, (str(discord_id),))
+        row = cur.fetchone()
+        if row:
+            return row.get("club_name") or row.get("manager_name") or row.get("name") or fallback_name or str(discord_id)
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+    return fallback_name or str(discord_id)
+
+
+def sync_site_match_result(match_id):
+    """Salva il risultato confermato nella tabella match_results letta dal sito."""
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT m.*, c.name AS championship_name, g.name AS group_name
+        FROM championship_matches m
+        LEFT JOIN championships c ON c.id = m.championship_id
+        LEFT JOIN championship_groups g ON g.id = m.group_id
+        WHERE m.id = %s
+        LIMIT 1
+    """, (match_id,))
+    m = cur.fetchone()
+
+    if not m:
+        conn.close()
+        return False
+
+    home_team = get_site_club_name(m["home_id"], m["home_name"])
+    away_team = get_site_club_name(m["away_id"], m["away_name"])
+    competition_name = m.get("group_name") or m.get("championship_name") or "Campionato"
+    competition_type = "Campionati"
+    round_name = f"Giornata {m['round_number']}"
+    winner = site_winner_name(home_team, away_team, m["home_goals"], m["away_goals"])
+
+    cur.execute("""
+        DELETE FROM match_results
+        WHERE source_table = 'championship_matches'
+          AND source_match_id = %s
+    """, (str(match_id),))
+
+    cur.execute("""
+        INSERT INTO match_results (
+            source_table,
+            source_match_id,
+            competition_name,
+            competition_type,
+            round,
+            home_team,
+            away_team,
+            home_score,
+            away_score,
+            winner,
+            status,
+            updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'played', CURRENT_TIMESTAMP)
+    """, (
+        "championship_matches",
+        str(match_id),
+        competition_name,
+        competition_type,
+        round_name,
+        home_team,
+        away_team,
+        safe_int(m["home_goals"]),
+        safe_int(m["away_goals"]),
+        winner,
+    ))
+
+    conn.commit()
+    conn.close()
+    return True
+
+
+def sync_site_standings_for_championship(championship_id):
+    """Ricalcola le classifiche del campionato attivo e aggiorna la tabella standings del sito."""
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT *
+        FROM championship_groups
+        WHERE championship_id = %s
+        ORDER BY id ASC
+    """, (championship_id,))
+    groups = cur.fetchall()
+
+    group_names = [g["name"] for g in groups]
+
+    if group_names:
+        cur.execute("""
+            DELETE FROM standings
+            WHERE competition_type = 'Campionati'
+              AND competition_name = ANY(%s)
+        """, (group_names,))
+    else:
+        cur.execute("DELETE FROM standings WHERE competition_type = 'Campionati'")
+
+    conn.commit()
+    conn.close()
+
+    # calculate_group_standings apre una sua connessione, quindi inseriamo dopo.
+    conn = connect()
+    cur = conn.cursor()
+
+    for g in groups:
+        table = calculate_group_standings(championship_id, g["id"])
+        for row in table:
+            discord_id = row.get("discord_id")
+            club_name = get_site_club_name(discord_id, row["name"]) if discord_id else row["name"]
+
+            cur.execute("""
+                INSERT INTO standings (
+                    competition_name,
+                    competition_type,
+                    club_name,
+                    played,
+                    wins,
+                    draws,
+                    losses,
+                    goals_for,
+                    goals_against,
+                    points,
+                    updated_at
+                )
+                VALUES (%s, 'Campionati', %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            """, (
+                g["name"],
+                club_name,
+                safe_int(row["pg"]),
+                safe_int(row["w"]),
+                safe_int(row["d"]),
+                safe_int(row["l"]),
+                safe_int(row["gf"]),
+                safe_int(row["ga"]),
+                safe_int(row["pts"]),
+            ))
+
+    conn.commit()
+    conn.close()
+    return True
+
+
+def sync_site_after_confirmed_match(match_id):
+    """Hook centrale chiamato quando un risultato campionato viene confermato."""
+    try:
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("SELECT championship_id FROM championship_matches WHERE id = %s", (match_id,))
+        row = cur.fetchone()
+        conn.close()
+
+        if not row:
+            return False
+
+        sync_site_match_result(match_id)
+        sync_site_standings_for_championship(row["championship_id"])
+        print(f"[SITE SYNC] Classifica e risultato aggiornati per match_id={match_id}")
+        return True
+    except Exception as e:
+        print(f"[SITE SYNC ERROR] match_id={match_id}: {e}")
+        return False
+
+
+def sync_site_manual_league_result(competition_name, home_team, away_team, home_score, away_score, round_name="Risultato"):
+    """Comando staff: salva un risultato manuale e ricalcola la classifica partendo da match_results."""
+    home_score = safe_int(home_score)
+    away_score = safe_int(away_score)
+    winner = site_winner_name(home_team, away_team, home_score, away_score)
+
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO match_results (
+            source_table,
+            source_match_id,
+            competition_name,
+            competition_type,
+            round,
+            home_team,
+            away_team,
+            home_score,
+            away_score,
+            winner,
+            status,
+            updated_at
+        )
+        VALUES ('manual', %s, %s, 'Campionati', %s, %s, %s, %s, %s, %s, 'played', CURRENT_TIMESTAMP)
+    """, (
+        f"manual-{datetime.now().timestamp()}",
+        competition_name,
+        round_name,
+        home_team,
+        away_team,
+        home_score,
+        away_score,
+        winner,
+    ))
+
+    cur.execute("SELECT * FROM match_results WHERE competition_name = %s AND competition_type = 'Campionati'", (competition_name,))
+    matches = cur.fetchall()
+
+    table = {}
+    for m in matches:
+        for team in (m["home_team"], m["away_team"]):
+            table.setdefault(team, {"pg": 0, "w": 0, "d": 0, "l": 0, "gf": 0, "ga": 0, "pts": 0})
+
+        hg = safe_int(m["home_score"])
+        ag = safe_int(m["away_score"])
+        h = m["home_team"]
+        a = m["away_team"]
+
+        table[h]["pg"] += 1
+        table[a]["pg"] += 1
+        table[h]["gf"] += hg
+        table[h]["ga"] += ag
+        table[a]["gf"] += ag
+        table[a]["ga"] += hg
+
+        if hg > ag:
+            table[h]["w"] += 1
+            table[a]["l"] += 1
+            table[h]["pts"] += 3
+        elif ag > hg:
+            table[a]["w"] += 1
+            table[h]["l"] += 1
+            table[a]["pts"] += 3
+        else:
+            table[h]["d"] += 1
+            table[a]["d"] += 1
+            table[h]["pts"] += 1
+            table[a]["pts"] += 1
+
+    cur.execute("DELETE FROM standings WHERE competition_name = %s AND competition_type = 'Campionati'", (competition_name,))
+
+    for team, row in table.items():
+        cur.execute("""
+            INSERT INTO standings (
+                competition_name,
+                competition_type,
+                club_name,
+                played,
+                wins,
+                draws,
+                losses,
+                goals_for,
+                goals_against,
+                points,
+                updated_at
+            )
+            VALUES (%s, 'Campionati', %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+        """, (
+            competition_name,
+            team,
+            row["pg"],
+            row["w"],
+            row["d"],
+            row["l"],
+            row["gf"],
+            row["ga"],
+            row["pts"],
+        ))
+
+    conn.commit()
+    conn.close()
+    return True
+
+
+def sync_site_cup_result(competition_name, round_name, home_team, away_team, home_score, away_score):
+    """Comando staff: salva risultato coppa nazionale e aggiorna tabellone letto dal sito."""
+    home_score = safe_int(home_score)
+    away_score = safe_int(away_score)
+    winner = site_winner_name(home_team, away_team, home_score, away_score)
+
+    conn = connect()
+    cur = conn.cursor()
+
+    source_id = f"manual-cup-{datetime.now().timestamp()}"
+
+    cur.execute("""
+        INSERT INTO match_results (
+            source_table,
+            source_match_id,
+            competition_name,
+            competition_type,
+            round,
+            home_team,
+            away_team,
+            home_score,
+            away_score,
+            winner,
+            status,
+            updated_at
+        )
+        VALUES ('manual_cup', %s, %s, 'Coppa Nazionale', %s, %s, %s, %s, %s, %s, 'played', CURRENT_TIMESTAMP)
+    """, (
+        source_id,
+        competition_name,
+        round_name,
+        home_team,
+        away_team,
+        home_score,
+        away_score,
+        winner,
+    ))
+
+    cur.execute("""
+        INSERT INTO cup_matches (
+            source_table,
+            source_match_id,
+            competition_name,
+            round,
+            home_team,
+            away_team,
+            home_score,
+            away_score,
+            winner,
+            status,
+            updated_at
+        )
+        VALUES ('manual_cup', %s, %s, %s, %s, %s, %s, %s, %s, 'played', CURRENT_TIMESTAMP)
+    """, (
+        source_id,
+        competition_name,
+        round_name,
+        home_team,
+        away_team,
+        home_score,
+        away_score,
+        winner,
+    ))
+
+    # La pagina classifiche attuale usa standings anche per il tabellone coppa:
+    # inseriamo una riga per ciascuna squadra del match.
+    cur.execute("""
+        INSERT INTO standings (
+            competition_name,
+            competition_type,
+            club_name,
+            played,
+            wins,
+            draws,
+            losses,
+            goals_for,
+            goals_against,
+            points,
+            updated_at
+        )
+        VALUES (%s, 'Coppa Nazionale', %s, 1, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+    """, (
+        competition_name,
+        home_team,
+        1 if home_score > away_score else 0,
+        1 if home_score == away_score else 0,
+        1 if home_score < away_score else 0,
+        home_score,
+        away_score,
+        3 if home_score > away_score else 1 if home_score == away_score else 0,
+    ))
+
+    cur.execute("""
+        INSERT INTO standings (
+            competition_name,
+            competition_type,
+            club_name,
+            played,
+            wins,
+            draws,
+            losses,
+            goals_for,
+            goals_against,
+            points,
+            updated_at
+        )
+        VALUES (%s, 'Coppa Nazionale', %s, 1, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+    """, (
+        competition_name,
+        away_team,
+        1 if away_score > home_score else 0,
+        1 if away_score == home_score else 0,
+        1 if away_score < home_score else 0,
+        away_score,
+        home_score,
+        3 if away_score > home_score else 1 if away_score == home_score else 0,
+    ))
+
+    conn.commit()
+    conn.close()
+    return True
+
+# ========================================================
+
+
 class ResultConfirmView(discord.ui.View):
     def __init__(self, match_id, confirm_by):
         super().__init__(timeout=86400)
@@ -8074,8 +8634,10 @@ class ResultConfirmView(discord.ui.View):
         conn.commit()
         conn.close()
 
+        sync_site_after_confirmed_match(self.match_id)
+
         embed = build_result_embed(self.match_id)
-        await interaction.response.edit_message(content="✅ Risultato confermato.", embed=embed, view=None)
+        await interaction.response.edit_message(content="✅ Risultato confermato e sito aggiornato.", embed=embed, view=None)
 
     @discord.ui.button(label="Contesta", style=discord.ButtonStyle.danger)
     async def contest(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -8129,6 +8691,128 @@ async def risultato(interaction: discord.Interaction):
     )
 
     await interaction.response.send_message(embed=embed, view=ResultOpponentView(matches), ephemeral=True)
+
+
+@tree.command(name="risultato_campionato", description="Staff: inserisce un risultato campionato e aggiorna sito/classifica")
+@app_commands.describe(
+    competizione="Nome campionato/girone, es: Serie A",
+    casa="Squadra di casa",
+    trasferta="Squadra in trasferta",
+    gol_casa="Gol casa",
+    gol_trasferta="Gol trasferta",
+    giornata="Giornata o turno"
+)
+async def risultato_campionato(
+    interaction: discord.Interaction,
+    competizione: str,
+    casa: str,
+    trasferta: str,
+    gol_casa: int,
+    gol_trasferta: int,
+    giornata: str = "Risultato"
+):
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    if not is_league_admin(interaction):
+        await interaction.followup.send("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+
+    try:
+        sync_site_manual_league_result(
+            competizione,
+            casa,
+            trasferta,
+            gol_casa,
+            gol_trasferta,
+            giornata
+        )
+
+        embed = discord.Embed(
+            title="✅ Risultato campionato registrato",
+            description=(
+                f"🏆 **{competizione}**\n"
+                f"📅 {giornata}\n\n"
+                f"**{casa} {gol_casa} - {gol_trasferta} {trasferta}**\n\n"
+                f"🌐 Classifica sito aggiornata."
+            ),
+            color=discord.Color.green()
+        )
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+        try:
+            channel = interaction.guild.get_channel(int(RESULTS_CHANNEL_ID)) if interaction.guild else None
+            if channel:
+                await channel.send(embed=embed)
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"[RISULTATO CAMPIONATO ERROR] {e}")
+        await interaction.followup.send(f"❌ Errore aggiornamento risultato: `{e}`", ephemeral=True)
+
+
+@tree.command(name="risultato_coppa", description="Staff: inserisce un risultato coppa e aggiorna sito/tabellone")
+@app_commands.describe(
+    competizione="Nome coppa, es: Coppa Italia",
+    turno="Turno, es: Ottavi, Quarti, Semifinale, Finale",
+    casa="Squadra di casa",
+    trasferta="Squadra in trasferta",
+    gol_casa="Gol casa",
+    gol_trasferta="Gol trasferta"
+)
+async def risultato_coppa(
+    interaction: discord.Interaction,
+    competizione: str,
+    turno: str,
+    casa: str,
+    trasferta: str,
+    gol_casa: int,
+    gol_trasferta: int
+):
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    if not is_league_admin(interaction):
+        await interaction.followup.send("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+
+    try:
+        sync_site_cup_result(
+            competizione,
+            turno,
+            casa,
+            trasferta,
+            gol_casa,
+            gol_trasferta
+        )
+
+        winner = site_winner_name(casa, trasferta, gol_casa, gol_trasferta) or "Pareggio"
+
+        embed = discord.Embed(
+            title="🏆 Risultato coppa registrato",
+            description=(
+                f"🏆 **{competizione}**\n"
+                f"📌 {turno}\n\n"
+                f"**{casa} {gol_casa} - {gol_trasferta} {trasferta}**\n"
+                f"✅ Qualificata/Vincitrice: **{winner}**\n\n"
+                f"🌐 Tabellone sito aggiornato."
+            ),
+            color=discord.Color.orange()
+        )
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+        try:
+            channel = interaction.guild.get_channel(int(RESULTS_CHANNEL_ID)) if interaction.guild else None
+            if channel:
+                await channel.send(embed=embed)
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"[RISULTATO COPPA ERROR] {e}")
+        await interaction.followup.send(f"❌ Errore aggiornamento coppa: `{e}`", ephemeral=True)
+
 
 
 @tree.command(name="classifica", description="Mostra la classifica del campionato")
