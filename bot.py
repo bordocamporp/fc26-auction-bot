@@ -10327,92 +10327,389 @@ def save_unified_result_and_sync(source_table, match_id, home_goals, away_goals,
     finally:
         conn.close()
 
-class GuidedMatchResultModal(discord.ui.Modal, title="Inserisci risultato"):
-    home_goals = discord.ui.TextInput(label="Gol casa", placeholder="Es: 2", required=True, max_length=2)
-    away_goals = discord.ui.TextInput(label="Gol trasferta", placeholder="Es: 1", required=True, max_length=2)
-    home_scorers = discord.ui.TextInput(label="Marcatori casa", placeholder="Es: Mbappe 2, Rodri 1", required=False, max_length=300)
-    away_scorers = discord.ui.TextInput(label="Marcatori trasferta", placeholder="Es: Lautaro 1", required=False, max_length=300)
 
-    def __init__(self, source_table, match_id):
-        super().__init__()
-        self.source_table = source_table
-        self.match_id = match_id
 
-    async def on_submit(self, interaction: discord.Interaction):
+def get_players_for_club_or_user(club_name=None, user_id=None):
+    conn = db_connect_safe()
+    cur = conn.cursor()
+
+    try:
+        if user_id:
+            try:
+                cur.execute("""
+                    SELECT id, name, position, overall
+                    FROM players
+                    WHERE owner_discord_id = %s
+                    ORDER BY overall DESC NULLS LAST, name ASC
+                    LIMIT 25
+                """, (str(user_id),))
+                rows = cur.fetchall()
+                if rows:
+                    return rows
+            except Exception as e:
+                print(f"[PLAYERS BY USER] {e}")
+
+        if club_name:
+            try:
+                aliases = list(get_team_aliases(club_name)) if "get_team_aliases" in globals() else [normalize_text(club_name)]
+                cur.execute("""
+                    SELECT id, name, position, overall, team
+                    FROM players
+                    ORDER BY overall DESC NULLS LAST, name ASC
+                """)
+                rows = cur.fetchall()
+
+                filtered = []
+                club_norm = normalize_text(club_name)
+
+                for row in rows:
+                    team_norm = normalize_text(row_get(row, "team", ""))
+                    if team_norm in aliases or club_norm in team_norm or team_norm in club_norm:
+                        filtered.append(row)
+                    if len(filtered) >= 25:
+                        break
+
+                if filtered:
+                    return filtered
+            except Exception as e:
+                print(f"[PLAYERS BY CLUB] {e}")
+
+    finally:
+        conn.close()
+
+    return []
+
+def scorer_label(player):
+    name = str(row_get(player, "name", "Giocatore"))
+    pos = str(row_get(player, "position", "") or "")
+    ovr = str(row_get(player, "overall", "") or "")
+    extra = " ".join(x for x in [pos, f"OVR {ovr}" if ovr else ""] if x)
+    return name[:100], extra[:100]
+
+
+class GoalCountSelect(discord.ui.Select):
+    def __init__(self, flow_view, side, player_name):
+        self.flow_view = flow_view
+        self.side = side
+        self.player_name = player_name
+
+        options = [
+            discord.SelectOption(label=f"{i} gol", value=str(i))
+            for i in range(1, 8)
+        ]
+
+        super().__init__(
+            placeholder=f"Quanti gol ha fatto {player_name[:40]}?",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        goals = safe_int(self.values[0], 1)
+        self.flow_view.add_scorer(self.side, self.player_name, goals)
+
+        await interaction.response.edit_message(
+            embed=self.flow_view.build_embed(),
+            view=self.flow_view,
+        )
+
+
+class GoalCountView(discord.ui.View):
+    def __init__(self, flow_view, side, player_name):
+        super().__init__(timeout=180)
+        self.add_item(GoalCountSelect(flow_view, side, player_name))
+
+
+class PlayerScorerSelect(discord.ui.Select):
+    def __init__(self, flow_view, side, players):
+        self.flow_view = flow_view
+        self.side = side
+
+        options = []
+        for p in players[:25]:
+            name, extra = scorer_label(p)
+            options.append(
+                discord.SelectOption(
+                    label=name,
+                    value=name,
+                    description=extra or "Giocatore",
+                )
+            )
+
+        if not options:
+            options = [
+                discord.SelectOption(
+                    label="Nessun giocatore trovato",
+                    value="none",
+                    description="Controlla la rosa della squadra",
+                )
+            ]
+
+        side_label = "casa" if side == "home" else "trasferta"
+        super().__init__(
+            placeholder=f"Scegli marcatore squadra {side_label}...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "none":
+            await interaction.response.send_message(
+                "❌ Nessun giocatore disponibile per questa squadra.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"⚽ Quanti gol ha fatto **{self.values[0]}**?",
+            view=GoalCountView(self.flow_view, self.side, self.values[0]),
+            ephemeral=True,
+        )
+
+
+class PlayerScorerView(discord.ui.View):
+    def __init__(self, flow_view, side, players):
+        super().__init__(timeout=180)
+        self.add_item(PlayerScorerSelect(flow_view, side, players))
+
+
+class GuidedScorerFlowView(discord.ui.View):
+    def __init__(self, match):
+        super().__init__(timeout=600)
+        self.match = match
+        self.home_scorers = []
+        self.away_scorers = []
+
+    def add_scorer(self, side, player_name, goals):
+        target = self.home_scorers if side == "home" else self.away_scorers
+
+        for idx, (name, old_goals) in enumerate(target):
+            if normalize_text(name) == normalize_text(player_name):
+                target[idx] = (name, safe_int(old_goals) + safe_int(goals))
+                return
+
+        target.append((player_name, safe_int(goals, 1)))
+
+    def total_home(self):
+        return sum(safe_int(goals) for _, goals in self.home_scorers)
+
+    def total_away(self):
+        return sum(safe_int(goals) for _, goals in self.away_scorers)
+
+    def scorer_lines(self, rows):
+        if not rows:
+            return "Nessun marcatore inserito."
+        return "\n".join(f"• **{name}** × {goals}" for name, goals in rows)
+
+    def build_embed(self):
+        home = self.match["home_club"]
+        away = self.match["away_club"]
+        home_goals = self.total_home()
+        away_goals = self.total_away()
+
+        embed = discord.Embed(
+            title="⚽ Inserimento risultato guidato",
+            description=(
+                f"**{home} {home_goals} - {away_goals} {away}**\n\n"
+                "Aggiungi i marcatori con i pulsanti sotto. "
+                "Il risultato viene calcolato automaticamente."
+            ),
+            color=discord.Color.gold(),
+        )
+        embed.add_field(
+            name=f"Marcatori {home}",
+            value=self.scorer_lines(self.home_scorers),
+            inline=False,
+        )
+        embed.add_field(
+            name=f"Marcatori {away}",
+            value=self.scorer_lines(self.away_scorers),
+            inline=False,
+        )
+        embed.set_footer(
+            text=f"{self.match['competition_name']} • {self.match['round']} {self.match['leg']}"
+        )
+        return embed
+
+    @discord.ui.button(label="Aggiungi marcatore casa", style=discord.ButtonStyle.primary, emoji="🏠")
+    async def add_home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        players = get_players_for_club_or_user(
+            club_name=self.match["home_club"],
+            user_id=self.match.get("home_user_id"),
+        )
+        await interaction.response.send_message(
+            f"🏠 Scegli marcatore per **{self.match['home_club']}**:",
+            view=PlayerScorerView(self, "home", players),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Aggiungi marcatore trasferta", style=discord.ButtonStyle.primary, emoji="🚌")
+    async def add_away(self, interaction: discord.Interaction, button: discord.ui.Button):
+        players = get_players_for_club_or_user(
+            club_name=self.match["away_club"],
+            user_id=self.match.get("away_user_id"),
+        )
+        await interaction.response.send_message(
+            f"🚌 Scegli marcatore per **{self.match['away_club']}**:",
+            view=PlayerScorerView(self, "away", players),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Reset marcatori", style=discord.ButtonStyle.secondary, emoji="♻️")
+    async def reset_scorers(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.home_scorers = []
+        self.away_scorers = []
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Conferma risultato", style=discord.ButtonStyle.success, emoji="✅")
+    async def confirm_result(self, interaction: discord.Interaction, button: discord.ui.Button):
+        home_goals = self.total_home()
+        away_goals = self.total_away()
+
+        if home_goals == 0 and away_goals == 0:
+            await interaction.response.send_message(
+                "❌ Devi inserire almeno un marcatore prima di confermare.",
+                ephemeral=True,
+            )
+            return
+
         await safe_defer(interaction, ephemeral=True, thinking=True)
+
         try:
             match = save_unified_result_and_sync(
-                self.source_table,
-                self.match_id,
-                self.home_goals.value,
-                self.away_goals.value,
-                parse_scorers_text(self.home_scorers.value),
-                parse_scorers_text(self.away_scorers.value),
+                self.match["source_table"],
+                self.match["id"],
+                home_goals,
+                away_goals,
+                self.home_scorers,
+                self.away_scorers,
             )
+
             await interaction.followup.send(
-                f"✅ Risultato salvato e sincronizzato col sito.\n**{match['home_club']} {self.home_goals.value} - {self.away_goals.value} {match['away_club']}**",
-                ephemeral=True
+                (
+                    "✅ Risultato confermato e sincronizzato col sito.\n"
+                    f"**{match['home_club']} {home_goals} - {away_goals} {match['away_club']}**"
+                ),
+                ephemeral=True,
             )
+
+            for item in self.children:
+                item.disabled = True
+
+            try:
+                await interaction.message.edit(embed=self.build_embed(), view=self)
+            except Exception:
+                pass
+
         except Exception as e:
-            print(f"[RESULT MODAL ERROR] {type(e).__name__}: {e}")
-            await interaction.followup.send(f"❌ Errore salvataggio risultato: `{type(e).__name__}`", ephemeral=True)
+            print(f"[CONFIRM RESULT ERROR] {type(e).__name__}: {e}")
+            await interaction.followup.send(
+                f"❌ Errore conferma risultato: `{type(e).__name__}`",
+                ephemeral=True,
+            )
+
 
 class GuidedMatchSelect(discord.ui.Select):
     def __init__(self, matches):
         self.match_map = {}
         options = []
-        for idx, m in enumerate(matches[:25], start=1):
+
+        for idx, match in enumerate(matches[:25], start=1):
             value = str(idx)
-            self.match_map[value] = m
-            label = f"{m['home_club']} vs {m['away_club']}"[:100]
-            desc = f"{m['competition_name']} • {m['round']} {m['leg']}".strip()[:100]
-            options.append(discord.SelectOption(label=label, value=value, description=desc or "Partita attiva"))
+            self.match_map[value] = match
+            label = f"{match['home_club']} vs {match['away_club']}"[:100]
+            desc = f"{match['competition_name']} • {match['round']} {match['leg']}".strip()[:100]
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    value=value,
+                    description=desc or "Partita attiva",
+                )
+            )
 
         if not options:
             options = [discord.SelectOption(label="Nessuna partita disponibile", value="none")]
 
-        super().__init__(placeholder="Scegli la partita...", min_values=1, max_values=1, options=options)
+        super().__init__(
+            placeholder="Scegli la partita...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
 
     async def callback(self, interaction: discord.Interaction):
         if self.values[0] == "none":
             await interaction.response.send_message("❌ Nessuna partita disponibile.", ephemeral=True)
             return
+
         match = self.match_map[self.values[0]]
-        await interaction.response.send_modal(GuidedMatchResultModal(match["source_table"], match["id"]))
+        flow = GuidedScorerFlowView(match)
+
+        await interaction.response.send_message(
+            embed=flow.build_embed(),
+            view=flow,
+            ephemeral=True,
+        )
+
 
 class GuidedMatchSelectView(discord.ui.View):
     def __init__(self, matches):
         super().__init__(timeout=300)
         self.add_item(GuidedMatchSelect(matches))
 
+
 class GuidedCompetitionSelect(discord.ui.Select):
     def __init__(self, options):
-        super().__init__(placeholder="Scegli la competizione...", min_values=1, max_values=1, options=options)
+        super().__init__(
+            placeholder="Scegli la competizione...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+
         try:
             matches = get_matches_for_competition(interaction.user.id, self.values[0])
+
             if not matches:
-                await interaction.followup.send("❌ Non ci sono partite attive per questa competizione.", ephemeral=True)
+                await interaction.followup.send(
+                    "❌ Non ci sono partite attive per questa competizione.",
+                    ephemeral=True,
+                )
                 return
+
             embed = discord.Embed(
                 title="📅 Scegli la partita",
-                description="Seleziona la partita attiva per inserire risultato e marcatori.",
-                color=discord.Color.green()
+                description=(
+                    "Seleziona la partita. Dopo potrai aggiungere i marcatori "
+                    "casa/trasferta e il risultato verrà calcolato automaticamente."
+                ),
+                color=discord.Color.green(),
             )
-            await interaction.followup.send(embed=embed, view=GuidedMatchSelectView(matches), ephemeral=True)
+
+            await interaction.followup.send(
+                embed=embed,
+                view=GuidedMatchSelectView(matches),
+                ephemeral=True,
+            )
+
         except Exception as e:
             print(f"[GUIDED COMPETITION CALLBACK ERROR] {type(e).__name__}: {e}")
-            await interaction.followup.send(f"❌ Errore: `{type(e).__name__}`", ephemeral=True)
+            await interaction.followup.send(
+                f"❌ Errore: `{type(e).__name__}`",
+                ephemeral=True,
+            )
+
 
 class GuidedCompetitionView(discord.ui.View):
     def __init__(self, *args):
         super().__init__(timeout=300)
         options = args[-1]
         self.add_item(GuidedCompetitionSelect(options))
-
-# ========================================================================
 
 @tree.command(name="risultato", description="Inserisci un risultato guidato: competizione, partita, gol e marcatori")
 async def risultato(interaction: discord.Interaction):
@@ -10439,8 +10736,8 @@ async def risultato(interaction: discord.Interaction):
             title="⚽ Inserisci risultato",
             description=(
                 "Scegli la competizione a cui stai partecipando.\n\n"
-                "Poi selezioni la partita attiva e inserisci gol + marcatori.\n"
-                "Formato marcatori: `Mbappe 3, Rodri 2`."
+                "Poi selezioni la partita attiva e aggiungi i marcatori dai menu.\n"
+                "Il risultato viene calcolato automaticamente dai gol inseriti."
             ),
             color=discord.Color.blue(),
         )
