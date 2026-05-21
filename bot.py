@@ -3662,7 +3662,7 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
             budget = budget_real
             for p in players:
                 cur.execute(
-                    "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s",
+                    "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id::text = %s",
                     (str(member.id), 0, p["id"])
                 )
 
@@ -4797,7 +4797,7 @@ class SquadraRealeModal(discord.ui.Modal, title="Assegna squadra reale"):
 
         for p in players:
             cur.execute(
-                "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s",
+                "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id::text = %s",
                 (str(member.id), 0, p["id"])
             )
 
@@ -5199,7 +5199,7 @@ async def card(interaction: discord.Interaction, player_id: str):
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM players WHERE id = %s", (player_id,))
+    cur.execute("SELECT * FROM players WHERE id::text = %s", (player_id,))
     player = cur.fetchone()
     conn.close()
 
@@ -5226,7 +5226,7 @@ async def start_auction_for_player(interaction: discord.Interaction, player_id: 
     conn = connect()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM players WHERE id = %s", (str(player_id),))
+    cur.execute("SELECT * FROM players WHERE id::text = %s", (str(player_id),))
     player = cur.fetchone()
 
     if not player:
@@ -5755,7 +5755,7 @@ async def close_auction(channel, auction_id: int, message=None):
                 (final_price, auction["highest_bidder_id"])
             )
             cur.execute(
-                "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s",
+                "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id::text = %s",
                 (auction["highest_bidder_id"], final_price, auction["player_id"])
             )
             cur.execute(
@@ -6398,7 +6398,7 @@ async def svincola(interaction: discord.Interaction, player_id: str):
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT name, owner_discord_id, sold_price FROM players WHERE id = %s", (player_id,))
+    cur.execute("SELECT name, owner_discord_id, sold_price FROM players WHERE id::text = %s", (player_id,))
     player = cur.fetchone()
 
     if not player:
@@ -6412,7 +6412,7 @@ async def svincola(interaction: discord.Interaction, player_id: str):
             (player["sold_price"], player["owner_discord_id"])
         )
 
-    cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL WHERE id = %s", (player_id,))
+    cur.execute("UPDATE players SET owner_discord_id = NULL, sold_price = NULL WHERE id::text = %s", (player_id,))
     conn.commit()
     conn.close()
 
@@ -6429,7 +6429,7 @@ async def assegna(interaction: discord.Interaction, player_id: str, utente: disc
     conn = connect()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM players WHERE id = %s", (player_id,))
+    cur.execute("SELECT * FROM players WHERE id::text = %s", (player_id,))
     player = cur.fetchone()
 
     if not player:
@@ -6451,7 +6451,7 @@ async def assegna(interaction: discord.Interaction, player_id: str, utente: disc
         return
 
     cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (prezzo, str(utente.id)))
-    cur.execute("UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s", (str(utente.id), prezzo, player_id))
+    cur.execute("UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id::text = %s", (str(utente.id), prezzo, player_id))
     conn.commit()
     conn.close()
 
@@ -6495,7 +6495,7 @@ async def pack_gold(interaction: discord.Interaction, utente: discord.Member, nu
 
     for p in players:
         cur.execute(
-            "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s",
+            "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id::text = %s",
             (str(utente.id), 0, p["id"])
         )
 
@@ -6798,7 +6798,7 @@ class TradeView(discord.ui.View):
 
         # Validate players ownership.
         if offer_player_id:
-            cur.execute("SELECT name, owner_discord_id FROM players WHERE id = %s", (offer_player_id,))
+            cur.execute("SELECT name, owner_discord_id FROM players WHERE id::text = %s", (offer_player_id,))
             p = cur.fetchone()
             if not p or str(p["owner_discord_id"]) != proposer_id:
                 conn.close()
@@ -6806,7 +6806,7 @@ class TradeView(discord.ui.View):
                 return
 
         if request_player_id:
-            cur.execute("SELECT name, owner_discord_id FROM players WHERE id = %s", (request_player_id,))
+            cur.execute("SELECT name, owner_discord_id FROM players WHERE id::text = %s", (request_player_id,))
             p = cur.fetchone()
             if not p or str(p["owner_discord_id"]) != target_id:
                 conn.close()
@@ -6848,10 +6848,10 @@ class TradeView(discord.ui.View):
 
         # Player movements.
         if offer_player_id:
-            cur.execute("UPDATE players SET owner_discord_id = %s WHERE id = %s", (target_id, offer_player_id))
+            cur.execute("UPDATE players SET owner_discord_id = %s WHERE id::text = %s", (target_id, offer_player_id))
 
         if request_player_id:
-            cur.execute("UPDATE players SET owner_discord_id = %s WHERE id = %s", (proposer_id, request_player_id))
+            cur.execute("UPDATE players SET owner_discord_id = %s WHERE id::text = %s", (proposer_id, request_player_id))
 
         cur.execute("UPDATE trade_offers SET status = 'accepted' WHERE id = %s", (self.trade_id,))
         conn.commit()
@@ -6894,7 +6894,7 @@ async def blacklist_add(interaction: discord.Interaction, player_id: str, motivo
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT name FROM players WHERE id = %s", (player_id,))
+    cur.execute("SELECT name FROM players WHERE id::text = %s", (player_id,))
     player = cur.fetchone()
 
     if not player:
@@ -6939,7 +6939,7 @@ async def blacklist(interaction: discord.Interaction):
     cur.execute("""
         SELECT b.player_id, b.reason, p.name
         FROM blacklist_players b
-        LEFT JOIN players p ON p.id = b.player_id
+        LEFT JOIN players p ON p.id::text = b.player_id::text
         ORDER BY b.created_at DESC
         LIMIT 20
     """)
@@ -7197,7 +7197,7 @@ async def assegna_squadra(interaction: discord.Interaction, utente: discord.Memb
 
     for p in players:
         cur.execute(
-            "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s",
+            "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id::text = %s",
             (str(utente.id), 0, p["id"])
         )
 
@@ -9643,7 +9643,7 @@ class TradeOfferResponseView(discord.ui.View):
         amount = safe_int(offer["amount"])
 
         # Controlli proprietà attuali
-        cur.execute("SELECT owner_discord_id FROM players WHERE id = %s", (requested_player_id,))
+        cur.execute("SELECT owner_discord_id FROM players WHERE id::text = %s", (requested_player_id,))
         req = cur.fetchone()
         if not req or str(req["owner_discord_id"]) != target_id:
             conn.close()
@@ -9651,7 +9651,7 @@ class TradeOfferResponseView(discord.ui.View):
             return
 
         if offered_player_id:
-            cur.execute("SELECT owner_discord_id FROM players WHERE id = %s", (str(offered_player_id),))
+            cur.execute("SELECT owner_discord_id FROM players WHERE id::text = %s", (str(offered_player_id),))
             off = cur.fetchone()
             if not off or str(off["owner_discord_id"]) != proposer_id:
                 conn.close()
@@ -9667,11 +9667,11 @@ class TradeOfferResponseView(discord.ui.View):
                 return
 
         # Trasferimento giocatore richiesto al proponente
-        cur.execute("UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s", (proposer_id, amount, requested_player_id))
+        cur.execute("UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id::text = %s", (proposer_id, amount, requested_player_id))
 
         # Trasferimento eventuale giocatore offerto al destinatario
         if offered_player_id:
-            cur.execute("UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s", (target_id, 0, str(offered_player_id)))
+            cur.execute("UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id::text = %s", (target_id, 0, str(offered_player_id)))
 
         # Crediti dal proponente al destinatario
         if amount > 0:
