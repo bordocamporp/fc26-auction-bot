@@ -528,6 +528,25 @@ def player_embed(player, title="FC26 Player Card"):
     return embed
 
 
+def format_auction_timer(remaining):
+    remaining = max(0, safe_int(remaining))
+    total = max(1, safe_int(AUCTION_SECONDS, 45))
+    minutes = remaining // 60
+    seconds = remaining % 60
+
+    if remaining <= 5:
+        status = "🔴 ULTIMI SECONDI"
+    elif remaining <= 10:
+        status = "🟠 ANTI-SNIPE ATTIVO"
+    else:
+        status = "🟢 ASTA IN CORSO"
+
+    blocks = 10
+    filled = max(0, min(blocks, round((remaining / total) * blocks)))
+    bar = "█" * filled + "░" * (blocks - filled)
+    return f"{status}\n⏱️ **{minutes:02d}:{seconds:02d}**\n`{bar}` **{remaining}s**"
+
+
 def auction_embed(player, auction, remaining=None):
     highest_bid = auction["highest_bid"] or 0
     bidder_id = auction["highest_bidder_id"]
@@ -537,37 +556,34 @@ def auction_embed(player, auction, remaining=None):
     recent = auction_last_bids.get(int(auction_id), [])
     recent_text = "\n".join(recent[-5:]) if recent else "Nessuna offerta ancora."
 
-    if remaining is None:
-        timer_text = f"{AUCTION_SECONDS}s"
-    else:
-        timer_text = f"⏳ **{remaining}s**"
+    timer_text = format_auction_timer(AUCTION_SECONDS if remaining is None else remaining)
 
     embed = discord.Embed(
         title="🔨 ASTA LIVE",
-        description=f"**{player['name']}** è ora all'asta.",
+        description=(
+            f"## {player['name']}\n"
+            f"🏟️ **{player['team']}** • **{player['position']}** • OVR **{player['overall']}**"
+        ),
         color=discord.Color.gold()
     )
 
-    embed.add_field(name="Ruolo", value=player["position"], inline=True)
-    embed.add_field(name="Squadra", value=player["team"], inline=True)
-    embed.add_field(name="Overall", value=str(player["overall"]), inline=True)
-    embed.add_field(name="Prezzo attuale", value=f"**{highest_bid}** crediti", inline=True)
-    embed.add_field(name="Leader", value=leader, inline=True)
-    embed.add_field(name="Timer", value=timer_text, inline=True)
-    embed.add_field(name="Ultime offerte", value=recent_text, inline=False)
+    embed.add_field(name="💰 Prezzo attuale", value=f"**{highest_bid}** crediti", inline=True)
+    embed.add_field(name="👑 Leader", value=leader, inline=True)
+    embed.add_field(name="📊 ID asta", value=f"`{auction_id}`", inline=True)
+    embed.add_field(name="⏳ Timer", value=timer_text, inline=False)
+    embed.add_field(name="📈 Ultime offerte", value=recent_text, inline=False)
     embed.add_field(
-        name="Anti-snipe",
-        value=f"Se arriva un'offerta sotto i **{ANTI_SNIPE_THRESHOLD}s**, il timer aumenta di **{ANTI_SNIPE_EXTENSION}s**.",
+        name="🛡️ Anti-snipe",
+        value=f"Offerta sotto i **{ANTI_SNIPE_THRESHOLD}s** → +**{ANTI_SNIPE_EXTENSION}s** automatici.",
         inline=False
     )
     embed.add_field(
-        name="Offerte",
-        value="Usa i bottoni sotto: **+10**, **+50**, **All In** oppure **Offerta custom**.",
+        name="🎮 Come offrire",
+        value="Usa i bottoni: **+10**, **+50**, **All In** oppure **Offerta custom**.",
         inline=False
     )
-    embed.set_footer(text=f"ID asta: {auction_id} • ID giocatore: {player['id']} • FC26 Auction Bot")
+    embed.set_footer(text=f"ID giocatore: {player['id']} • FC26 Auction Bot")
     return embed
-
 
 async def get_log_channel():
     if not AUCTION_LOG_CHANNEL_ID:
@@ -5032,11 +5048,10 @@ async def run_auction_countdown(channel, auction_id: int, message):
             auction_timers.pop(int(auction_id), None)
             return
 
-        if remaining % 5 == 0 or remaining <= 10:
-            try:
-                await message.edit(embed=auction_embed(row, row, remaining), view=AuctionView())
-            except Exception as e:
-                print(f"[ASTA] Errore countdown edit: {e}")
+        try:
+            await message.edit(embed=auction_embed(row, row, remaining), view=AuctionView())
+        except Exception as e:
+            print(f"[ASTA] Errore countdown edit: {e}")
 
         await asyncio.sleep(1)
         auction_timers[int(auction_id)] -= 1
@@ -5079,8 +5094,8 @@ async def close_auction(channel, auction_id: int, message=None):
                 (final_price, auction["highest_bidder_id"])
             )
             cur.execute(
-                "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = %s",
-                (auction["highest_bidder_id"], final_price, auction["player_id"])
+                "UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id::text = %s",
+                (auction["highest_bidder_id"], final_price, str(auction["player_id"]))
             )
             cur.execute(
                 "UPDATE auctions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = %s",
@@ -5104,23 +5119,60 @@ async def close_auction(channel, auction_id: int, message=None):
                 f"🏆 Hai vinto l'asta di **{auction['player_name']}** per **{auction['highest_bid']}** crediti + tassa {tax_amount}. Totale: **{final_price}**."
             )
 
+            club_name = "Nessun club"
+            try:
+                club_name = manager.get("club_name") or manager.get("team_name") or "Nessun club"
+            except Exception:
+                club_name = "Nessun club"
+
             embed = discord.Embed(
-                title="✅ ASTA CHIUSA",
-                description=f"**{auction['player_name']}** assegnato a **{winner.display_name}**.",
+                title="🏆 ASTA CONCLUSA",
+                description=(
+                    f"## {auction['player_name']} è stato acquistato!\n"
+                    f"👤 Vincitore: <@{auction['highest_bidder_id']}>\n"
+                    f"🏟️ Club: **{club_name}**\n"
+                    f"💰 Offerta vincente: **{auction['highest_bid']}** crediti"
+                ),
                 color=discord.Color.green()
             )
-            embed.add_field(name="Prezzo finale", value=f"{auction['highest_bid']} crediti", inline=True)
-            embed.add_field(name="Tassa mercato", value=f"{tax_amount} crediti ({MARKET_TAX}%)", inline=True)
-            embed.add_field(name="Costo totale", value=f"{final_price} crediti", inline=True)
-            embed.set_image(url=WALKOUT_GIF)
+            embed.add_field(name="🏦 Tassa mercato", value=f"{tax_amount} crediti ({MARKET_TAX}%)", inline=True)
+            embed.add_field(name="💳 Totale pagato", value=f"**{final_price}** crediti", inline=True)
+            embed.add_field(name="📌 ID giocatore", value=f"`{auction['player_id']}`", inline=True)
+            embed.set_footer(text="FC26 Auction Bot • Operazione completata")
+
+            card_file = None
+            try:
+                conn_card = connect()
+                cur_card = conn_card.cursor()
+                cur_card.execute("SELECT * FROM players WHERE id::text = %s", (str(auction["player_id"]),))
+                player_full = cur_card.fetchone()
+                conn_card.close()
+                if player_full:
+                    card_path = create_player_card(player_full)
+                    card_file = discord.File(str(card_path), filename="winner_card.png")
+                    embed.set_image(url="attachment://winner_card.png")
+                else:
+                    embed.set_image(url=WALKOUT_GIF)
+            except Exception as e:
+                print(f"[ASTA] Errore card vincitore: {e}")
+                embed.set_image(url=WALKOUT_GIF)
 
             if message:
                 try:
-                    await message.edit(view=None)
+                    final_live_embed = auction_embed(auction, auction, 0)
+                    final_live_embed.title = "✅ ASTA TERMINATA"
+                    final_live_embed.color = discord.Color.green()
+                    await message.edit(embed=final_live_embed, view=None)
                 except Exception:
-                    pass
+                    try:
+                        await message.edit(view=None)
+                    except Exception:
+                        pass
 
-            await channel.send(embed=embed)
+            if card_file:
+                await channel.send(embed=embed, file=card_file)
+            else:
+                await channel.send(embed=embed)
 
             log_embed = discord.Embed(
                 title="📜 Asta conclusa",
