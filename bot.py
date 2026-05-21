@@ -301,10 +301,10 @@ ANTI_SNIPE_THRESHOLD = 10
 ANTI_SNIPE_EXTENSION = 20
 MARKET_TAX = 5
 
-MAX_GK = 4
-MAX_DEF = 10
-MAX_MID = 10
-MAX_ATT = 10
+MAX_GK = 2
+MAX_DEF = 6
+MAX_MID = 6
+MAX_ATT = 4
 
 intents = discord.Intents.default()
 # Necessario per recuperare i membri del server quando lo staff accetta/rifiuta
@@ -1236,7 +1236,7 @@ def market_status_label():
 
 def budget_from_team_overall(avg_ovr):
     avg_ovr = float(avg_ovr or 0)
-    
+
     # Budget modalità squadre reali
     # Top club: pochi crediti, club più deboli: più crediti.
     if avg_ovr >= 85:
@@ -9294,8 +9294,7 @@ async def avvia_ritorno(interaction: discord.Interaction):
 
 @tree.command(name="risultato", description="Inserisci un risultato guidato: competizione, partita, gol e marcatori")
 async def risultato(interaction: discord.Interaction):
-
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await safe_defer(interaction, ephemeral=True, thinking=True)
 
     if not is_results_channel(interaction):
         await interaction.followup.send(
@@ -9304,21 +9303,44 @@ async def risultato(interaction: discord.Interaction):
         )
         return
 
-    options = get_guided_competition_options(interaction.user.id)
+    try:
+        options = get_guided_competition_options(interaction.user.id)
 
-    if not options:
+        if not options:
+            await interaction.followup.send(
+                "❌ Non hai partite attive da inserire. Lo staff deve prima usare `/avvia_andata` o `/avvia_ritorno`, oppure generare/attivare le coppe.",
+                ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title="⚽ Inserisci risultato",
+            description=(
+                "Scegli la competizione a cui stai partecipando.
+
+"
+                "Poi selezioni la partita attiva e inserisci gol + marcatori.
+"
+                "Formato marcatori consigliato: `Mbappe 3, Rodri 2`."
+            ),
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(text=f"Fase campionato attiva: {get_active_leg().upper()}")
+
         await interaction.followup.send(
-            "❌ Non hai partite attive da inserire. Lo staff deve prima usare `/avvia_andata` o `/avvia_ritorno`, oppure generare/attivare le coppe.",
+            embed=embed,
+            view=GuidedCompetitionView(options),
             ephemeral=True
         )
-        return
 
-    await interaction.followup.send(
-        "⚽ Seleziona la competizione:",
-        view=GuidedCompetitionView(interaction.user.id, options),
-        ephemeral=True
-    )
-        
+    except Exception as e:
+        print(f"[SLASH ERROR] Comando-risultato Errore={type(e).__name__}: {e}")
+        await interaction.followup.send(
+            f"❌ Errore comando: `{type(e).__name__}`",
+            ephemeral=True
+        )
+
+
 @tree.command(name="risultato_campionato", description="Staff: inserisce un risultato campionato e aggiorna sito/classifica")
 @app_commands.describe(
     competizione="Nome campionato/girone, es: Serie A",
