@@ -1781,7 +1781,7 @@ async def place_bid(interaction: discord.Interaction, increment=None, all_in=Fal
         UPDATE auctions
         SET highest_bid = %s,
             highest_bidder_id = %s
-        WHERE id = %s
+        WHERE id = CAST(%s AS BIGINT)
           AND status = 'open'
     """, (new_bid, str(interaction.user.id), auction["id"]))
     conn.commit()
@@ -3812,7 +3812,7 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     cur.execute("""
         UPDATE signup_requests
         SET status = 'accepted', club_name = %s, handled_by = %s, handled_at = CURRENT_TIMESTAMP
-        WHERE id = %s
+        WHERE id = CAST(%s AS BIGINT)
     """, (club_name, str(interaction.user.id), int(request_id)))
 
     conn.commit()
@@ -5570,7 +5570,7 @@ async def start_auction_for_player(interaction: discord.Interaction, player_id: 
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("UPDATE auctions SET message_id = %s WHERE id = %s", (str(message.id), auction_id))
+    cur.execute("UPDATE auctions SET message_id = %s WHERE id = CAST(%s AS BIGINT)", (str(message.id), auction_id))
     conn.commit()
     conn.close()
 
@@ -6000,7 +6000,7 @@ async def close_auction(channel, auction_id: int, message=None):
                 (auction["highest_bidder_id"], final_price, auction["player_id"])
             )
             cur.execute(
-                "UPDATE auctions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = %s",
+                "UPDATE auctions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = CAST(%s AS BIGINT)",
                 (auction_id,)
             )
             conn.commit()
@@ -7054,7 +7054,7 @@ class TradeView(discord.ui.View):
         conn = connect()
         cur = conn.cursor()
 
-        cur.execute("SELECT * FROM trade_offers WHERE id = %s AND status = 'pending'", (self.trade_id,))
+        cur.execute("SELECT * FROM trade_offers WHERE id = CAST(%s AS BIGINT) AND status = 'pending'", (self.trade_id,))
         trade = cur.fetchone()
 
         if not trade:
@@ -7131,7 +7131,7 @@ class TradeView(discord.ui.View):
         if request_player_id:
             cur.execute("UPDATE players SET owner_discord_id = %s WHERE id = CAST(%s AS BIGINT)", (proposer_id, request_player_id))
 
-        cur.execute("UPDATE trade_offers SET status = 'accepted' WHERE id = %s", (self.trade_id,))
+        cur.execute("UPDATE trade_offers SET status = 'accepted' WHERE id = CAST(%s AS BIGINT)", (self.trade_id,))
         conn.commit()
         conn.close()
 
@@ -7793,7 +7793,7 @@ def generate_single_elimination_pairs(players):
 def create_national_cups_for_groups(cur, championship_id, groups):
     created = 0
     for group_id, players in groups.items():
-        cur.execute("SELECT name FROM championship_groups WHERE id = %s", (group_id,))
+        cur.execute("SELECT name FROM championship_groups WHERE id = CAST(%s AS BIGINT)", (group_id,))
         g = cur.fetchone()
         group_name = g["name"] if g else f"Girone {group_id}"
         cup_name = f"Coppa Nazionale {group_name}"
@@ -9590,7 +9590,7 @@ async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.
         cur.execute("""
             UPDATE players
             SET owner_discord_id = %s, sold_price = %s
-            WHERE id = %s
+            WHERE id = CAST(%s AS BIGINT)
         """, (str(utente.id), 0, p["id"]))
 
     # Manager con budget corretto
@@ -10515,7 +10515,7 @@ class TradeOfferResponseView(discord.ui.View):
             cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (amount, proposer_id))
             cur.execute("UPDATE managers SET budget = budget + %s WHERE discord_id = %s", (amount, target_id))
 
-        cur.execute("UPDATE player_trade_offers SET status = 'accepted', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (self.offer_id,))
+        cur.execute("UPDATE player_trade_offers SET status = 'accepted', updated_at = CURRENT_TIMESTAMP WHERE id = CAST(%s AS BIGINT)", (self.offer_id,))
         conn.commit()
         conn.close()
 
@@ -11595,7 +11595,7 @@ def _sync_signup_accept_db(req, request_id, club_name, handled_by, handled_by_na
                 club_name = %s,
                 handled_by = %s,
                 handled_at = CURRENT_TIMESTAMP
-            WHERE id = %s
+            WHERE id = CAST(%s AS BIGINT)
         """, (club_name or None, str(handled_by), int(request_id)))
 
         try:
@@ -11872,7 +11872,7 @@ async def process_website_signup_action(action_row):
     cur = conn.cursor()
 
     try:
-        cur.execute("SELECT * FROM signup_requests WHERE id = %s LIMIT 1", (request_id,))
+        cur.execute("SELECT * FROM signup_requests WHERE id = CAST(%s AS BIGINT) LIMIT 1", (request_id,))
         req = cur.fetchone()
 
         if not req:
