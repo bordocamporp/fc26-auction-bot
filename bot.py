@@ -9663,8 +9663,8 @@ def generator_championship_options():
 async def genera_coppa_nazionale(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
+    async def callback(self, interaction: discord.Interaction):
     await interaction.response.send_modal(CompetitionNameModal())
-
 
 @tree.command(name="genera_coppa_nazionale", description="Staff: genera una coppa nazionale dal campionato scelto")
 async def genera_coppa_nazionale(interaction: discord.Interaction):
