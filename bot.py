@@ -2693,7 +2693,71 @@ def _parse_sqlite_datetime(value):
 
 
 # ================= SAFE ACTIVITY HELPERS =================
-# Definiti prima dei comandi/task: nel file originale erano dopo bot.run()
+# Definiti prima dei comandi/task: nel file originale erano dopo 
+@tree.command(name="calendario", description="Mostra calendario partite da disputare divise per competizione")
+async def calendario(interaction: discord.Interaction):
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+    try:
+        matches = unified_pending_matches(discord_id=None, only_user=False)
+        if not matches:
+            await interaction.followup.send("📅 Nessuna partita da disputare.", ephemeral=True)
+            return
+
+        grouped = {}
+        for m in matches:
+            key = f"{m['competition_name']} ({m['competition_type']})"
+            grouped.setdefault(key, []).append(m)
+
+        embeds = []
+        for comp, items in grouped.items():
+            lines = []
+            for m in items[:12]:
+                lines.append(f"• **{m['home_club']}** vs **{m['away_club']}** — {m['round']} {m['leg']}")
+            embeds.append(discord.Embed(title=f"📅 {comp}", description="\\n".join(lines), color=discord.Color.blurple()))
+
+        await interaction.followup.send(embeds=embeds[:10], ephemeral=True)
+    except Exception as e:
+        print(f"[CALENDARIO ERROR] {type(e).__name__}: {e}")
+        await interaction.followup.send(f"❌ Errore calendario: `{type(e).__name__}`", ephemeral=True)
+
+@tree.command(name="risultati_lista", description="Mostra ultimi risultati divisi per competizione")
+async def risultati_lista(interaction: discord.Interaction):
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+    try:
+        conn = db_connect_safe()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT competition_name, competition_type, round, home_team, away_team, home_score, away_score, created_at
+            FROM match_results
+            ORDER BY created_at DESC
+            LIMIT 40
+        """)
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            await interaction.followup.send("📊 Nessun risultato inserito.", ephemeral=True)
+            return
+
+        grouped = {}
+        for r in rows:
+            key = f"{row_get(r,'competition_name','Competizione')} ({row_get(r,'competition_type','')})"
+            grouped.setdefault(key, []).append(r)
+
+        embeds = []
+        for comp, items in grouped.items():
+            lines = []
+            for r in items[:12]:
+                lines.append(f"• **{row_get(r,'home_team')} {row_get(r,'home_score')} - {row_get(r,'away_score')} {row_get(r,'away_team')}** — {row_get(r,'round','')}")
+            embeds.append(discord.Embed(title=f"📊 {comp}", description="\\n".join(lines), color=discord.Color.green()))
+
+        await interaction.followup.send(embeds=embeds[:10], ephemeral=True)
+    except Exception as e:
+        print(f"[RISULTATI LISTA ERROR] {type(e).__name__}: {e}")
+        await interaction.followup.send(f"❌ Errore risultati: `{type(e).__name__}`", ephemeral=True)
+
+
+bot.run()
 # e quindi non venivano mai caricati prima dell'avvio del bot.
 def _fetch_all_player_activity_rows():
     """Legge i dati attività giocatori da Supabase.
@@ -9711,24 +9775,18 @@ async def avvia_ritorno(interaction: discord.Interaction):
 # ================= FINE RISULTATI GUIDATI =================
 
 
-# ================= RISULTATI/CALENDARIO - FIX COMPLETO =================
 
-def db_url_value():
-    return (
-        globals().get("DATABASE_URL")
-        or os.getenv("DATABASE_URL")
-        or os.getenv("POSTGRES_URL")
-        or os.getenv("SUPABASE_DB_URL")
-    )
+
+# ================= RISULTATI/CALENDARIO - UNIFIED FIX TUTTE COMPETIZIONI =================
 
 def db_connect_safe():
-    # Il progetto usa già connect() dal file db.py: è la sorgente corretta.
     try:
         return connect()
     except Exception:
-        url = db_url_value()
+        url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or os.getenv("SUPABASE_DB_URL")
         if not url:
-            raise RuntimeError("DATABASE_URL/POSTGRES_URL non configurato e connect() non disponibile.")
+            raise RuntimeError("DATABASE_URL/POSTGRES_URL non configurato.")
+        import psycopg2
         return psycopg2.connect(url)
 
 def row_get(row, key, default=None):
@@ -9740,11 +9798,50 @@ def row_get(row, key, default=None):
         except Exception:
             return default
 
+def get_active_leg_safe():
+    try:
+        return get_active_leg()
+    except Exception:
+        return "andata"
+
+def competition_group_from_type(value):
+    v = normalize_text(value or "")
+    if "nazionale" in v or ("coppa" in v and "europe" not in v and "champions" not in v and "europa" not in v and "conference" not in v):
+        return "Coppa Nazionale"
+    if "champions" in v or "europa" in v or "conference" in v or "europe" in v:
+        return "Coppe Europee"
+    return "Campionati"
+
+def get_manager_club_for_user(discord_id):
+    conn = db_connect_safe()
+    cur = conn.cursor()
+    try:
+        for sql in [
+            "SELECT club_name FROM managers WHERE discord_id = %s LIMIT 1",
+            "SELECT team_name FROM real_team_assignments WHERE discord_id = %s LIMIT 1",
+        ]:
+            try:
+                cur.execute(sql, (str(discord_id),))
+                row = cur.fetchone()
+                if row:
+                    club = row_get(row, "club_name") or row_get(row, "team_name")
+                    if club is None:
+                        try:
+                            club = row[0]
+                        except Exception:
+                            club = None
+                    if club:
+                        return str(club)
+            except Exception:
+                pass
+    finally:
+        conn.close()
+    return None
+
 def ensure_results_calendar_tables():
     conn = db_connect_safe()
     cur = conn.cursor()
 
-    # Tabelle principali già usate dal sito.
     cur.execute("""
     CREATE TABLE IF NOT EXISTS fixtures (
         id BIGSERIAL PRIMARY KEY,
@@ -9784,7 +9881,7 @@ def ensure_results_calendar_tables():
         try:
             cur.execute(sql)
         except Exception as e:
-            print(f"[FIXTURES ALTER] {e}")
+            print(f"[ALTER fixtures] {e}")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS match_results (
@@ -9809,6 +9906,8 @@ def ensure_results_calendar_tables():
     CREATE TABLE IF NOT EXISTS goalscorers (
         id BIGSERIAL PRIMARY KEY,
         fixture_id BIGINT,
+        source_table TEXT,
+        source_match_id TEXT,
         user_id TEXT,
         club_name TEXT,
         player_name TEXT,
@@ -9816,6 +9915,15 @@ def ensure_results_calendar_tables():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
+
+    for sql in [
+        "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS source_table TEXT",
+        "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS source_match_id TEXT",
+    ]:
+        try:
+            cur.execute(sql)
+        except Exception:
+            pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS standings (
@@ -9856,164 +9964,217 @@ def ensure_results_calendar_tables():
     conn.commit()
     conn.close()
 
-def competition_group_from_type(value):
-    v = normalize_text(value or "")
-    if "nazionale" in v or ("coppa" in v and "europe" not in v):
-        return "Coppa Nazionale"
-    if "champions" in v or "europa" in v or "conference" in v or "europe" in v:
-        return "Coppe Europee"
-    return "Campionati"
+def unified_pending_matches(discord_id=None, only_user=True):
+    """
+    Legge TUTTE le partite ancora da disputare:
+    - fixtures
+    - championship_matches
+    - national_cup_matches
+    - european_cup_matches se esiste
+    Le normalizza in dict unificati per calendario e /risultato.
+    """
+    ensure_results_calendar_tables()
+    active_leg = normalize_text(get_active_leg_safe() or "andata")
+    club = get_manager_club_for_user(discord_id) if discord_id else None
+    out = []
 
-def get_active_leg_safe():
-    try:
-        return get_active_leg()
-    except Exception:
-        return "andata"
-
-def get_manager_club_for_user(discord_id):
     conn = db_connect_safe()
     cur = conn.cursor()
+
+    # 1) fixtures nuove
     try:
-        cur.execute("SELECT club_name FROM managers WHERE discord_id = %s LIMIT 1", (str(discord_id),))
-        row = cur.fetchone()
-        if row:
-            club = row_get(row, "club_name") or (row[0] if not hasattr(row, "get") else None)
-            if club:
-                return str(club)
-        cur.execute("SELECT team_name FROM real_team_assignments WHERE discord_id = %s LIMIT 1", (str(discord_id),))
-        row = cur.fetchone()
-        if row:
-            club = row_get(row, "team_name") or (row[0] if not hasattr(row, "get") else None)
-            if club:
-                return str(club)
-    finally:
-        conn.close()
-    return None
+        cur.execute("""
+            SELECT *
+            FROM fixtures
+            WHERE COALESCE(played, FALSE) = FALSE
+              AND COALESCE(active, TRUE) = TRUE
+            ORDER BY competition_type, competition_name, round, id
+        """)
+        for r in cur.fetchall():
+            leg = normalize_text(row_get(r, "leg", "") or "")
+            if leg and leg not in ("unica", active_leg):
+                continue
+            home_club = str(row_get(r, "home_club", "") or "")
+            away_club = str(row_get(r, "away_club", "") or "")
+            home_id = str(row_get(r, "home_user_id", "") or "")
+            away_id = str(row_get(r, "away_user_id", "") or "")
+            if only_user and discord_id and club:
+                if normalize_text(home_club) != normalize_text(club) and normalize_text(away_club) != normalize_text(club) and home_id != str(discord_id) and away_id != str(discord_id):
+                    continue
+            out.append({
+                "source_table": "fixtures",
+                "id": str(row_get(r, "id")),
+                "competition_name": row_get(r, "competition_name", "Competizione"),
+                "competition_type": row_get(r, "competition_type", "Campionati"),
+                "round": row_get(r, "round", ""),
+                "leg": row_get(r, "leg", ""),
+                "home_user_id": home_id,
+                "away_user_id": away_id,
+                "home_club": home_club,
+                "away_club": away_club,
+            })
+    except Exception as e:
+        print(f"[UNIFIED fixtures] {e}")
+
+    # 2) championship_matches vecchie
+    try:
+        cur.execute("""
+            SELECT
+                m.*,
+                c.name AS competition_name,
+                COALESCE(g.name, g.group_name, 'Girone Unico') AS group_label
+            FROM championship_matches m
+            LEFT JOIN championships c ON c.id = m.championship_id
+            LEFT JOIN championship_groups g ON g.id = m.group_id
+            WHERE COALESCE(m.status, 'pending') <> 'played'
+              AND m.home_goals IS NULL
+              AND m.away_goals IS NULL
+            ORDER BY c.name, m.round_number, m.id
+        """)
+        for r in cur.fetchall():
+            home_club = str(row_get(r, "home_name", "") or "")
+            away_club = str(row_get(r, "away_name", "") or "")
+            home_id = str(row_get(r, "home_id", "") or "")
+            away_id = str(row_get(r, "away_id", "") or "")
+            if only_user and discord_id and club:
+                if normalize_text(home_club) != normalize_text(club) and normalize_text(away_club) != normalize_text(club) and home_id != str(discord_id) and away_id != str(discord_id):
+                    continue
+            out.append({
+                "source_table": "championship_matches",
+                "id": str(row_get(r, "id")),
+                "competition_name": row_get(r, "competition_name", "Campionato"),
+                "competition_type": "Campionati",
+                "round": f"{row_get(r, 'group_label', 'Girone')} - Giornata {row_get(r, 'round_number', '')}",
+                "leg": active_leg,
+                "home_user_id": home_id,
+                "away_user_id": away_id,
+                "home_club": home_club,
+                "away_club": away_club,
+            })
+    except Exception as e:
+        print(f"[UNIFIED championship_matches] {e}")
+
+    # 3) national_cup_matches
+    try:
+        cur.execute("""
+            SELECT
+                m.*,
+                nc.name AS competition_name,
+                c.name AS parent_championship
+            FROM national_cup_matches m
+            LEFT JOIN national_cups nc ON nc.id = m.cup_id
+            LEFT JOIN championships c ON c.id = nc.championship_id
+            WHERE COALESCE(m.status, 'pending') <> 'played'
+              AND m.home_goals IS NULL
+              AND m.away_goals IS NULL
+            ORDER BY nc.name, m.round_number, m.id
+        """)
+        for r in cur.fetchall():
+            home_club = str(row_get(r, "home_name", "") or "")
+            away_club = str(row_get(r, "away_name", "") or "")
+            home_id = str(row_get(r, "home_id", "") or "")
+            away_id = str(row_get(r, "away_id", "") or "")
+            if only_user and discord_id and club:
+                if normalize_text(home_club) != normalize_text(club) and normalize_text(away_club) != normalize_text(club) and home_id != str(discord_id) and away_id != str(discord_id):
+                    continue
+            out.append({
+                "source_table": "national_cup_matches",
+                "id": str(row_get(r, "id")),
+                "competition_name": row_get(r, "competition_name", "Coppa Nazionale"),
+                "competition_type": "Coppa Nazionale",
+                "round": f"Turno {row_get(r, 'round_number', '')}",
+                "leg": "unica",
+                "home_user_id": home_id,
+                "away_user_id": away_id,
+                "home_club": home_club,
+                "away_club": away_club,
+            })
+    except Exception as e:
+        print(f"[UNIFIED national_cup_matches] {e}")
+
+    # 4) european_cup_matches, se presente
+    try:
+        cur.execute("""
+            SELECT
+                m.*,
+                ec.name AS competition_name,
+                ec.cup_type AS cup_type
+            FROM european_cup_matches m
+            LEFT JOIN european_cups ec ON ec.id = m.cup_id
+            WHERE COALESCE(m.status, 'pending') <> 'played'
+              AND m.home_goals IS NULL
+              AND m.away_goals IS NULL
+            ORDER BY ec.name, m.round_number, m.id
+        """)
+        for r in cur.fetchall():
+            home_club = str(row_get(r, "home_name", "") or "")
+            away_club = str(row_get(r, "away_name", "") or "")
+            home_id = str(row_get(r, "home_id", "") or "")
+            away_id = str(row_get(r, "away_id", "") or "")
+            leg = normalize_text(row_get(r, "leg", "") or active_leg)
+            if leg and leg not in ("unica", active_leg):
+                continue
+            if only_user and discord_id and club:
+                if normalize_text(home_club) != normalize_text(club) and normalize_text(away_club) != normalize_text(club) and home_id != str(discord_id) and away_id != str(discord_id):
+                    continue
+            out.append({
+                "source_table": "european_cup_matches",
+                "id": str(row_get(r, "id")),
+                "competition_name": row_get(r, "competition_name", "Coppa Europea"),
+                "competition_type": row_get(r, "cup_type", "Coppe Europee") or "Coppe Europee",
+                "round": f"Turno {row_get(r, 'round_number', '')}",
+                "leg": row_get(r, "leg", active_leg),
+                "home_user_id": home_id,
+                "away_user_id": away_id,
+                "home_club": home_club,
+                "away_club": away_club,
+            })
+    except Exception as e:
+        print(f"[UNIFIED european_cup_matches] {e}")
+
+    conn.close()
+    return out
 
 def get_guided_competition_options(discord_id):
-    ensure_results_calendar_tables()
-    club = get_manager_club_for_user(discord_id)
-    active_leg = get_active_leg_safe()
+    matches = unified_pending_matches(discord_id=discord_id, only_user=True)
 
-    conn = db_connect_safe()
-    cur = conn.cursor()
-    params = []
-    where = "played = FALSE AND COALESCE(active, TRUE) = TRUE"
-
-    if active_leg:
-        where += " AND (leg IS NULL OR LOWER(leg) = LOWER(%s) OR LOWER(leg) = 'unica')"
-        params.append(str(active_leg))
-
-    # Se il manager ha club, mostra solo sue partite. Se non lo troviamo, mostra comunque le attive.
-    if club:
-        where += " AND (LOWER(home_club) = LOWER(%s) OR LOWER(away_club) = LOWER(%s) OR home_user_id = %s OR away_user_id = %s)"
-        params.extend([club, club, str(discord_id), str(discord_id)])
-
-    cur.execute(f"""
-        SELECT competition_name, competition_type, COUNT(*) AS total
-        FROM fixtures
-        WHERE {where}
-        GROUP BY competition_name, competition_type
-        ORDER BY competition_type, competition_name
-    """, tuple(params))
-    rows = cur.fetchall()
-    conn.close()
+    grouped = {}
+    for m in matches:
+        key = f"{m['competition_type']}|||{m['competition_name']}"
+        grouped.setdefault(key, 0)
+        grouped[key] += 1
 
     options = []
-    used = set()
-    for r in rows:
-        cname = str(row_get(r, "competition_name", "") or "")
-        ctype = str(row_get(r, "competition_type", "") or "")
-        total = row_get(r, "total", 0)
-        if not cname:
-            continue
-        value = f"{ctype}|||{cname}"
-        if value in used:
-            continue
-        used.add(value)
-
+    for key, total in grouped.items():
+        ctype, cname = key.split("|||", 1)
         group = competition_group_from_type(ctype or cname)
         emoji = "🏆"
         if group == "Coppa Nazionale":
             emoji = "🇮🇹"
         elif group == "Coppe Europee":
             emoji = "🌍"
+        options.append(discord.SelectOption(
+            label=str(cname)[:100],
+            value=key[:100],
+            description=f"{group} • {total} partite da disputare"[:100],
+            emoji=emoji
+        ))
 
-        label = cname[:100]
-        desc = f"{group} • {total} partite attive"
-        options.append(discord.SelectOption(label=label, value=value[:100], description=desc[:100], emoji=emoji))
-
-    # Discord max 25 option.
     return options[:25]
 
 def get_matches_for_competition(discord_id, competition_key):
-    ensure_results_calendar_tables()
     parts = str(competition_key).split("|||", 1)
     if len(parts) == 2:
         ctype, cname = parts
     else:
-        ctype, cname = "", competition_key
+        ctype, cname = "", str(competition_key)
 
-    club = get_manager_club_for_user(discord_id)
-    active_leg = get_active_leg_safe()
-
-    conn = db_connect_safe()
-    cur = conn.cursor()
-
-    params = [cname]
-    where = "played = FALSE AND COALESCE(active, TRUE) = TRUE AND competition_name = %s"
-
-    if ctype:
-        where += " AND (competition_type = %s OR competition_type IS NULL)"
-        params.append(ctype)
-
-    if active_leg:
-        where += " AND (leg IS NULL OR LOWER(leg) = LOWER(%s) OR LOWER(leg) = 'unica')"
-        params.append(str(active_leg))
-
-    if club:
-        where += " AND (LOWER(home_club) = LOWER(%s) OR LOWER(away_club) = LOWER(%s) OR home_user_id = %s OR away_user_id = %s)"
-        params.extend([club, club, str(discord_id), str(discord_id)])
-
-    cur.execute(f"""
-        SELECT *
-        FROM fixtures
-        WHERE {where}
-        ORDER BY competition_type, competition_name, round, id
-        LIMIT 25
-    """, tuple(params))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def get_players_for_club_or_user(club_name=None, user_id=None):
-    conn = db_connect_safe()
-    cur = conn.cursor()
-    try:
-        if user_id:
-            cur.execute("""
-                SELECT id, name, position, overall
-                FROM players
-                WHERE owner_discord_id = %s
-                ORDER BY overall DESC NULLS LAST, name ASC
-                LIMIT 25
-            """, (str(user_id),))
-            rows = cur.fetchall()
-            if rows:
-                return rows
-
-        if club_name:
-            cur.execute("""
-                SELECT id, name, position, overall
-                FROM players
-                WHERE LOWER(team) = LOWER(%s)
-                ORDER BY overall DESC NULLS LAST, name ASC
-                LIMIT 25
-            """, (str(club_name),))
-            return cur.fetchall()
-    finally:
-        conn.close()
-    return []
+    matches = unified_pending_matches(discord_id=discord_id, only_user=True)
+    return [
+        m for m in matches
+        if normalize_text(m["competition_name"]) == normalize_text(cname)
+        and (not ctype or normalize_text(m["competition_type"]) == normalize_text(ctype))
+    ][:25]
 
 def upsert_standing_row(cur, competition_name, competition_type, club_name, gf, ga):
     gf = safe_int(gf)
@@ -10055,88 +10216,7 @@ def upsert_standing_row(cur, competition_name, competition_type, club_name, gf, 
             VALUES (%s,%s,%s,1,%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP)
         """, (competition_name, competition_type, club_name, win, draw, loss, gf, ga, pts))
 
-def save_fixture_result_and_sync(fixture_id, home_goals, away_goals, home_scorers=None, away_scorers=None):
-    ensure_results_calendar_tables()
-    home_scorers = home_scorers or []
-    away_scorers = away_scorers or []
-
-    conn = db_connect_safe()
-    cur = conn.cursor()
-
-    try:
-        cur.execute("SELECT * FROM fixtures WHERE id = %s LIMIT 1", (str(fixture_id),))
-        fixture = cur.fetchone()
-        if not fixture:
-            raise RuntimeError("Partita non trovata.")
-
-        competition_name = row_get(fixture, "competition_name", "")
-        competition_type = row_get(fixture, "competition_type", "")
-        round_name = row_get(fixture, "round", "")
-        home_club = row_get(fixture, "home_club", "")
-        away_club = row_get(fixture, "away_club", "")
-        home_user = row_get(fixture, "home_user_id", "")
-        away_user = row_get(fixture, "away_user_id", "")
-
-        hg = safe_int(home_goals)
-        ag = safe_int(away_goals)
-        winner = home_club if hg > ag else (away_club if ag > hg else "Pareggio")
-
-        cur.execute("""
-            UPDATE fixtures
-            SET home_goals = %s,
-                away_goals = %s,
-                played = TRUE,
-                active = FALSE,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = %s
-        """, (hg, ag, str(fixture_id)))
-
-        cur.execute("""
-            INSERT INTO match_results (
-                source_table, source_match_id, competition_name, competition_type, round,
-                home_team, away_team, home_score, away_score, winner, status, created_at, updated_at
-            )
-            VALUES ('fixtures', %s, %s, %s, %s, %s, %s, %s, %s, %s, 'played', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        """, (str(fixture_id), competition_name, competition_type, round_name, home_club, away_club, hg, ag, winner))
-
-        group = competition_group_from_type(competition_type or competition_name)
-        # Campionati + gironi europei aggiornano standings. Coppa nazionale/tabellone aggiorna cup_matches.
-        if group == "Campionati" or (group == "Coppe Europee" and "girone" in normalize_text(round_name)):
-            upsert_standing_row(cur, competition_name, competition_type, home_club, hg, ag)
-            upsert_standing_row(cur, competition_name, competition_type, away_club, ag, hg)
-        else:
-            cur.execute("""
-                INSERT INTO cup_matches (
-                    source_table, source_match_id, competition_name, round,
-                    home_team, away_team, home_score, away_score, winner, status, created_at, updated_at
-                )
-                VALUES ('fixtures', %s, %s, %s, %s, %s, %s, %s, %s, 'played', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            """, (str(fixture_id), competition_name, round_name, home_club, away_club, hg, ag, winner))
-
-        cur.execute("DELETE FROM goalscorers WHERE fixture_id = %s", (str(fixture_id),))
-
-        for name, goals in home_scorers:
-            cur.execute("""
-                INSERT INTO goalscorers (fixture_id, user_id, club_name, player_name, goals)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (str(fixture_id), str(home_user or ""), home_club, str(name), safe_int(goals, 1)))
-
-        for name, goals in away_scorers:
-            cur.execute("""
-                INSERT INTO goalscorers (fixture_id, user_id, club_name, player_name, goals)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (str(fixture_id), str(away_user or ""), away_club, str(name), safe_int(goals, 1)))
-
-        conn.commit()
-        return fixture
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
 def parse_scorers_text(raw):
-    # Formato: "Mbappe 3, Rodri 2" oppure "Mbappe, Rodri"
     results = []
     for part in str(raw or "").split(","):
         item = part.strip()
@@ -10153,32 +10233,124 @@ def parse_scorers_text(raw):
             results.append((name, max(1, goals)))
     return results
 
+def save_unified_result_and_sync(source_table, match_id, home_goals, away_goals, home_scorers=None, away_scorers=None):
+    home_scorers = home_scorers or []
+    away_scorers = away_scorers or []
+    conn = db_connect_safe()
+    cur = conn.cursor()
+    try:
+        # Recupera la partita dal sistema unificato.
+        all_matches = unified_pending_matches(discord_id=None, only_user=False)
+        match = None
+        for m in all_matches:
+            if m["source_table"] == source_table and str(m["id"]) == str(match_id):
+                match = m
+                break
+        if not match:
+            raise RuntimeError("Partita non trovata o già giocata.")
+
+        hg = safe_int(home_goals)
+        ag = safe_int(away_goals)
+        winner = match["home_club"] if hg > ag else (match["away_club"] if ag > hg else "Pareggio")
+
+        if source_table == "fixtures":
+            cur.execute("""
+                UPDATE fixtures
+                SET home_goals=%s, away_goals=%s, played=TRUE, active=FALSE, updated_at=CURRENT_TIMESTAMP
+                WHERE id=%s
+            """, (hg, ag, str(match_id)))
+        elif source_table == "championship_matches":
+            cur.execute("""
+                UPDATE championship_matches
+                SET home_goals=%s, away_goals=%s, status='played'
+                WHERE id=%s
+            """, (hg, ag, str(match_id)))
+        elif source_table == "national_cup_matches":
+            cur.execute("""
+                UPDATE national_cup_matches
+                SET home_goals=%s, away_goals=%s, status='played'
+                WHERE id=%s
+            """, (hg, ag, str(match_id)))
+        elif source_table == "european_cup_matches":
+            cur.execute("""
+                UPDATE european_cup_matches
+                SET home_goals=%s, away_goals=%s, status='played'
+                WHERE id=%s
+            """, (hg, ag, str(match_id)))
+
+        cur.execute("""
+            INSERT INTO match_results (
+                source_table, source_match_id, competition_name, competition_type, round,
+                home_team, away_team, home_score, away_score, winner, status, created_at, updated_at
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'played',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+        """, (
+            source_table, str(match_id), match["competition_name"], match["competition_type"], match["round"],
+            match["home_club"], match["away_club"], hg, ag, winner
+        ))
+
+        group = competition_group_from_type(match["competition_type"] or match["competition_name"])
+        is_group_stage = "girone" in normalize_text(match["round"]) or group == "Campionati"
+
+        if is_group_stage:
+            upsert_standing_row(cur, match["competition_name"], match["competition_type"], match["home_club"], hg, ag)
+            upsert_standing_row(cur, match["competition_name"], match["competition_type"], match["away_club"], ag, hg)
+        else:
+            cur.execute("""
+                INSERT INTO cup_matches (
+                    source_table, source_match_id, competition_name, round,
+                    home_team, away_team, home_score, away_score, winner, status, created_at, updated_at
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'played',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            """, (
+                source_table, str(match_id), match["competition_name"], match["round"],
+                match["home_club"], match["away_club"], hg, ag, winner
+            ))
+
+        for name, goals in home_scorers:
+            cur.execute("""
+                INSERT INTO goalscorers (source_table, source_match_id, user_id, club_name, player_name, goals)
+                VALUES (%s,%s,%s,%s,%s,%s)
+            """, (source_table, str(match_id), match["home_user_id"], match["home_club"], name, safe_int(goals, 1)))
+
+        for name, goals in away_scorers:
+            cur.execute("""
+                INSERT INTO goalscorers (source_table, source_match_id, user_id, club_name, player_name, goals)
+                VALUES (%s,%s,%s,%s,%s,%s)
+            """, (source_table, str(match_id), match["away_user_id"], match["away_club"], name, safe_int(goals, 1)))
+
+        conn.commit()
+        return match
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 class GuidedMatchResultModal(discord.ui.Modal, title="Inserisci risultato"):
     home_goals = discord.ui.TextInput(label="Gol casa", placeholder="Es: 2", required=True, max_length=2)
     away_goals = discord.ui.TextInput(label="Gol trasferta", placeholder="Es: 1", required=True, max_length=2)
     home_scorers = discord.ui.TextInput(label="Marcatori casa", placeholder="Es: Mbappe 2, Rodri 1", required=False, max_length=300)
     away_scorers = discord.ui.TextInput(label="Marcatori trasferta", placeholder="Es: Lautaro 1", required=False, max_length=300)
 
-    def __init__(self, fixture_id):
+    def __init__(self, source_table, match_id):
         super().__init__()
-        self.fixture_id = fixture_id
+        self.source_table = source_table
+        self.match_id = match_id
 
     async def on_submit(self, interaction: discord.Interaction):
         await safe_defer(interaction, ephemeral=True, thinking=True)
         try:
-            fixture = save_fixture_result_and_sync(
-                self.fixture_id,
+            match = save_unified_result_and_sync(
+                self.source_table,
+                self.match_id,
                 self.home_goals.value,
                 self.away_goals.value,
                 parse_scorers_text(self.home_scorers.value),
                 parse_scorers_text(self.away_scorers.value),
             )
-
             await interaction.followup.send(
-                (
-                    "✅ Risultato salvato e sincronizzato col sito.\\n"
-                    f"**{row_get(fixture, 'home_club')} {self.home_goals.value} - {self.away_goals.value} {row_get(fixture, 'away_club')}**"
-                ),
+                f"✅ Risultato salvato e sincronizzato col sito.\n**{match['home_club']} {self.home_goals.value} - {self.away_goals.value} {match['away_club']}**",
                 ephemeral=True
             )
         except Exception as e:
@@ -10187,25 +10359,26 @@ class GuidedMatchResultModal(discord.ui.Modal, title="Inserisci risultato"):
 
 class GuidedMatchSelect(discord.ui.Select):
     def __init__(self, matches):
+        self.match_map = {}
         options = []
-        for m in matches[:25]:
-            mid = str(row_get(m, "id"))
-            home = str(row_get(m, "home_club", "Casa"))
-            away = str(row_get(m, "away_club", "Trasferta"))
-            round_name = str(row_get(m, "round", "") or "")
-            leg = str(row_get(m, "leg", "") or "")
-            label = f"{home} vs {away}"[:100]
-            desc = f"{round_name} {leg}".strip()[:100]
-            options.append(discord.SelectOption(label=label, value=mid, description=desc or "Partita attiva"))
+        for idx, m in enumerate(matches[:25], start=1):
+            value = str(idx)
+            self.match_map[value] = m
+            label = f"{m['home_club']} vs {m['away_club']}"[:100]
+            desc = f"{m['competition_name']} • {m['round']} {m['leg']}".strip()[:100]
+            options.append(discord.SelectOption(label=label, value=value, description=desc or "Partita attiva"))
+
         if not options:
-            options = [discord.SelectOption(label="Nessuna partita disponibile", value="none", description="Lo staff deve generare/avviare le partite")]
+            options = [discord.SelectOption(label="Nessuna partita disponibile", value="none")]
+
         super().__init__(placeholder="Scegli la partita...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         if self.values[0] == "none":
             await interaction.response.send_message("❌ Nessuna partita disponibile.", ephemeral=True)
             return
-        await interaction.response.send_modal(GuidedMatchResultModal(self.values[0]))
+        match = self.match_map[self.values[0]]
+        await interaction.response.send_modal(GuidedMatchResultModal(match["source_table"], match["id"]))
 
 class GuidedMatchSelectView(discord.ui.View):
     def __init__(self, matches):
@@ -10223,7 +10396,6 @@ class GuidedCompetitionSelect(discord.ui.Select):
             if not matches:
                 await interaction.followup.send("❌ Non ci sono partite attive per questa competizione.", ephemeral=True)
                 return
-
             embed = discord.Embed(
                 title="📅 Scegli la partita",
                 description="Seleziona la partita attiva per inserire risultato e marcatori.",
@@ -10237,11 +10409,7 @@ class GuidedCompetitionSelect(discord.ui.Select):
 class GuidedCompetitionView(discord.ui.View):
     def __init__(self, *args):
         super().__init__(timeout=300)
-        # compatibilità: GuidedCompetitionView(options) oppure GuidedCompetitionView(user_id, options)
-        if len(args) == 1:
-            options = args[0]
-        else:
-            options = args[1]
+        options = args[-1]
         self.add_item(GuidedCompetitionSelect(options))
 
 # ========================================================================
@@ -10270,8 +10438,8 @@ async def risultato(interaction: discord.Interaction):
         embed = discord.Embed(
             title="⚽ Inserisci risultato",
             description=(
-                "Scegli la competizione a cui stai partecipando.\\n\\n"
-                "Poi selezioni la partita attiva e inserisci gol + marcatori.\\n"
+                "Scegli la competizione a cui stai partecipando.\n\n"
+                "Poi selezioni la partita attiva e inserisci gol + marcatori.\n"
                 "Formato marcatori: `Mbappe 3, Rodri 2`."
             ),
             color=discord.Color.blue(),
@@ -10452,3356 +10620,4 @@ async def classifica(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="calendario", description="Mostra le partite ancora da disputare")
-async def calendario(interaction: discord.Interaction):
-    if not is_calendar_channel(interaction):
-        await interaction.response.send_message("❌ Il calendario si vede solo nel canale CALENDARIO.", delete_after=10)
-        return
 
-    champ = active_championship()
-    if not champ:
-        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
-        return
-
-    conn = connect()
-    cur = conn.cursor()
-
-    # Calcola quante giornate totali ci sono.
-    cur.execute("""
-        SELECT MAX(round_number) AS max_round
-        FROM championship_matches
-        WHERE championship_id = %s
-    """, (champ["id"],))
-    max_round_row = cur.fetchone()
-    max_round = int(max_round_row["max_round"] or 0)
-    first_leg_last_round = max_round // 2 if max_round else 0
-
-    # Prima mostriamo solo l'andata. Il ritorno compare solo quando tutta l'andata è completata.
-    cur.execute("""
-        SELECT COUNT(*) AS pending_first_leg
-        FROM championship_matches
-        WHERE championship_id = %s
-          AND status = 'pending'
-          AND round_number <= %s
-    """, (champ["id"], first_leg_last_round))
-    pending_first_leg = int(cur.fetchone()["pending_first_leg"] or 0)
-
-    if pending_first_leg > 0:
-        leg_label = "Andata"
-        round_filter_min = 1
-        round_filter_max = first_leg_last_round
-    else:
-        leg_label = "Ritorno"
-        round_filter_min = first_leg_last_round + 1
-        round_filter_max = max_round
-
-    # Mostra solo partite ancora da disputare, ordinate per giornata.
-    cur.execute("""
-        SELECT m.*, g.name AS group_name
-        FROM championship_matches m
-        JOIN championship_groups g ON g.id = m.group_id
-        WHERE m.championship_id = %s
-          AND m.status = 'pending'
-          AND m.round_number BETWEEN %s AND %s
-        ORDER BY m.round_number ASC, g.id ASC, m.id ASC
-        LIMIT 30
-    """, (champ["id"], round_filter_min, round_filter_max))
-    rows = cur.fetchall()
-    conn.close()
-
-    if not rows:
-        await interaction.response.send_message("✅ Non ci sono partite da disputare in calendario.", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title=f"📅 Calendario — {champ['name']}",
-        description=f"Fase visualizzata: **{leg_label}**\\nMostro solo le prossime partite ancora da disputare.",
-        color=discord.Color.blue()
-    )
-
-    for m in rows:
-        embed.add_field(
-            name=f"{m['group_name']} • Giornata {m['round_number']}",
-            value=f"**{m['home_name']}** vs **{m['away_name']}**",
-            inline=False
-        )
-
-    embed.set_footer(text="Il ritorno comparirà solo quando tutte le partite di andata saranno completate.")
-    await interaction.response.send_message(embed=embed)
-
-
-
-@tree.command(name="prossima_partita", description="Mostra la tua prossima partita")
-async def prossima_partita(interaction: discord.Interaction):
-    if not is_calendar_channel(interaction):
-        await interaction.response.send_message("❌ Questo comando si usa solo nel canale CALENDARIO.", delete_after=10)
-        return
-
-    champ = active_championship()
-    if not champ:
-        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
-        return
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT m.*, g.name AS group_name
-        FROM championship_matches m
-        JOIN championship_groups g ON g.id = m.group_id
-        WHERE m.championship_id = %s
-          AND m.status = 'pending'
-          AND (m.home_id = %s OR m.away_id = %s)
-        ORDER BY m.round_number ASC
-        LIMIT 1
-    """, (champ["id"], str(interaction.user.id), str(interaction.user.id)))
-    m = cur.fetchone()
-    conn.close()
-
-    if not m:
-        await interaction.response.send_message("Non hai prossime partite.", ephemeral=True)
-        return
-
-    embed = discord.Embed(title="⏭️ Prossima partita", color=discord.Color.blue())
-    embed.add_field(name="Girone", value=m["group_name"], inline=True)
-    embed.add_field(name="Giornata", value=str(m["round_number"]), inline=True)
-    embed.add_field(name="Match", value=f"**{m['home_name']}** vs **{m['away_name']}**", inline=False)
-
-    await interaction.response.send_message(embed=embed)
-
-
-@tree.command(name="capocannonieri", description="Classifica marcatori")
-async def capocannonieri(interaction: discord.Interaction):
-    if not is_stats_channel(interaction):
-        await interaction.response.send_message("❌ Le statistiche si vedono solo nel canale STATISTICHE.", delete_after=10)
-        return
-
-    champ = active_championship()
-    if not champ:
-        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
-        return
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT s.scorer_name, SUM(s.goals) AS goals
-        FROM match_scorers s
-        JOIN championship_matches m ON m.id = s.match_id
-        WHERE m.championship_id = %s AND m.status = 'confirmed'
-        GROUP BY s.scorer_name
-        ORDER BY goals DESC
-        LIMIT 20
-    """, (champ["id"],))
-    rows = cur.fetchall()
-    conn.close()
-
-    embed = discord.Embed(title="⚽ Capocannonieri", color=discord.Color.gold())
-
-    if not rows:
-        embed.description = "Nessun marcatore registrato."
-    else:
-        for i, r in enumerate(rows, start=1):
-            embed.add_field(name=f"{i}. {r['scorer_name']}", value=f"{r['goals']} gol", inline=False)
-
-    await interaction.response.send_message(embed=embed)
-
-
-@tree.command(name="miglior_difesa", description="Mostra le migliori difese")
-async def miglior_difesa(interaction: discord.Interaction):
-    if not is_stats_channel(interaction):
-        await interaction.response.send_message("❌ Le statistiche si vedono solo nel canale STATISTICHE.", delete_after=10)
-        return
-
-    champ = active_championship()
-    if not champ:
-        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
-        return
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM championship_groups WHERE championship_id = %s", (champ["id"],))
-    groups = cur.fetchall()
-    conn.close()
-
-    all_rows = []
-    for g in groups:
-        all_rows.extend(calculate_group_standings(champ["id"], g["id"]))
-
-    all_rows.sort(key=lambda x: (x["ga"], -x["pts"]))
-
-    embed = discord.Embed(title="🧤 Miglior difesa", color=discord.Color.blue())
-    for i, r in enumerate(all_rows[:15], start=1):
-        embed.add_field(name=f"{i}. {r['name']}", value=f"Gol subiti: {r['ga']} | PG: {r['pg']}", inline=False)
-
-    await interaction.response.send_message(embed=embed)
-
-
-@tree.command(name="forza_risultato", description="Admin: forza o corregge un risultato")
-@app_commands.describe(match_id="ID partita", home_goals="Gol casa", away_goals="Gol trasferta")
-async def forza_risultato(interaction: discord.Interaction, match_id: int, home_goals: int, away_goals: int):
-    if not is_league_admin(interaction):
-        await interaction.response.send_message("❌ Solo gli admin possono forzare risultati.", ephemeral=True)
-        return
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE championship_matches
-        SET home_goals = %s, away_goals = %s, status = 'confirmed', submitted_by = %s, confirm_by = NULL
-        WHERE id = %s
-    """, (home_goals, away_goals, str(interaction.user.id), match_id))
-    conn.commit()
-    conn.close()
-
-    await interaction.response.send_message(f"✅ Risultato forzato per partita ID {match_id}: {home_goals}-{away_goals}")
-
-
-@tree.command(name="revisioni", description="Admin: mostra risultati contestati")
-async def revisioni(interaction: discord.Interaction):
-    if not is_league_admin(interaction):
-        await interaction.response.send_message("❌ Solo gli admin possono vedere le revisioni.", ephemeral=True)
-        return
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT *
-        FROM championship_matches
-        WHERE status = 'contested'
-        ORDER BY round_number ASC
-        LIMIT 20
-    """)
-    rows = cur.fetchall()
-    conn.close()
-
-    embed = discord.Embed(title="⚠️ Risultati contestati", color=discord.Color.orange())
-
-    if not rows:
-        embed.description = "Nessun risultato contestato."
-    else:
-        for m in rows:
-            embed.add_field(
-                name=f"ID {m['id']} • G{m['round_number']}",
-                value=f"{m['home_name']} {m['home_goals']} - {m['away_goals']} {m['away_name']}",
-                inline=False
-            )
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-
-class ReplaceNewPlayerSelect(discord.ui.Select):
-    def __init__(self, old_member, candidates):
-        self.old_member = old_member
-
-        options = []
-        for m in candidates[:25]:
-            options.append(
-                discord.SelectOption(
-                    label=m.display_name[:100],
-                    value=str(m.id),
-                    description=f"Nuovo player • ID {m.id}"
-                )
-            )
-
-        super().__init__(
-            placeholder="Scegli il nuovo player PRE-ISCRITTO...",
-            min_values=1,
-            max_values=1,
-            options=options
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        if not is_league_admin(interaction):
-            await interaction.response.send_message("❌ Solo gli admin possono sostituire player.", ephemeral=True)
-            return
-
-        guild = interaction.guild
-        new_member = await get_member_safe(guild, self.values[0])
-
-        if not new_member:
-            await interaction.response.send_message("Nuovo player non trovato.", ephemeral=True)
-            return
-
-        old_id = str(self.old_member.id)
-        new_id = str(new_member.id)
-
-        conn = connect()
-        cur = conn.cursor()
-
-        # Managers
-        cur.execute("SELECT * FROM managers WHERE discord_id = %s", (old_id,))
-        old_manager = cur.fetchone()
-
-        if old_manager:
-            cur.execute("""
-                INSERT INTO managers (discord_id, name, budget)
-                VALUES (%s, %s, %s)
-            """, (
-                new_id,
-                new_member.display_name,
-                old_manager["budget"]
-            ))
-
-            cur.execute("DELETE FROM managers WHERE discord_id = %s", (old_id,))
-
-        # Rosa
-        cur.execute("""
-            UPDATE players
-            SET owner_discord_id = %s
-            WHERE owner_discord_id = %s
-        """, (new_id, old_id))
-
-        # Championship players
-        cur.execute("""
-            UPDATE championship_players
-            SET discord_id = %s, display_name = %s
-            WHERE discord_id = %s
-        """, (new_id, new_member.display_name, old_id))
-
-        # Matches
-        cur.execute("""
-            UPDATE championship_matches
-            SET home_id = %s, home_name = %s
-            WHERE home_id = %s
-        """, (new_id, new_member.display_name, old_id))
-
-        cur.execute("""
-            UPDATE championship_matches
-            SET away_id = %s, away_name = %s
-            WHERE away_id = %s
-        """, (new_id, new_member.display_name, old_id))
-
-        # Real team assignments
-        cur.execute("""
-            UPDATE real_team_assignments
-            SET discord_id = %s, manager_name = %s
-            WHERE discord_id = %s
-        """, (new_id, new_member.display_name, old_id))
-
-        conn.commit()
-        conn.close()
-
-        embed = discord.Embed(
-            title="🔄 Player sostituito",
-            description=f"**{new_member.display_name}** prende il posto di **{self.old_member.display_name}**.",
-            color=discord.Color.green()
-        )
-
-        embed.add_field(name="Trasferito", value="✅ Rosa\n✅ Budget\n✅ Girone\n✅ Calendario\n✅ Statistiche", inline=False)
-
-        await interaction.response.edit_message(embed=embed, view=None)
-
-
-class ReplaceNewPlayerView(discord.ui.View):
-    def __init__(self, old_member, candidates):
-        super().__init__(timeout=180)
-        self.add_item(ReplaceNewPlayerSelect(old_member, candidates))
-
-
-class ReplaceOldPlayerSelect(discord.ui.Select):
-    def __init__(self, registered_members):
-        options = []
-
-        for m in registered_members[:25]:
-            options.append(
-                discord.SelectOption(
-                    label=m.display_name[:100],
-                    value=str(m.id),
-                    description=f"Player iscritto • ID {m.id}"
-                )
-            )
-
-        super().__init__(
-            placeholder="Scegli il player da sostituire...",
-            min_values=1,
-            max_values=1,
-            options=options
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        if not is_league_admin(interaction):
-            await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
-            return
-
-        guild = interaction.guild
-
-        old_member = await get_member_safe(guild, self.values[0])
-
-        if not old_member:
-            await interaction.response.send_message("Player non trovato.", ephemeral=True)
-            return
-
-        pre_role = guild.get_role(int(PRE_ISCRITTO_ROLE_ID)) if guild else None
-
-        if not pre_role:
-            await interaction.response.send_message("Ruolo PRE-ISCRITTO non trovato.", ephemeral=True)
-            return
-
-        candidates = [m for m in pre_role.members if not m.bot]
-
-        if not candidates:
-            await interaction.response.send_message("Nessun player PRE-ISCRITTO disponibile.", ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title="🔄 Sostituzione player",
-            description=f"Hai scelto di sostituire **{old_member.display_name}**.\n\nOra scegli il nuovo player PRE-ISCRITTO.",
-            color=discord.Color.orange()
-        )
-
-        await interaction.response.edit_message(
-            embed=embed,
-            view=ReplaceNewPlayerView(old_member, candidates)
-        )
-
-
-class ReplaceOldPlayerView(discord.ui.View):
-    def __init__(self, registered_members):
-        super().__init__(timeout=180)
-        self.add_item(ReplaceOldPlayerSelect(registered_members))
-
-
-@tree.command(name="sostituisci_player", description="Admin: sostituisce un player nel campionato")
-async def sostituisci_player(interaction: discord.Interaction):
-    if not is_league_admin(interaction):
-        await interaction.response.send_message("❌ Solo gli admin possono usare questo comando.", ephemeral=True)
-        return
-
-    guild = interaction.guild
-
-    role = guild.get_role(int(LEAGUE_PLAYER_ROLE_ID)) if guild else None
-
-    if not role:
-        await interaction.response.send_message("Ruolo ISCRITTI non trovato.", ephemeral=True)
-        return
-
-    registered_members = [m for m in role.members if not m.bot]
-
-    if not registered_members:
-        await interaction.response.send_message("Nessun player ISCRITTO trovato.", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title="🔄 Sostituzione player campionato",
-        description="Seleziona dalla tendina il player ISCRITTO da sostituire.",
-        color=discord.Color.blue()
-    )
-
-    await interaction.response.send_message(
-        embed=embed,
-        view=ReplaceOldPlayerView(registered_members),
-        ephemeral=True
-    )
-
-
-if __name__ == "__main__":
-    if not TOKEN:
-        raise RuntimeError("DISCORD_TOKEN mancante nel file .env")
-    
-
-# ================= LOG AUTOMATICO COMANDI STAFF =================
-
-async def log_every_staff_slash_command(interaction: discord.Interaction):
-    """
-    Logga automaticamente OGNI slash command usato dallo staff
-    nel canale LOG 1498345679511355582.
-    """
-    try:
-        if not interaction.guild:
-            return
-
-        if not getattr(interaction, "command", None):
-            return
-
-        user = interaction.user
-
-        # Logga solo utenti con ruoli staff configurati.
-        if not can_use_normal_staff(user):
-            return
-
-        command_name = interaction.command.qualified_name if interaction.command else "comando_sconosciuto"
-
-        # Evita loop/rumore eccessivo per comandi puramente informativi se vuoi:
-        # al momento logghiamo TUTTO come richiesto.
-
-        options_text = "Nessun parametro rilevato"
-        try:
-            data = getattr(interaction, "data", {}) or {}
-            options = data.get("options", [])
-            if options:
-                parts = []
-                for opt in options:
-                    name = opt.get("name", "parametro")
-                    value = opt.get("value", "")
-                    parts.append(f"`{name}` = `{value}`")
-                options_text = "\n".join(parts)
-        except Exception:
-            pass
-
-        channel_text = f"<#{interaction.channel_id}>" if interaction.channel_id else "Canale non rilevato"
-
-        await send_staff_log(
-            interaction.guild,
-            "🧾 Comando staff eseguito",
-            (
-                f"👤 Staff: {user.mention} (`{user.id}`)\n"
-                f"💬 Comando: `/{command_name}`\n"
-                f"📍 Canale: {channel_text}\n\n"
-                f"**Parametri:**\n{options_text}"
-            ),
-            user=user,
-            color=discord.Color.blurple()
-        )
-
-    except Exception as e:
-        print(f"[STAFF COMMAND LOG] Errore log comando staff: {e}")
-
-
-@bot.event
-async def on_interaction(interaction: discord.Interaction):
-    # Log automatico di tutti i comandi slash staff.
-    # IMPORTANTE: lo mandiamo in background, così non blocca la risposta del comando Discord.
-    if interaction.type == discord.InteractionType.application_command:
-        try:
-            bot.loop.create_task(log_every_staff_slash_command(interaction))
-        except Exception as e:
-            print(f"[STAFF COMMAND LOG] Errore avvio task log: {e}")
-
-# =================================================================
-
-# ================= STAFF PANEL =================
-
-class StaffPanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    @discord.ui.button(label="Stato mercato", style=discord.ButtonStyle.primary, emoji="📈")
-    async def market(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not can_use_staff_panel(interaction.user):
-            await interaction.response.send_message("❌ Non hai accesso allo staff panel.", ephemeral=True)
-            return
-        opened = is_market_open()
-        embed = discord.Embed(
-            title="📊 Stato mercato",
-            description=f"Il mercato è: **{'APERTO ✅' if opened else 'CHIUSO 🔒'}**",
-            color=discord.Color.green() if opened else discord.Color.red()
-        )
-        await interaction.response.send_message(embed=embed, view=MarketStatusView(), ephemeral=True)
-
-    @discord.ui.button(label="Backup", style=discord.ButtonStyle.secondary, emoji="💾")
-    async def backup(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not can_use_staff_panel(interaction.user):
-            await interaction.response.send_message("❌ Non hai accesso allo staff panel.", ephemeral=True)
-            return
-        embed = discord.Embed(
-            title="💾 Backup",
-            description="Usa `/backup_now`, `/backup_list` o `/restore_backup`.\nLe azioni critiche richiedono conferma.",
-            color=discord.Color.blue()
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @discord.ui.button(label="Fine stagione", style=discord.ButtonStyle.danger, emoji="🏁")
-    async def season(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not can_use_staff_panel(interaction.user):
-            await interaction.response.send_message("❌ Non hai accesso allo staff panel.", ephemeral=True)
-            return
-        embed = discord.Embed(
-            title="🏁 Fine stagione",
-            description="Usa `/fine_stagione` per avviare il flusso protetto con conferma.",
-            color=discord.Color.gold()
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @discord.ui.button(label="Inattivi", style=discord.ButtonStyle.secondary, emoji="⚠️")
-    async def inactive(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not can_use_staff_panel(interaction.user):
-            await interaction.response.send_message("❌ Non hai accesso allo staff panel.", ephemeral=True)
-            return
-        embed = discord.Embed(
-            title="⚠️ Sistema inattività",
-            description="Il bot controlla automaticamente ogni 22 ore e invia segnalazioni nel canale configurato.",
-            color=discord.Color.orange()
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@tree.command(name="staff_panel", description="Owner staff: pannello centrale gestione bot")
-async def staff_panel(interaction: discord.Interaction):
-    if not can_use_staff_panel(interaction.user):
-        await interaction.response.send_message("❌ Solo il ruolo autorizzato può usare lo staff panel.", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title="🛠️ FC26 Staff Panel",
-        description=(
-            "Pannello rapido per la gestione della lega.\n\n"
-            "Accesso riservato al ruolo owner staff."
-        ),
-        color=discord.Color.red()
-    )
-    embed.add_field(name="Mercato", value="Apri/chiudi mercato", inline=True)
-    embed.add_field(name="Backup", value="Backup e restore protetti", inline=True)
-    embed.add_field(name="Stagioni", value="Fine/nuova stagione", inline=True)
-    embed.add_field(name="Inattivi", value="Controlli automatici", inline=True)
-
-    await interaction.response.send_message(embed=embed, view=StaffPanelView(), ephemeral=True)
-
-# ===========================================================
-
-
-# ================= RIPUBBLICA RICHIESTE PENDING =================
-
-@tree.command(name="ripubblica_richieste", description="Staff: ripubblica tutte le richieste pending nel canale staff")
-async def ripubblica_richieste(interaction: discord.Interaction):
-    if not can_use_normal_staff(interaction.user):
-        await interaction.response.send_message(
-            "❌ Non hai i permessi per usare questo comando.",
-            ephemeral=True
-        )
-        return
-
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT *
-        FROM signup_requests
-        WHERE status = 'pending'
-        ORDER BY id ASC
-    """)
-
-    rows = cur.fetchall()
-    conn.close()
-
-    if not rows:
-        await interaction.response.send_message(
-            "ℹ️ Nessuna richiesta pending trovata.",
-            ephemeral=True
-        )
-        return
-
-    staff_channel = interaction.guild.get_channel(int(SIGNUP_STAFF_CHANNEL_ID))
-    if not staff_channel:
-        await interaction.response.send_message(
-            "❌ Canale staff richieste non trovato.",
-            ephemeral=True
-        )
-        return
-
-    sent = 0
-
-    for request in rows:
-        try:
-            member = interaction.guild.get_member(int(request["discord_id"]))
-
-            embed = discord.Embed(
-                title="📩 Richiesta iscrizione FC26",
-                description=f"Richiesta ID: **{request['id']}**",
-                color=discord.Color.orange()
-            )
-
-            player_text = member.mention if member else f"<@{request['discord_id']}>"
-
-            embed.add_field(name="Player Discord", value=player_text, inline=False)
-            embed.add_field(name="Nome", value=request["real_name"] or "N/D", inline=True)
-            embed.add_field(name="Età", value=request["age"] or "N/D", inline=True)
-            embed.add_field(name="Piattaforma", value=request["platform"] or "N/D", inline=True)
-            embed.add_field(name="ID PSN/Xbox/EA", value=request["game_id"] or "N/D", inline=False)
-
-            if request["club_preferences"]:
-                embed.add_field(
-                    name="Club preferiti",
-                    value=request["club_preferences"],
-                    inline=False
-                )
-
-            embed.set_footer(text="Lo staff deve scegliere ACCETTA o RIFIUTA.")
-
-            try:
-                await staff_channel.send(
-                    embed=embed,
-                    view=StaffDecisionView(request["id"])
-                )
-            except Exception:
-                await staff_channel.send(embed=embed)
-
-            sent += 1
-
-        except Exception as e:
-            print(f"[RIPUBBLICA_RICHIESTE] Errore richiesta {request['id']}: {e}")
-
-    await send_staff_log(
-        interaction.guild,
-        "📨 Richieste ripubblicate",
-        f"Ripubblicate **{sent}** richieste pending nel canale staff.",
-        user=interaction.user,
-        color=discord.Color.green()
-    )
-
-    await interaction.response.send_message(
-        f"✅ Ripubblicate {sent} richieste pending nel canale staff.",
-        ephemeral=True
-    )
-
-# ===============================================================
-
-
-# ================= FORZA ASSEGNAZIONE SQUADRA REALE =================
-
-
-@tree.command(name="forza_squadra_reale", description="Staff: assegna/ricorregge rosa reale e budget a un player già iscritto")
-@app_commands.describe(utente="Player già iscritto", squadra="Nome squadra reale da assegnare, es. Arsenal")
-async def forza_squadra_reale(interaction: discord.Interaction, utente: discord.Member, squadra: str):
-    if not can_use_normal_staff(interaction.user):
-        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
-        return
-
-    await safe_defer(interaction, ephemeral=True, thinking=True)
-
-    club_name = str(squadra).strip()
-    players, avg_ovr, budget = get_team_stats_reale(club_name, include_owned_by=str(utente.id))
-
-    if not players:
-        suggestions = get_exact_team_names_like(club_name)
-        suggestion_text = "\n".join(f"• {s}" for s in suggestions) if suggestions else "Nessun nome simile trovato."
-        await interaction.followup.send(
-            f"❌ Non ho trovato giocatori liberi per **{club_name}** nel database.\n\n"
-            f"Possibili nomi trovati:\n{suggestion_text}\n\n"
-            f"Usa `/diagnostica_squadra {club_name}`.",
-            ephemeral=True
-        )
-        return
-
-    real_team_name = players[0]["team"]
-
-    conn = connect()
-    cur = conn.cursor()
-
-    # Libera eventuale rosa precedente
-    cur.execute("""
-        UPDATE players
-        SET owner_discord_id = NULL, sold_price = NULL
-        WHERE owner_discord_id = %s
-    """, (str(utente.id),))
-
-    # Assegna la rosa reale
-    for p in players:
-        cur.execute("""
-            UPDATE players
-            SET owner_discord_id = %s, sold_price = %s
-            WHERE id = %s
-        """, (str(utente.id), 0, p["id"]))
-
-    # Manager con budget corretto
-    cur.execute("""
-        INSERT INTO managers (discord_id, name, budget)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (discord_id) DO NOTHING
-    """, (str(utente.id), utente.display_name, budget))
-
-    cur.execute("""
-        UPDATE managers
-        SET name = %s, budget = %s
-        WHERE discord_id = %s
-    """, (utente.display_name, budget, str(utente.id)))
-
-    # Aggiorna club
-    try:
-        cur.execute("""
-            UPDATE fc26_clubs
-            SET assigned_to = NULL
-            WHERE assigned_to = %s
-        """, (str(utente.id),))
-
-        cur.execute("""
-            UPDATE fc26_clubs
-            SET assigned_to = %s, assigned_at = CURRENT_TIMESTAMP
-            WHERE LOWER(name) = LOWER(%s)
-        """, (str(utente.id), club_name.lower()))
-
-        if cur.rowcount == 0:
-            cur.execute("""
-                UPDATE fc26_clubs
-                SET assigned_to = %s, assigned_at = CURRENT_TIMESTAMP
-                WHERE LOWER(name) = LOWER(%s)
-            """, (str(utente.id), real_team_name.lower()))
-    except Exception:
-        pass
-
-    try:
-        cur.execute("""
-            INSERT INTO real_team_assignments (discord_id, manager_name, team_name, avg_overall, assigned_budget) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (discord_id) DO UPDATE SET manager_name = EXCLUDED.manager_name, team_name = EXCLUDED.team_name, avg_overall = EXCLUDED.avg_overall, assigned_budget = EXCLUDED.assigned_budget
-        """, (str(utente.id), utente.display_name, real_team_name, avg_ovr, budget))
-    except Exception:
-        pass
-
-    try:
-        cur.execute("""
-            UPDATE signup_requests
-            SET club_name = %s
-            WHERE discord_id = %s AND status = 'accepted'
-        """, (real_team_name, str(utente.id)))
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
-
-    registered_role = interaction.guild.get_role(int(SIGNUP_REGISTERED_ROLE_ID))
-    pending_role = interaction.guild.get_role(int(SIGNUP_PENDING_ROLE_ID))
-
-    if registered_role:
-        try:
-            await utente.add_roles(registered_role, reason="Squadra reale assegnata manualmente")
-        except Exception:
-            pass
-
-    if pending_role:
-        try:
-            await utente.remove_roles(pending_role, reason="Squadra reale assegnata manualmente")
-        except Exception:
-            pass
-
-    embed = discord.Embed(
-        title="✅ Squadra reale assegnata",
-        description=f"{utente.mention} ora gestisce **{real_team_name}**.",
-        color=discord.Color.green()
-    )
-    embed.add_field(name="Giocatori assegnati", value=str(len(players)), inline=True)
-    embed.add_field(name="OVR medio", value=f"{avg_ovr:.1f}", inline=True)
-    embed.add_field(name="Budget corretto", value=f"{budget} crediti", inline=True)
-
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-    try:
-        await send_staff_log(
-            interaction.guild,
-            "✅ Squadra reale forzata/aggiornata",
-            (
-                f"Player: {utente.mention}\n"
-                f"Club: **{real_team_name}**\n"
-                f"Giocatori assegnati: **{len(players)}**\n"
-                f"OVR medio: **{avg_ovr:.1f}**\n"
-                f"Budget: **{budget} crediti**"
-            ),
-            user=interaction.user,
-            color=discord.Color.green()
-        )
-    except Exception:
-        pass
-
-# ================================================================
-# ================================================================
-
-
-# ================= COMANDO PLAYER: MIA SQUADRA =================
-
-@tree.command(name="mia_squadra", description="Mostra la tua squadra, budget e rosa")
-async def mia_squadra(interaction: discord.Interaction):
-    if str(interaction.channel_id) != str(ROSE_CHANNEL_ID):
-        await interaction.response.send_message(
-            f"❌ Puoi usare questo comando solo nel canale <#{ROSE_CHANNEL_ID}>.",
-            ephemeral=True
-        )
-        return
-
-    await safe_defer(interaction, ephemeral=True, thinking=True)
-
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("SELECT * FROM managers WHERE discord_id = %s", (str(interaction.user.id),))
-    manager = cur.fetchone()
-
-    if not manager:
-        conn.close()
-        await interaction.followup.send(
-            "❌ Non risulti ancora registrato come manager.",
-            ephemeral=True
-        )
-        return
-
-    # Club assegnato
-    club_name = "N/D"
-    league_name = "N/D"
-
-    try:
-        cur.execute("""
-            SELECT name, league
-            FROM fc26_clubs
-            WHERE assigned_to = %s
-            LIMIT 1
-        """, (str(interaction.user.id),))
-        club = cur.fetchone()
-        if club:
-            club_name = club["name"]
-            league_name = club["league"] or "N/D"
-    except Exception:
-        pass
-
-    # Rosa
-    cur.execute("""
-        SELECT name, team, position, overall, sold_price
-        FROM players
-        WHERE owner_discord_id = %s
-        ORDER BY 
-            CASE 
-                WHEN position IN ('GK', 'POR') THEN 1
-                WHEN position IN ('CB','LB','RB','LWB','RWB','DC','TS','TD') THEN 2
-                WHEN position IN ('CDM','CM','CAM','LM','RM','MCO','CDC','CC') THEN 3
-                ELSE 4
-            END,
-            overall DESC
-    """, (str(interaction.user.id),))
-    players = cur.fetchall()
-
-    conn.close()
-
-    budget = manager["budget"] if "budget" in manager.keys() else 0
-
-    avg_ovr = 0
-    if players:
-        avg_ovr = sum(safe_int(p["overall"]) for p in players) / len(players)
-
-    embed = discord.Embed(
-        title=f"🏟️ La tua squadra — {club_name}",
-        description=f"Manager: {interaction.user.mention}",
-        color=discord.Color.blue()
-    )
-
-    embed.add_field(name="Club", value=club_name, inline=True)
-    embed.add_field(name="Campionato", value=league_name, inline=True)
-    embed.add_field(name="Budget", value=f"{budget} crediti", inline=True)
-    embed.add_field(name="Giocatori in rosa", value=str(len(players)), inline=True)
-    embed.add_field(name="OVR medio", value=f"{avg_ovr:.1f}" if players else "N/D", inline=True)
-
-    if not players:
-        embed.add_field(
-            name="Rosa",
-            value="Nessun giocatore assegnato.",
-            inline=False
-        )
-    else:
-        lines = []
-        for p in players[:25]:
-            lines.append(
-                f"• **{p['name']}** — {p['position']} — OVR {p['overall']}"
-            )
-
-        embed.add_field(
-            name="Rosa",
-            value="\n".join(lines),
-            inline=False
-        )
-
-        if len(players) > 25:
-            embed.set_footer(text=f"Mostrati 25 giocatori su {len(players)} totali.")
-
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-@tree.command(name="mio_budget", description="Mostra rapidamente il tuo budget")
-async def mio_budget(interaction: discord.Interaction):
-    if str(interaction.channel_id) != str(ROSE_CHANNEL_ID):
-        await interaction.response.send_message(
-            f"❌ Puoi usare questo comando solo nel canale <#{ROSE_CHANNEL_ID}>.",
-            ephemeral=True
-        )
-        return
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (str(interaction.user.id),))
-    row = cur.fetchone()
-    conn.close()
-
-    if not row:
-        await interaction.response.send_message(
-            "❌ Non risulti ancora registrato come manager.",
-            ephemeral=True
-        )
-        return
-
-    await interaction.response.send_message(
-        f"💰 Il tuo budget attuale è: **{row['budget']} crediti**.",
-        ephemeral=True
-    )
-
-# ===============================================================
-
-
-# ================= SISTEMA SCAMBI GUIDATO CLUB/GIOCATORI/CREDITI =================
-
-def get_occupied_clubs_for_autocomplete():
-    conn = connect()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT c.name, c.league, c.assigned_to, COALESCE(COALESCE(m.name, m.manager_name, m.discord_id) AS name, m.manager_name, m.discord_id) AS manager_name
-            FROM fc26_clubs c
-            LEFT JOIN managers m ON m.discord_id = c.assigned_to
-            WHERE c.assigned_to IS NOT NULL
-            ORDER BY c.name ASC
-        """)
-        rows = cur.fetchall()
-    except Exception:
-        rows = []
-    conn.close()
-    return rows
-
-
-async def club_scambio_autocomplete(interaction: discord.Interaction, current: str):
-    return await autocomplete_club_occupati(interaction, current)
-
-
-async def autocomplete_giocatori_di_manager(interaction: discord.Interaction, current: str, manager_id: str):
-    """
-    Lista giocatori appartenenti a un manager.
-    """
-    if not manager_id:
-        return []
-
-    current_norm = normalize_text(current)
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, name, team, position, overall
-        FROM players
-        WHERE owner_discord_id = %s
-        ORDER BY overall DESC NULLS LAST, name ASC
-    """, (str(manager_id),))
-    rows = cur.fetchall()
-    conn.close()
-
-    choices = []
-    for r in rows:
-        name = str(r["name"] or "")
-        team = str(r["team"] or "")
-        pos = str(r["position"] or "")
-        ovr = str(r["overall"] or "")
-
-        haystack = normalize_text(f"{name} {team} {pos} {ovr}")
-        if current_norm and current_norm not in haystack:
-            continue
-
-        label = f"{name} • {pos} • {ovr} • {team}"
-        choices.append(app_commands.Choice(
-            name=label[:100],
-            value=str(r["id"])
-        ))
-
-        if len(choices) >= 25:
-            break
-
-    return choices
-
-
-async def autocomplete_miei_giocatori_o_crediti(interaction: discord.Interaction, current: str):
-    """
-    Lista giocatori del manager che propone lo scambio + opzione crediti.
-    """
-    current_norm = normalize_text(current)
-    choices = []
-
-    if "crediti".startswith(current_norm) or current_norm in {"", "credito", "cred"}:
-        choices.append(app_commands.Choice(name="💰 Offro solo crediti / aggiungo crediti", value="__credits__"))
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, name, team, position, overall
-        FROM players
-        WHERE owner_discord_id = %s
-        ORDER BY overall DESC NULLS LAST, name ASC
-    """, (str(interaction.user.id),))
-    rows = cur.fetchall()
-    conn.close()
-
-    for r in rows:
-        name = str(r["name"] or "")
-        team = str(r["team"] or "")
-        pos = str(r["position"] or "")
-        ovr = str(r["overall"] or "")
-
-        haystack = normalize_text(f"{name} {team} {pos} {ovr}")
-        if current_norm and current_norm not in haystack:
-            continue
-
-        label = f"{name} • {pos} • {ovr} • {team}"
-        choices.append(app_commands.Choice(
-            name=label[:100],
-            value=str(r["id"])
-        ))
-
-        if len(choices) >= 25:
-            break
-
-    return choices[:25]
-
-# ============================================================
-
-
-# ================= ALIAS AUTOCOMPLETE SCAMBI =================
-# Questi alias evitano crash se i decorator del comando /scambio
-# usano ancora i vecchi nomi funzione.
-
-
-def parse_scambio_club_value(value):
-    """
-    Campo /scambio club.
-    Valori supportati:
-    - "discord_id"
-    - "discord_id|Club • Manager"
-    """
-    raw = str(value or "").strip()
-    if "|" in raw:
-        return raw.split("|", 1)[0].strip()
-    return raw
-
-# ================= SCAMBI AUTOCOMPLETE DEFINITIVO =================
-
-async def occupied_club_autocomplete(interaction: discord.Interaction, current: str):
-    try:
-        current_norm = normalize_text(current)
-
-        conn = connect()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT
-                c.name AS club_name,
-                c.league AS league,
-                c.assigned_to AS owner_id,
-                COALESCE(m.name, m.manager_name, s.discord_name, c.assigned_to) AS manager_name
-            FROM fc26_clubs c
-            LEFT JOIN managers m ON m.discord_id = c.assigned_to
-            LEFT JOIN signup_requests s ON s.discord_id = c.assigned_to AND s.status = 'accepted'
-            WHERE c.assigned_to IS NOT NULL
-              AND c.assigned_to <> ''
-            ORDER BY c.league ASC, c.name ASC
-        """)
-        rows = cur.fetchall()
-        conn.close()
-
-        choices = []
-        for r in rows:
-            club = str(r["club_name"] or "")
-            league = str(r["league"] or "")
-            owner_id = str(r["owner_id"] or "")
-            manager = str(r["manager_name"] or owner_id)
-
-            if owner_id == str(interaction.user.id):
-                continue
-
-            search = normalize_text(f"{club} {league} {manager} {owner_id}")
-            if current_norm and current_norm not in search:
-                continue
-
-            # Discord mostra il VALUE nel campo dopo la scelta.
-            # Quindi mettiamo un valore leggibile ma parsabile:
-            # owner_id|Club • Manager
-            label = f"{club} • {manager}"
-            value = f"{owner_id}|{club} • {manager}"
-            choices.append(app_commands.Choice(name=label[:100], value=value[:100]))
-
-            if len(choices) >= 25:
-                break
-
-        return choices
-    except Exception as e:
-        print(f"[SCAMBIO AUTOCOMPLETE club] Errore: {e}")
-        return []
-
-
-async def requested_player_autocomplete(interaction: discord.Interaction, current: str):
-    try:
-        owner_raw = getattr(interaction.namespace, "club", None)
-        owner_id = parse_scambio_club_value(owner_raw)
-        if not owner_id:
-            return []
-
-        current_norm = normalize_text(current)
-
-        conn = connect()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id, name, team, position, overall
-            FROM players
-            WHERE owner_discord_id = %s
-            ORDER BY overall DESC NULLS LAST, name ASC
-        """, (str(owner_id),))
-        rows = cur.fetchall()
-        conn.close()
-
-        choices = []
-        for r in rows:
-            name = str(r["name"] or "")
-            team = str(r["team"] or "")
-            pos = str(r["position"] or "")
-            ovr = str(r["overall"] or "")
-
-            search = normalize_text(f"{name} {team} {pos} {ovr}")
-            if current_norm and current_norm not in search:
-                continue
-
-            label = f"{name} • {pos} • OVR {ovr} • {team}"
-            choices.append(app_commands.Choice(name=label[:100], value=str(r["id"])))
-
-            if len(choices) >= 25:
-                break
-
-        return choices
-    except Exception as e:
-        print(f"[SCAMBIO AUTOCOMPLETE richiesto] Errore: {e}")
-        return []
-
-
-async def offered_player_autocomplete(interaction: discord.Interaction, current: str):
-    try:
-        current_norm = normalize_text(current)
-
-        conn = connect()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id, name, team, position, overall
-            FROM players
-            WHERE owner_discord_id = %s
-            ORDER BY overall DESC NULLS LAST, name ASC
-        """, (str(interaction.user.id),))
-        rows = cur.fetchall()
-        conn.close()
-
-        choices = []
-        for r in rows:
-            name = str(r["name"] or "")
-            team = str(r["team"] or "")
-            pos = str(r["position"] or "")
-            ovr = str(r["overall"] or "")
-
-            search = normalize_text(f"{name} {team} {pos} {ovr}")
-            if current_norm and current_norm not in search:
-                continue
-
-            label = f"{name} • {pos} • OVR {ovr} • {team}"
-            choices.append(app_commands.Choice(name=label[:100], value=str(r["id"])))
-
-            if len(choices) >= 25:
-                break
-
-        return choices
-    except Exception as e:
-        print(f"[SCAMBIO AUTOCOMPLETE offerto] Errore: {e}")
-        return []
-
-
-# Alias compatibilità
-async def autocomplete_club_occupati(interaction: discord.Interaction, current: str):
-    return await occupied_club_autocomplete(interaction, current)
-
-async def autocomplete_giocatore_richiesto(interaction: discord.Interaction, current: str):
-    return await requested_player_autocomplete(interaction, current)
-
-async def autocomplete_mio_giocatore(interaction: discord.Interaction, current: str):
-    return await offered_player_autocomplete(interaction, current)
-
-async def autocomplete_giocatori_di_manager(interaction: discord.Interaction, current: str, manager_id: str):
-    class NS:
-        pass
-    old_ns = getattr(interaction, "namespace", None)
-    try:
-        interaction.namespace.club = manager_id
-    except Exception:
-        pass
-    return await requested_player_autocomplete(interaction, current)
-
-async def autocomplete_miei_giocatori_o_crediti(interaction: discord.Interaction, current: str):
-    return await offered_player_autocomplete(interaction, current)
-
-# ================================================================
-
-
-def ensure_manager_from_real_team(discord_id):
-    discord_id = str(discord_id)
-    conn = connect()
-    cur = conn.cursor()
-
-    for sql in [
-        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS name TEXT",
-        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS manager_name TEXT",
-        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS club_name TEXT",
-        "ALTER TABLE managers ADD COLUMN IF NOT EXISTS budget INTEGER DEFAULT 500"
-    ]:
-        try:
-            cur.execute(sql)
-        except Exception:
-            pass
-
-    cur.execute("""
-        SELECT
-            COALESCE(s.discord_name, %s) AS display_name,
-            c.name AS club_name,
-            COALESCE(m.budget, 500) AS budget
-        FROM fc26_clubs c
-        LEFT JOIN signup_requests s ON s.discord_id = c.assigned_to
-        LEFT JOIN managers m ON m.discord_id = c.assigned_to
-        WHERE c.assigned_to = %s
-        LIMIT 1
-    """, (discord_id, discord_id))
-    row = cur.fetchone()
-
-    if row:
-        display_name = row["display_name"] or discord_id
-        club_name = row["club_name"]
-        budget = safe_int(row["budget"], 500)
-
-        cur.execute("""
-            INSERT INTO managers (discord_id, name, manager_name, club_name, budget)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (discord_id) DO UPDATE SET
-                name = COALESCE(managers.name, EXCLUDED.name),
-                manager_name = COALESCE(managers.manager_name, EXCLUDED.manager_name),
-                club_name = COALESCE(managers.club_name, EXCLUDED.club_name),
-                budget = COALESCE(managers.budget, EXCLUDED.budget)
-        """, (discord_id, display_name, display_name, club_name, budget))
-        conn.commit()
-        conn.close()
-        return True
-
-    conn.close()
-    return False
-
-@tree.command(name="scambio", description="Proponi uno scambio a un club occupato")
-@app_commands.describe(
-    club="Club occupato a cui proporre lo scambio",
-    giocatore_richiesto="Giocatore che vuoi dal club scelto",
-    mio_giocatore="Tuo giocatore da offrire, opzionale",
-    crediti="Crediti che vuoi offrire, opzionale"
-)
-@app_commands.autocomplete(
-    club=occupied_club_autocomplete,
-    giocatore_richiesto=requested_player_autocomplete,
-    mio_giocatore=offered_player_autocomplete
-)
-async def scambio(
-    interaction: discord.Interaction,
-    club: str,
-    giocatore_richiesto: str,
-    mio_giocatore: str = None,
-    crediti: int = 0
-):
-    target_manager_id = parse_scambio_club_value(club)
-
-
-    try:
-        ensure_manager_from_real_team(interaction.user.id)
-        ensure_manager_from_real_team(target_manager_id)
-    except Exception as e:
-        print(f"[SCAMBIO] Errore ensure manager real team: {e}")
-
-
-    if not is_market_open():
-        await interaction.response.send_message(
-            "🔒 Il mercato è chiuso. Non puoi proporre scambi in questo momento.",
-            ephemeral=True
-        )
-        return
-
-    if str(interaction.channel_id) != str(SCAMBI_CHANNEL_ID):
-        await interaction.response.send_message(
-            f"❌ Puoi proporre scambi solo nel canale <#{SCAMBI_CHANNEL_ID}>.",
-            ephemeral=True
-        )
-        return
-
-    target_owner_id = get_club_owner_id(club)
-
-    if not target_owner_id:
-        await interaction.response.send_message(
-            "❌ Questo club non risulta assegnato a nessun manager.",
-            ephemeral=True
-        )
-        return
-
-    if str(target_owner_id) == str(interaction.user.id):
-        await interaction.response.send_message(
-            "❌ Non puoi proporre uno scambio alla tua stessa squadra.",
-            ephemeral=True
-        )
-        return
-
-    requested_player = get_player_by_name_from_owner(target_owner_id, giocatore_richiesto)
-    if not requested_player:
-        await interaction.response.send_message(
-            "❌ Il giocatore richiesto non risulta nella rosa del club selezionato.",
-            ephemeral=True
-        )
-        return
-
-    offered_player = None
-    if mio_giocatore:
-        offered_player = get_player_by_name_from_owner(str(interaction.user.id), mio_giocatore)
-        if not offered_player:
-            await interaction.response.send_message(
-                "❌ Il giocatore che vuoi offrire non risulta nella tua rosa.",
-                ephemeral=True
-            )
-            return
-
-    crediti = safe_int(crediti, 0)
-    if crediti < 0:
-        await interaction.response.send_message("❌ I crediti non possono essere negativi.", ephemeral=True)
-        return
-
-    if not offered_player and crediti <= 0:
-        await interaction.response.send_message(
-            "❌ Devi offrire almeno un tuo giocatore oppure dei crediti.",
-            ephemeral=True
-        )
-        return
-
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (str(interaction.user.id),))
-    proposer_manager = cur.fetchone()
-
-    if crediti > 0 and (not proposer_manager or safe_int(proposer_manager["budget"]) < crediti):
-        conn.close()
-        await interaction.response.send_message(
-            "❌ Budget insufficiente per proporre questi crediti.",
-            ephemeral=True
-        )
-        return
-
-    target_member = await get_member_safe(interaction.guild, target_owner_id)
-    target_name = target_member.display_name if target_member else f"Manager {target_owner_id}"
-
-    try:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS player_trade_offers (
-                id SERIAL PRIMARY KEY,
-                proposer_id TEXT NOT NULL,
-                proposer_name TEXT,
-                target_id TEXT NOT NULL,
-                target_name TEXT,
-                player_id TEXT NOT NULL,
-                player_name TEXT,
-                offered_player_id TEXT,
-                offered_player_name TEXT,
-                amount INTEGER DEFAULT 0,
-                counter_amount INTEGER,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP
-            )
-        """)
-
-        # Migrazioni per chi aveva vecchia tabella
-        for col_def in [
-            "offered_player_id TEXT",
-            "offered_player_name TEXT"
-        ]:
-            try:
-                cur.execute(f"ALTER TABLE player_trade_offers ADD COLUMN IF NOT EXISTS {col_def}")
-            except Exception:
-                pass
-
-        cur.execute("""
-            INSERT INTO player_trade_offers
-            (proposer_id, proposer_name, target_id, target_name, player_id, player_name,
-             offered_player_id, offered_player_name, amount, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')
-        """, (
-            str(interaction.user.id),
-            interaction.user.display_name,
-            str(target_owner_id),
-            target_name,
-            str(requested_player["id"]),
-            requested_player["name"],
-            str(offered_player["id"]) if offered_player else None,
-            offered_player["name"] if offered_player else None,
-            crediti
-        ))
-
-        offer_id = cur.lastrowid
-        conn.commit()
-
-    except Exception as e:
-        conn.close()
-        await interaction.response.send_message(f"❌ Errore creazione offerta: `{e}`", ephemeral=True)
-        return
-
-    conn.close()
-
-    embed = discord.Embed(
-        title="📨 Nuova proposta di scambio",
-        description=f"Offerta ID: **{offer_id}**",
-        color=discord.Color.orange()
-    )
-    embed.add_field(name="Da", value=interaction.user.mention, inline=True)
-    embed.add_field(name="A club", value=f"**{club}**", inline=True)
-    embed.add_field(name="Manager destinatario", value=f"<@{target_owner_id}>", inline=True)
-    embed.add_field(
-        name="Giocatore richiesto",
-        value=f"**{requested_player['name']}** — {requested_player['position']} — OVR {requested_player['overall']}",
-        inline=False
-    )
-
-    offered_parts = []
-    if offered_player:
-        offered_parts.append(f"**{offered_player['name']}** — {offered_player['position']} — OVR {offered_player['overall']}")
-    if crediti > 0:
-        offered_parts.append(f"**{crediti} crediti**")
-
-    embed.add_field(name="Offerta", value="\n".join(offered_parts), inline=False)
-    embed.set_footer(text="Il manager destinatario può accettare, rifiutare o fare controfferta.")
-
-    view = TradeOfferResponseView(offer_id)
-
-    await interaction.response.send_message(embed=embed, view=view)
-
-    try:
-        if target_member:
-            await target_member.send(embed=embed)
-    except Exception:
-        pass
-
-    try:
-        await send_staff_log(
-            interaction.guild,
-            "🤝 Nuova proposta di scambio",
-            (
-                f"Offerta ID: **{offer_id}**\n"
-                f"Da: {interaction.user.mention}\n"
-                f"A: <@{target_owner_id}> / Club: **{club}**\n"
-                f"Richiesto: **{requested_player['name']}**\n"
-                f"Offerta: {', '.join(offered_parts)}"
-            ),
-            user=interaction.user,
-            color=discord.Color.orange()
-        )
-    except Exception:
-        pass
-
-
-class CounterOfferModal(discord.ui.Modal, title="Controfferta"):
-    credits = discord.ui.TextInput(
-        label="Crediti richiesti/inclusi",
-        placeholder="Esempio: 50",
-        required=False,
-        max_length=6
-    )
-
-    note = discord.ui.TextInput(
-        label="Messaggio controfferta",
-        placeholder="Scrivi la tua controproposta",
-        required=False,
-        style=discord.TextStyle.paragraph,
-        max_length=500
-    )
-
-    def __init__(self, offer_id):
-        super().__init__()
-        self.offer_id = int(offer_id)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        amount = safe_int(str(self.credits.value).strip() or 0, 0)
-
-        conn = connect()
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE player_trade_offers
-            SET status = 'countered', counter_amount = %s, updated_at = CURRENT_TIMESTAMP
-            WHERE id = %s
-        """, (amount, self.offer_id))
-        conn.commit()
-
-        cur.execute("SELECT * FROM player_trade_offers WHERE id = %s", (self.offer_id,))
-        offer = cur.fetchone()
-        conn.close()
-
-        proposer_id = offer["proposer_id"] if offer else None
-
-        embed = discord.Embed(
-            title="🔁 Controfferta inviata",
-            description=f"Offerta ID: **{self.offer_id}**",
-            color=discord.Color.blue()
-        )
-        embed.add_field(name="Crediti controfferta", value=f"{amount} crediti", inline=True)
-        if str(self.note.value).strip():
-            embed.add_field(name="Messaggio", value=str(self.note.value).strip(), inline=False)
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-        try:
-            if proposer_id:
-                user = await bot.fetch_user(int(proposer_id))
-                await user.send(embed=embed)
-        except Exception:
-            pass
-
-
-class TradeOfferResponseView(discord.ui.View):
-    def __init__(self, offer_id):
-        super().__init__(timeout=None)
-        self.offer_id = int(offer_id)
-
-    async def _get_offer(self):
-        conn = connect()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM player_trade_offers WHERE id = %s", (self.offer_id,))
-        offer = cur.fetchone()
-        conn.close()
-        return offer
-
-    @discord.ui.button(label="Accetta", style=discord.ButtonStyle.success, custom_id="trade_accept_btn")
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        offer = await self._get_offer()
-        if not offer:
-            await interaction.response.send_message("Offerta non trovata.", ephemeral=True)
-            return
-
-        if str(interaction.user.id) != str(offer["target_id"]):
-            await interaction.response.send_message("❌ Solo il destinatario può accettare questa offerta.", ephemeral=True)
-            return
-
-        if offer["status"] != "pending":
-            await interaction.response.send_message("Questa offerta non è più pending.", ephemeral=True)
-            return
-
-        conn = connect()
-        cur = conn.cursor()
-
-        proposer_id = str(offer["proposer_id"])
-        target_id = str(offer["target_id"])
-        requested_player_id = str(offer["player_id"])
-        offered_player_id = offer["offered_player_id"]
-        amount = safe_int(offer["amount"])
-
-        # Controlli proprietà attuali
-        cur.execute("SELECT owner_discord_id FROM players WHERE id = CAST(%s AS BIGINT)", (requested_player_id,))
-        req = cur.fetchone()
-        if not req or str(req["owner_discord_id"]) != target_id:
-            conn.close()
-            await interaction.response.send_message("❌ Il giocatore richiesto non appartiene più al destinatario.", ephemeral=True)
-            return
-
-        if offered_player_id:
-            cur.execute("SELECT owner_discord_id FROM players WHERE id = CAST(%s AS BIGINT)", (str(offered_player_id),))
-            off = cur.fetchone()
-            if not off or str(off["owner_discord_id"]) != proposer_id:
-                conn.close()
-                await interaction.response.send_message("❌ Il giocatore offerto non appartiene più al proponente.", ephemeral=True)
-                return
-
-        if amount > 0:
-            cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (proposer_id,))
-            proposer = cur.fetchone()
-            if not proposer or safe_int(proposer["budget"]) < amount:
-                conn.close()
-                await interaction.response.send_message("❌ Il proponente non ha più budget sufficiente.", ephemeral=True)
-                return
-
-        # Trasferimento giocatore richiesto al proponente
-        cur.execute("UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = CAST(%s AS BIGINT)", (proposer_id, amount, requested_player_id))
-
-        # Trasferimento eventuale giocatore offerto al destinatario
-        if offered_player_id:
-            cur.execute("UPDATE players SET owner_discord_id = %s, sold_price = %s WHERE id = CAST(%s AS BIGINT)", (target_id, 0, str(offered_player_id)))
-
-        # Crediti dal proponente al destinatario
-        if amount > 0:
-            cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (amount, proposer_id))
-            cur.execute("UPDATE managers SET budget = budget + %s WHERE discord_id = %s", (amount, target_id))
-
-        cur.execute("UPDATE player_trade_offers SET status = 'accepted', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (self.offer_id,))
-        conn.commit()
-        conn.close()
-
-        embed = discord.Embed(
-            title="✅ Scambio accettato",
-            description=f"Offerta ID: **{self.offer_id}** completata.",
-            color=discord.Color.green()
-        )
-        await interaction.response.edit_message(embed=embed, view=None)
-
-    @discord.ui.button(label="Rifiuta", style=discord.ButtonStyle.danger, custom_id="trade_reject_btn")
-    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
-        offer = await self._get_offer()
-        if not offer:
-            await interaction.response.send_message("Offerta non trovata.", ephemeral=True)
-            return
-
-        if str(interaction.user.id) != str(offer["target_id"]):
-            await interaction.response.send_message("❌ Solo il destinatario può rifiutare questa offerta.", ephemeral=True)
-            return
-
-        conn = connect()
-        cur = conn.cursor()
-        cur.execute("UPDATE player_trade_offers SET status = 'rejected', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (self.offer_id,))
-        conn.commit()
-        conn.close()
-
-        embed = discord.Embed(
-            title="❌ Scambio rifiutato",
-            description=f"Offerta ID: **{self.offer_id}** rifiutata.",
-            color=discord.Color.red()
-        )
-        await interaction.response.edit_message(embed=embed, view=None)
-
-    @discord.ui.button(label="Controfferta", style=discord.ButtonStyle.secondary, custom_id="trade_counter_btn")
-    async def counter(self, interaction: discord.Interaction, button: discord.ui.Button):
-        offer = await self._get_offer()
-        if not offer:
-            await interaction.response.send_message("Offerta non trovata.", ephemeral=True)
-            return
-
-        if str(interaction.user.id) != str(offer["target_id"]):
-            await interaction.response.send_message("❌ Solo il destinatario può fare una controfferta.", ephemeral=True)
-            return
-
-        await interaction.response.send_modal(CounterOfferModal(self.offer_id))
-
-# =========================================================================
-
-
-# ================= RICERCA GIOCATORI: NOME O CLUB =================
-
-# ================= AUTOCOMPLETE RICERCA =================
-# Nota Discord: autocomplete e select menu possono mostrare massimo 25 opzioni per volta.
-# Per evitare liste incomplete di club, la ricerca club ora è a 2 step:
-# 1) scegli/filtra il campionato;
-# 2) il bot mostra il menu dei club di quel campionato;
-# 3) scegli il club e vedi la rosa/giocatori.
-
-LEAGUE_PREFIX = "league::"
-
-
-def _row_get(row, key, default=None):
-    try:
-        return row.get(key, default)
-    except Exception:
-        try:
-            return row[key]
-        except Exception:
-            return default
-
-
-def _choice_label(value: str, max_len: int = 100) -> str:
-    value = str(value or "").strip()
-    return value[:max_len] if value else "Senza nome"
-
-
-async def cerca_campionato_autocomplete(interaction: discord.Interaction, current: str):
-    """Mostra i campionati disponibili da Supabase/PostgreSQL."""
-    conn = None
-    try:
-        current_clean = str(current or "").strip().lower()
-        like = f"%{current_clean}%"
-        conn = connect()
-        cur = conn.cursor()
-
-        # Fonte principale: fc26_clubs.league. Fallback: players.league.
-        try:
-            if current_clean:
-                cur.execute("""
-                    SELECT DISTINCT COALESCE(league, 'Senza campionato') AS league
-                    FROM fc26_clubs
-                    WHERE league IS NOT NULL AND league <> '' AND LOWER(league) LIKE %s
-                    ORDER BY league ASC
-                    LIMIT 25
-                """, (like,))
-            else:
-                cur.execute("""
-                    SELECT DISTINCT COALESCE(league, 'Senza campionato') AS league
-                    FROM fc26_clubs
-                    WHERE league IS NOT NULL AND league <> ''
-                    ORDER BY league ASC
-                    LIMIT 25
-                """)
-            rows = cur.fetchall()
-        except Exception:
-            rows = []
-
-        if not rows:
-            if current_clean:
-                cur.execute("""
-                    SELECT DISTINCT COALESCE(league, 'Gioco') AS league
-                    FROM players
-                    WHERE league IS NOT NULL AND league <> '' AND LOWER(league) LIKE %s
-                    ORDER BY league ASC
-                    LIMIT 25
-                """, (like,))
-            else:
-                cur.execute("""
-                    SELECT DISTINCT COALESCE(league, 'Gioco') AS league
-                    FROM players
-                    WHERE league IS NOT NULL AND league <> ''
-                    ORDER BY league ASC
-                    LIMIT 25
-                """)
-            rows = cur.fetchall()
-
-        choices = []
-        seen = set()
-        for r in rows[:25]:
-            league = str(_row_get(r, "league", "") or "").strip()
-            if not league or league.lower() in seen:
-                continue
-            seen.add(league.lower())
-            choices.append(app_commands.Choice(name=_choice_label(league), value=league[:100]))
-        return choices
-    except Exception as e:
-        print(f"[AUTOCOMPLETE CAMPIONATO] Errore: {type(e).__name__}: {e}")
-        return []
-    finally:
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
-
-
-async def cerca_club_autocomplete(interaction: discord.Interaction, current: str):
-    """Mostra club filtrati dal campionato scelto nel comando /cerca_club."""
-    conn = None
-    try:
-        league = str(getattr(interaction.namespace, "campionato", "") or "").strip()
-        current_clean = str(current or "").strip().lower()
-        like = f"%{current_clean}%"
-
-        if not league:
-            # Discord mostra max 25 scelte: prima va selezionato il campionato.
-            return [app_commands.Choice(name="Seleziona prima il campionato", value="")]
-
-        conn = connect()
-        cur = conn.cursor()
-
-        try:
-            if current_clean:
-                cur.execute("""
-                    SELECT name, assigned_to
-                    FROM fc26_clubs
-                    WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
-                      AND LOWER(name) LIKE %s
-                    ORDER BY name ASC
-                    LIMIT 25
-                """, (league, like))
-            else:
-                cur.execute("""
-                    SELECT name, assigned_to
-                    FROM fc26_clubs
-                    WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
-                    ORDER BY name ASC
-                    LIMIT 25
-                """, (league,))
-            rows = cur.fetchall()
-        except Exception:
-            rows = []
-
-        if not rows:
-            if current_clean:
-                cur.execute("""
-                    SELECT DISTINCT team AS name, NULL AS assigned_to
-                    FROM players
-                    WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
-                      AND team IS NOT NULL AND team <> ''
-                      AND LOWER(team) LIKE %s
-                    ORDER BY team ASC
-                    LIMIT 25
-                """, (league, like))
-            else:
-                cur.execute("""
-                    SELECT DISTINCT team AS name, NULL AS assigned_to
-                    FROM players
-                    WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
-                      AND team IS NOT NULL AND team <> ''
-                    ORDER BY team ASC
-                    LIMIT 25
-                """, (league,))
-            rows = cur.fetchall()
-
-        choices = []
-        seen = set()
-        for r in rows[:25]:
-            name = str(_row_get(r, "name", "") or "").strip()
-            if not name or name.lower() in seen:
-                continue
-            seen.add(name.lower())
-            status = "assegnato" if _row_get(r, "assigned_to") else "libero"
-            choices.append(app_commands.Choice(name=_choice_label(f"{name} • {status}"), value=name[:100]))
-        return choices
-    except Exception as e:
-        print(f"[AUTOCOMPLETE CLUB] Errore: {type(e).__name__}: {e}")
-        return []
-    finally:
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
-
-
-async def cerca_testo_autocomplete(interaction: discord.Interaction, current: str):
-    """
-    Autocomplete per /cerca e /cerc.
-
-    - Nome giocatore: mostra giocatori.
-    - Nome club: mostra prima i campionati. Dopo aver scelto il campionato,
-      il comando apre un menu con i club di quel campionato.
-    """
-    conn = None
-    try:
-        tipo = getattr(interaction.namespace, "tipo", None)
-        tipo_value = getattr(tipo, "value", tipo) or "player"
-        current_clean = str(current or "").strip()
-        like = f"%{current_clean.lower()}%"
-
-        conn = connect()
-        cur = conn.cursor()
-
-        # ================= CLUB: STEP 1, SOLO CAMPIONATI =================
-        if str(tipo_value) == "club":
-            # IMPORTANTE: Discord consente massimo 25 scelte in autocomplete.
-            # Per non mostrare solo i primi 25 club, qui mostriamo SEMPRE e SOLO i campionati.
-            # Dopo aver selezionato un campionato, il comando apre un menu paginato con i club.
-            if current_clean.startswith(LEAGUE_PREFIX):
-                current_clean = current_clean[len(LEAGUE_PREFIX):].strip()
-                like = f"%{current_clean.lower()}%"
-
-            # Mostra campionati, non club, così non perdi club oltre i primi 25.
-            if current_clean:
-                cur.execute("""
-                    SELECT DISTINCT COALESCE(league, 'Senza campionato') AS league
-                    FROM fc26_clubs
-                    WHERE league IS NOT NULL AND league <> '' AND LOWER(league) LIKE %s
-                    ORDER BY league ASC
-                    LIMIT 25
-                """, (like,))
-            else:
-                cur.execute("""
-                    SELECT DISTINCT COALESCE(league, 'Senza campionato') AS league
-                    FROM fc26_clubs
-                    WHERE league IS NOT NULL AND league <> ''
-                    ORDER BY league ASC
-                    LIMIT 25
-                """)
-            rows = cur.fetchall()
-
-            if not rows:
-                if current_clean:
-                    cur.execute("""
-                        SELECT DISTINCT COALESCE(league, 'Gioco') AS league
-                        FROM players
-                        WHERE league IS NOT NULL AND league <> '' AND LOWER(league) LIKE %s
-                        ORDER BY league ASC
-                        LIMIT 25
-                    """, (like,))
-                else:
-                    cur.execute("""
-                        SELECT DISTINCT COALESCE(league, 'Gioco') AS league
-                        FROM players
-                        WHERE league IS NOT NULL AND league <> ''
-                        ORDER BY league ASC
-                        LIMIT 25
-                    """)
-                rows = cur.fetchall()
-
-            choices = []
-            seen = set()
-            for r in rows[:25]:
-                league = str(_row_get(r, "league", "") or "").strip()
-                if not league or league.lower() in seen:
-                    continue
-                seen.add(league.lower())
-                choices.append(app_commands.Choice(
-                    name=_choice_label(f"📁 {league}"),
-                    value=f"{LEAGUE_PREFIX}{league}"[:100]
-                ))
-            return choices
-
-        # ================= GIOCATORI =================
-        # Mostra giocatori da Supabase. Se non scrivi nulla, mostra i migliori per overall.
-        if current_clean:
-            cur.execute("""
-                SELECT
-                    p.id,
-                    p.name,
-                    p.position,
-                    p.overall,
-                    p.team,
-                    p.owner_discord_id,
-                    COALESCE(m.club_name, p.team) AS current_club
-                FROM players p
-                LEFT JOIN managers m ON m.discord_id = p.owner_discord_id
-                WHERE LOWER(p.name) LIKE %s
-                   OR LOWER(p.team) LIKE %s
-                   OR LOWER(COALESCE(m.club_name, '')) LIKE %s
-                ORDER BY p.overall DESC NULLS LAST, p.name ASC
-                LIMIT 25
-            """, (like, like, like))
-        else:
-            cur.execute("""
-                SELECT
-                    p.id,
-                    p.name,
-                    p.position,
-                    p.overall,
-                    p.team,
-                    p.owner_discord_id,
-                    COALESCE(m.club_name, p.team) AS current_club
-                FROM players p
-                LEFT JOIN managers m ON m.discord_id = p.owner_discord_id
-                ORDER BY p.overall DESC NULLS LAST, p.name ASC
-                LIMIT 25
-            """)
-
-        rows = cur.fetchall()
-
-        choices = []
-        for p in rows[:25]:
-            stato = "venduto" if _row_get(p, "owner_discord_id") else "libero"
-            label = f"{_row_get(p, 'name')} • OVR {_row_get(p, 'overall')} • {_row_get(p, 'position')} • {_row_get(p, 'current_club')} • {stato}"
-            choices.append(app_commands.Choice(name=_choice_label(label), value=str(_row_get(p, "id"))[:100]))
-        return choices
-
-    except Exception as e:
-        print(f"[AUTOCOMPLETE CERCA] Errore: {type(e).__name__}: {e}")
-        return []
-    finally:
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
-
-
-def _get_clubs_for_league(league_name: str):
-    conn = connect()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT name, assigned_to
-            FROM fc26_clubs
-            WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
-            ORDER BY name ASC
-        """, (str(league_name),))
-        rows = cur.fetchall()
-    except Exception:
-        rows = []
-
-    if not rows:
-        cur.execute("""
-            SELECT DISTINCT team AS name, NULL AS assigned_to
-            FROM players
-            WHERE LOWER(COALESCE(league, '')) = LOWER(%s)
-              AND team IS NOT NULL AND team <> ''
-            ORDER BY team ASC
-        """, (str(league_name),))
-        rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def _build_club_players_embed(club_name: str):
-    query = normalize_text(club_name).strip()
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT p.*, COALESCE(m.club_name, p.team) AS current_club
-        FROM players p
-        LEFT JOIN managers m ON m.discord_id = p.owner_discord_id
-        ORDER BY p.overall DESC NULLS LAST
-    """)
-    all_players = cur.fetchall()
-    conn.close()
-
-    matched = [
-        p for p in all_players
-        if query in normalize_text(_row_get(p, "current_club", _row_get(p, "team", "")) or _row_get(p, "team", ""))
-    ]
-
-    if not matched:
-        return None, 0
-
-    embed = discord.Embed(
-        title="Risultati ricerca club",
-        description=f"Club cercato: **{club_name}**\nGiocatori trovati: **{len(matched)}**",
-        color=discord.Color.green()
-    )
-
-    for p in matched[:25]:
-        owner = _row_get(p, "owner_discord_id")
-        status = f"Assegnato a <@{owner}>" if owner else "Libero"
-        embed.add_field(
-            name=f"{_row_get(p, 'name')} — OVR {_row_get(p, 'overall')}",
-            value=(
-                f"Club attuale: **{_row_get(p, 'current_club', _row_get(p, 'team'))}**\n"
-                f"Club originale: **{_row_get(p, 'team')}**\n"
-                f"Ruolo: **{_row_get(p, 'position')}**\n"
-                f"Stato: **{status}**\n"
-                f"ID: `{_row_get(p, 'id')}`"
-            ),
-            inline=False
-        )
-
-    if len(matched) > 25:
-        embed.set_footer(text=f"Mostrati 25 giocatori su {len(matched)} trovati.")
-    return embed, len(matched)
-
-
-class ClubSearchSelect(discord.ui.Select):
-    def __init__(self, view_ref, league_name: str, clubs, page: int = 0):
-        self.view_ref = view_ref
-        self.league_name = league_name
-        self.clubs = list(clubs or [])
-        self.page = max(0, int(page or 0))
-
-        start = self.page * 25
-        end = start + 25
-        page_rows = self.clubs[start:end]
-
-        options = []
-        for r in page_rows:
-            name = str(_row_get(r, "name", "") or "").strip()
-            if not name:
-                continue
-            status = "assegnato" if _row_get(r, "assigned_to") else "libero"
-            options.append(discord.SelectOption(
-                label=name[:100],
-                value=name[:100],
-                description=f"{league_name} • {status}"[:100]
-            ))
-
-        if not options:
-            options = [discord.SelectOption(label="Nessun club trovato", value="__none__")]
-
-        total_pages = max(1, (len(self.clubs) + 24) // 25)
-        super().__init__(
-            placeholder=f"Scegli club in {league_name} • pagina {self.page + 1}/{total_pages}",
-            min_values=1,
-            max_values=1,
-            options=options
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        club_name = self.values[0]
-        if club_name == "__none__":
-            await interaction.response.send_message("❌ Nessun club disponibile per questo campionato.", ephemeral=True)
-            return
-
-        embed, count = _build_club_players_embed(club_name)
-        if not embed:
-            await interaction.response.edit_message(
-                content=f"❌ Nessun giocatore trovato per **{club_name}**.",
-                embed=None,
-                view=None
-            )
-            return
-
-        await interaction.response.edit_message(content=None, embed=embed, view=None)
-
-
-class ClubSearchView(discord.ui.View):
-    def __init__(self, league_name: str, clubs, page: int = 0):
-        super().__init__(timeout=180)
-        self.league_name = league_name
-        self.clubs = list(clubs or [])
-        self.page = max(0, int(page or 0))
-        self.total_pages = max(1, (len(self.clubs) + 24) // 25)
-        self._render_items()
-
-    def _render_items(self):
-        self.clear_items()
-        self.add_item(ClubSearchSelect(self, self.league_name, self.clubs, self.page))
-
-        prev_button = discord.ui.Button(
-            label="⬅️ Indietro",
-            style=discord.ButtonStyle.secondary,
-            disabled=self.page <= 0
-        )
-        next_button = discord.ui.Button(
-            label="Avanti ➡️",
-            style=discord.ButtonStyle.primary,
-            disabled=self.page >= self.total_pages - 1
-        )
-
-        async def prev_callback(interaction: discord.Interaction):
-            self.page = max(0, self.page - 1)
-            self._render_items()
-            await interaction.response.edit_message(
-                content=f"Campionato selezionato: **{self.league_name}**\nScegli il club dal menu. Pagina **{self.page + 1}/{self.total_pages}**.",
-                view=self
-            )
-
-        async def next_callback(interaction: discord.Interaction):
-            self.page = min(self.total_pages - 1, self.page + 1)
-            self._render_items()
-            await interaction.response.edit_message(
-                content=f"Campionato selezionato: **{self.league_name}**\nScegli il club dal menu. Pagina **{self.page + 1}/{self.total_pages}**.",
-                view=self
-            )
-
-        prev_button.callback = prev_callback
-        next_button.callback = next_callback
-
-        if self.total_pages > 1:
-            self.add_item(prev_button)
-            self.add_item(next_button)
-
-
-@tree.command(name="cerca", description="Cerca giocatori per nome oppure per club")
-@app_commands.describe(
-    tipo="Scegli se cercare per nome giocatore o per club",
-    testo="Giocatore: scrivi nome. Club: scegli un campionato dal menu, poi scegli il club.",
-)
-@app_commands.choices(tipo=[
-    app_commands.Choice(name="Nome giocatore", value="player"),
-    app_commands.Choice(name="Nome club", value="club"),
-])
-@app_commands.autocomplete(testo=cerca_testo_autocomplete)
-async def cerca(interaction: discord.Interaction, tipo: app_commands.Choice[str], testo: str):
-    if not is_search_channel(interaction):
-        await interaction.response.send_message(
-            f"❌ Puoi usare questo comando solo nel canale <#{SEARCH_CHANNEL_ID}>.",
-            ephemeral=True
-        )
-        return
-
-    if tipo.value == "club" and str(testo).startswith(LEAGUE_PREFIX):
-        await safe_defer(interaction, ephemeral=True, thinking=True)
-        league_name = str(testo)[len(LEAGUE_PREFIX):].strip()
-        clubs = _get_clubs_for_league(league_name)
-        if not clubs:
-            await interaction.followup.send(f"❌ Nessun club trovato per il campionato **{league_name}**.", ephemeral=True)
-            return
-        await interaction.followup.send(
-            content=f"Campionato selezionato: **{league_name}**\nScegli il club dal menu. Pagina **1/{max(1, (len(clubs) + 24) // 25)}**.",
-            view=ClubSearchView(league_name, clubs),
-            ephemeral=True
-        )
-        return
-
-    query = normalize_text(testo).strip()
-
-    if len(query) < 2:
-        await interaction.response.send_message(
-            "❌ Scrivi almeno 2 caratteri per la ricerca.",
-            ephemeral=True
-        )
-        return
-
-    await safe_defer(interaction, ephemeral=True, thinking=True)
-
-    conn = connect()
-    cur = conn.cursor()
-
-    if tipo.value == "player":
-        # Se arriva un valore dal menu a tendina, testo è l'ID del giocatore.
-        # Altrimenti resta valida la ricerca manuale per nome.
-        if str(testo).isdigit():
-            cur.execute("""
-                SELECT p.*, COALESCE(m.club_name, p.team) AS current_club
-                FROM players p
-                LEFT JOIN managers m ON m.discord_id = p.owner_discord_id
-                WHERE p.id = %s
-                LIMIT 1
-            """, (int(testo),))
-        else:
-            cur.execute("""
-                SELECT p.*, COALESCE(m.club_name, p.team) AS current_club
-                FROM players p
-                LEFT JOIN managers m ON m.discord_id = p.owner_discord_id
-                WHERE LOWER(p.name) LIKE %s
-                ORDER BY p.overall DESC NULLS LAST
-                LIMIT 10
-            """, (f"%{testo.lower()}%",))
-        rows = cur.fetchall()
-
-        conn.close()
-
-        if not rows:
-            await interaction.followup.send("❌ Nessun giocatore trovato con quel nome.", ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title="Risultati ricerca giocatore",
-            description=f"Ricerca: **{testo}**",
-            color=discord.Color.blue()
-        )
-
-        for p in rows:
-            owner = _row_get(p, "owner_discord_id")
-            status = f"Assegnato a <@{owner}>" if owner else "Libero"
-            embed.add_field(
-                name=f"{_row_get(p, 'name')} — OVR {_row_get(p, 'overall')}",
-                value=(
-                    f"Club attuale: **{_row_get(p, 'current_club', _row_get(p, 'team'))}**\n"
-                    f"Club originale: **{_row_get(p, 'team')}**\n"
-                    f"Ruolo: **{_row_get(p, 'position')}**\n"
-                    f"Stato: **{status}**\n"
-                    f"ID: `{_row_get(p, 'id')}`"
-                ),
-                inline=False
-            )
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        return
-
-    # Ricerca diretta per club manuale.
-    conn.close()
-    embed, count = _build_club_players_embed(testo)
-    if not embed:
-        await interaction.followup.send(
-            "❌ Nessun giocatore trovato per questo club. Scegli prima un campionato dal menu oppure prova con un nome club diverso.",
-            ephemeral=True
-        )
-        return
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-@tree.command(name="cerca_club", description="Cerca club in due step: campionato e club")
-@app_commands.describe(
-    campionato="Scegli il campionato",
-    club="Scegli il club del campionato selezionato"
-)
-@app_commands.autocomplete(campionato=cerca_campionato_autocomplete, club=cerca_club_autocomplete)
-async def cerca_club(interaction: discord.Interaction, campionato: str, club: str):
-    if not is_search_channel(interaction):
-        await interaction.response.send_message(
-            f"❌ Puoi usare questo comando solo nel canale <#{SEARCH_CHANNEL_ID}>.",
-            ephemeral=True
-        )
-        return
-
-    if not club:
-        await interaction.response.send_message("❌ Seleziona prima il campionato e poi il club.", ephemeral=True)
-        return
-
-    await safe_defer(interaction, ephemeral=True, thinking=True)
-    embed, count = _build_club_players_embed(club)
-    if not embed:
-        await interaction.followup.send(f"❌ Nessun giocatore trovato per **{club}**.", ephemeral=True)
-        return
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-@tree.command(name="cerc", description="Alias rapido: cerca giocatori per nome oppure club")
-@app_commands.describe(
-    tipo="Scegli se cercare per nome giocatore o per club",
-    testo="Giocatore: scrivi nome. Club: scegli un campionato dal menu, poi scegli il club."
-)
-@app_commands.choices(tipo=[
-    app_commands.Choice(name="Nome giocatore", value="player"),
-    app_commands.Choice(name="Nome club", value="club"),
-])
-@app_commands.autocomplete(testo=cerca_testo_autocomplete)
-async def cerc(interaction: discord.Interaction, tipo: app_commands.Choice[str], testo: str):
-    await cerca.callback(interaction, tipo, testo)
-
-# ===========================================================
-
-
-# ================= AGGIORNA BUDGET SQUADRE REALI =================
-
-@tree.command(name="aggiorna_budget_reali", description="Staff: ricalcola il budget dei club già iscritti in modalità reale")
-async def aggiorna_budget_reali(interaction: discord.Interaction):
-    if not can_use_normal_staff(interaction.user):
-        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
-        return
-
-    await safe_defer(interaction, ephemeral=True, thinking=True)
-
-    conn = connect()
-    cur = conn.cursor()
-
-    try:
-        cur.execute("""
-            SELECT c.name AS club_name, c.assigned_to, COALESCE(COALESCE(m.name, m.manager_name, m.discord_id) AS name, m.manager_name, m.discord_id) AS manager_name
-            FROM fc26_clubs c
-            LEFT JOIN managers m ON m.discord_id = c.assigned_to
-            WHERE c.assigned_to IS NOT NULL
-            ORDER BY c.name ASC
-        """)
-        assigned = cur.fetchall()
-    except Exception as e:
-        conn.close()
-        await interaction.followup.send(f"❌ Errore lettura club assegnati: `{e}`", ephemeral=True)
-        return
-
-    updated = []
-    skipped = []
-
-    for row in assigned:
-        club_name = row["club_name"]
-        discord_id = row["assigned_to"]
-
-        players, avg_ovr, new_budget = get_team_stats_reale(club_name, include_owned_by=str(discord_id))
-
-        if not players:
-            skipped.append(club_name)
-            continue
-
-        cur.execute("""
-            UPDATE managers
-            SET budget = %s
-            WHERE discord_id = %s
-        """, (new_budget, str(discord_id)))
-
-        try:
-            cur.execute("""
-                INSERT INTO real_team_assignments (discord_id, manager_name, team_name, avg_overall, assigned_budget) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (discord_id) DO UPDATE SET manager_name = EXCLUDED.manager_name, team_name = EXCLUDED.team_name, avg_overall = EXCLUDED.avg_overall, assigned_budget = EXCLUDED.assigned_budget
-            """, (
-                str(discord_id),
-                row["manager_name"] or str(discord_id),
-                players[0]["team"],
-                avg_ovr,
-                new_budget
-            ))
-        except Exception:
-            pass
-
-        updated.append((club_name, discord_id, avg_ovr, new_budget))
-
-    conn.commit()
-    conn.close()
-
-    embed = discord.Embed(
-        title="✅ Budget squadre reali aggiornati",
-        description=f"Aggiornati **{len(updated)}** club assegnati.",
-        color=discord.Color.green()
-    )
-
-    if updated:
-        lines = []
-        for club_name, discord_id, avg_ovr, budget in updated[:20]:
-            lines.append(f"• **{club_name}** — <@{discord_id}> — OVR {avg_ovr:.1f} → **{budget} crediti**")
-        embed.add_field(name="Aggiornati", value="\n".join(lines), inline=False)
-
-    if skipped:
-        embed.add_field(
-            name="Saltati",
-            value="\n".join(f"• {club}" for club in skipped[:15]),
-            inline=False
-        )
-        embed.set_footer(text="I club saltati non hanno rosa trovata nel database. Usa /diagnostica_squadra.")
-
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-    try:
-        await send_staff_log(
-            interaction.guild,
-            "💰 Budget squadre reali aggiornati",
-            f"Aggiornati **{len(updated)}** club. Saltati **{len(skipped)}** club.",
-            user=interaction.user,
-            color=discord.Color.green()
-        )
-    except Exception:
-        pass
-
-# ===============================================================
-
-
-# ===========================================================
-# BORDO CAMPO - WEBSITE/DISCORD SIGNUP SYNC PATCH v4
-# ===========================================================
-
-def ensure_website_signup_sync_tables():
-    """
-    Crea/aggiorna le tabelle usate dalla sincronizzazione sito <-> Discord.
-    Fix importante per PostgreSQL/Supabase:
-    se una ALTER TABLE fallisce, la transazione diventa "aborted".
-    Per questo ogni comando usa SAVEPOINT + ROLLBACK TO SAVEPOINT.
-    """
-    conn = connect()
-    cur = conn.cursor()
-
-    def run_migration(sql, label=None):
-        sp_name = "sp_migration"
-        try:
-            cur.execute(f"SAVEPOINT {sp_name}")
-            cur.execute(sql)
-            cur.execute(f"RELEASE SAVEPOINT {sp_name}")
-            return True
-        except Exception as e:
-            try:
-                cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
-                cur.execute(f"RELEASE SAVEPOINT {sp_name}")
-            except Exception:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            print(f"[WEBSITE SYNC] Migrazione ignorata{f' ({label})' if label else ''}: {e}")
-            return False
-
-    try:
-        # Tabelle base se non esistono ancora.
-        run_migration("""
-            CREATE TABLE IF NOT EXISTS signup_requests (
-                id SERIAL PRIMARY KEY,
-                discord_id TEXT,
-                discord_name TEXT,
-                real_name TEXT,
-                age TEXT,
-                platform TEXT,
-                game_id TEXT,
-                club_preferences TEXT,
-                status TEXT DEFAULT 'pending',
-                club_name TEXT,
-                handled_by TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                handled_at TIMESTAMP
-            )
-        """, "create signup_requests")
-
-        run_migration("""
-            CREATE TABLE IF NOT EXISTS fc26_clubs (
-                name TEXT PRIMARY KEY,
-                league TEXT,
-                assigned_to TEXT,
-                assigned_at TIMESTAMP,
-                previous_owner_id TEXT,
-                previous_owner_name TEXT
-            )
-        """, "create fc26_clubs")
-
-        run_migration("""
-            CREATE TABLE IF NOT EXISTS managers (
-                id SERIAL PRIMARY KEY,
-                discord_id TEXT,
-                name TEXT,
-                manager_name TEXT,
-                club_name TEXT,
-                budget INTEGER DEFAULT 500
-            )
-        """, "create managers")
-
-        # Colonne necessarie. Ogni ALTER è isolata: se fallisce non sporca la transazione.
-        migrations = [
-            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_message_id TEXT", "signup_requests.staff_message_id"),
-            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS staff_channel_id TEXT", "signup_requests.staff_channel_id"),
-            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS signup_source TEXT DEFAULT 'discord'", "signup_requests.signup_source"),
-            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'discord'", "signup_requests.source"),
-            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS ea_id TEXT", "signup_requests.ea_id"),
-            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS preferred_clubs TEXT", "signup_requests.preferred_clubs"),
-            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_preferences TEXT", "signup_requests.club_preferences"),
-            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_by TEXT", "signup_requests.handled_by"),
-            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS handled_at TIMESTAMP", "signup_requests.handled_at"),
-            ("ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS club_name TEXT", "signup_requests.club_name"),
-            ("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS league TEXT", "fc26_clubs.league"),
-            ("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_to TEXT", "fc26_clubs.assigned_to"),
-            ("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP", "fc26_clubs.assigned_at"),
-            ("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_id TEXT", "fc26_clubs.previous_owner_id"),
-            ("ALTER TABLE fc26_clubs ADD COLUMN IF NOT EXISTS previous_owner_name TEXT", "fc26_clubs.previous_owner_name"),
-            ("ALTER TABLE managers ADD COLUMN IF NOT EXISTS discord_id TEXT", "managers.discord_id"),
-            ("ALTER TABLE managers ADD COLUMN IF NOT EXISTS name TEXT", "managers.name"),
-            ("ALTER TABLE managers ADD COLUMN IF NOT EXISTS manager_name TEXT", "managers.manager_name"),
-            ("ALTER TABLE managers ADD COLUMN IF NOT EXISTS club_name TEXT", "managers.club_name"),
-            ("ALTER TABLE managers ADD COLUMN IF NOT EXISTS budget INTEGER DEFAULT 500", "managers.budget"),
-            ("ALTER TABLE players ADD COLUMN IF NOT EXISTS owner_discord_id TEXT", "players.owner_discord_id"),
-            ("ALTER TABLE players ADD COLUMN IF NOT EXISTS sold_price INTEGER", "players.sold_price"),
-        ]
-        for sql, label in migrations:
-            run_migration(sql, label)
-
-        run_migration("""
-            CREATE TABLE IF NOT EXISTS signup_staff_actions (
-              id SERIAL PRIMARY KEY,
-              request_id BIGINT NOT NULL,
-              action TEXT NOT NULL,
-              club_name TEXT,
-              handled_by TEXT,
-              handled_by_name TEXT,
-              source TEXT DEFAULT 'website',
-              processed BOOLEAN DEFAULT false,
-              processed_at TIMESTAMP,
-              error TEXT,
-              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """, "create signup_staff_actions")
-
-        # Colonne extra anche se la tabella esisteva già con schema incompleto.
-        action_migrations = [
-            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS request_id BIGINT", "signup_staff_actions.request_id"),
-            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS action TEXT", "signup_staff_actions.action"),
-            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS club_name TEXT", "signup_staff_actions.club_name"),
-            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS handled_by TEXT", "signup_staff_actions.handled_by"),
-            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS handled_by_name TEXT", "signup_staff_actions.handled_by_name"),
-            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'website'", "signup_staff_actions.source"),
-            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS processed BOOLEAN DEFAULT false", "signup_staff_actions.processed"),
-            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS processed_at TIMESTAMP", "signup_staff_actions.processed_at"),
-            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS error TEXT", "signup_staff_actions.error"),
-            ("ALTER TABLE signup_staff_actions ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP", "signup_staff_actions.created_at"),
-        ]
-        for sql, label in action_migrations:
-            run_migration(sql, label)
-
-        run_migration("CREATE INDEX IF NOT EXISTS idx_signup_staff_actions_processed ON signup_staff_actions(processed)", "index signup_staff_actions.processed")
-        run_migration("CREATE INDEX IF NOT EXISTS idx_signup_requests_status ON signup_requests(status)", "index signup_requests.status")
-
-        conn.commit()
-
-    except Exception as e:
-        conn.rollback()
-        print(f"[WEBSITE SYNC] Errore migrazione tabelle: {e}")
-    finally:
-        conn.close()
-
-
-async def register_pending_signup_views():
-    try:
-        conn = connect()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id
-            FROM signup_requests
-            WHERE status IN ('pending', 'choosing_club')
-            ORDER BY id DESC
-            LIMIT 100
-        """)
-        rows = cur.fetchall()
-        conn.close()
-
-        count = 0
-        for row in rows:
-            try:
-                bot.add_view(SignupStaffView(int(row["id"])))
-                count += 1
-            except Exception:
-                pass
-
-        print(f"[WEBSITE SYNC] View iscrizioni pending registrate: {count}")
-    except Exception as e:
-        print(f"[WEBSITE SYNC] Errore registrazione view pending: {e}")
-
-
-def _sync_signup_accept_db(req, request_id, club_name, handled_by, handled_by_name):
-    """
-    Parte database dell'accettazione sito.
-    È SINCRONA e viene eseguita in asyncio.to_thread, così non blocca Discord.
-    """
-    discord_id = str(req.get("discord_id") or "").strip()
-    if not discord_id:
-        raise Exception("Discord ID mancante nella richiesta")
-
-    display_name = str(
-        req.get("discord_name")
-        or req.get("real_name")
-        or handled_by_name
-        or discord_id
-    )
-
-    club_name = str(club_name or "").strip()
-    budget = DEFAULT_BUDGET
-    assigned_players = 0
-    avg_ovr = 0
-
-    conn = connect()
-    cur = conn.cursor()
-
-    try:
-        # Libera eventuale vecchia rosa del manager
-        cur.execute("""
-            UPDATE players
-            SET owner_discord_id = NULL,
-                sold_price = NULL
-            WHERE owner_discord_id = %s
-        """, (discord_id,))
-
-        if club_name:
-            # Controlla club, ma non bloccare se la tabella club ha nomi leggermente diversi.
-            cur.execute("""
-                SELECT name, assigned_to
-                FROM fc26_clubs
-                WHERE LOWER(name) = LOWER(%s)
-                LIMIT 1
-            """, (club_name,))
-            club_row = cur.fetchone()
-
-            if club_row:
-                current_owner = str(club_row.get("assigned_to") or "").strip()
-                if current_owner and current_owner != discord_id:
-                    raise Exception(f"Club già assegnato: {club_name}")
-
-            # Assegna giocatori del club.
-            cur.execute("""
-                UPDATE players
-                SET owner_discord_id = %s,
-                    sold_price = 0
-                WHERE LOWER(team) = LOWER(%s)
-            """, (discord_id, club_name))
-
-            assigned_players = cur.rowcount or 0
-
-            # Fallback per nomi simili.
-            if assigned_players == 0:
-                cur.execute("""
-                    UPDATE players
-                    SET owner_discord_id = %s,
-                        sold_price = 0
-                    WHERE team ILIKE %s
-                """, (discord_id, f"%{club_name}%"))
-                assigned_players = cur.rowcount or 0
-
-            cur.execute("""
-                SELECT COUNT(*) AS count_players,
-                       COALESCE(AVG(overall), 0) AS avg_ovr
-                FROM players
-                WHERE owner_discord_id = %s
-            """, (discord_id,))
-            stats = cur.fetchone()
-            assigned_players = int(stats.get("count_players") or assigned_players or 0)
-            avg_ovr = float(stats.get("avg_ovr") or 0)
-
-            try:
-                budget = budget_from_team_overall(avg_ovr) if assigned_players > 0 else DEFAULT_BUDGET
-            except Exception:
-                budget = DEFAULT_BUDGET
-
-        # Crea/aggiorna manager SENZA ON CONFLICT, così non dipende da vincoli unique.
-        cur.execute("SELECT id FROM managers WHERE discord_id = %s LIMIT 1", (discord_id,))
-        existing_manager = cur.fetchone()
-
-        if existing_manager:
-            cur.execute("""
-                UPDATE managers
-                SET name = %s,
-                    manager_name = %s,
-                    club_name = %s,
-                    budget = %s
-                WHERE discord_id = %s
-            """, (display_name, display_name, club_name or None, int(budget), discord_id))
-        else:
-            cur.execute("""
-                INSERT INTO managers (discord_id, name, manager_name, club_name, budget)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (discord_id, display_name, display_name, club_name or None, int(budget)))
-
-        if club_name:
-            cur.execute("""
-                UPDATE fc26_clubs
-                SET assigned_to = %s,
-                    assigned_at = CURRENT_TIMESTAMP,
-                    previous_owner_id = NULL,
-                    previous_owner_name = NULL
-                WHERE LOWER(name) = LOWER(%s)
-            """, (discord_id, club_name))
-
-        cur.execute("""
-            UPDATE signup_requests
-            SET status = 'accepted',
-                club_name = %s,
-                handled_by = %s,
-                handled_at = CURRENT_TIMESTAMP
-            WHERE id = %s
-        """, (club_name or None, str(handled_by), int(request_id)))
-
-        try:
-            cur.execute("""
-                INSERT INTO real_team_assignments
-                (discord_id, manager_name, team_name, avg_overall, assigned_budget)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (discord_id) DO UPDATE SET
-                    manager_name = EXCLUDED.manager_name,
-                    team_name = EXCLUDED.team_name,
-                    avg_overall = EXCLUDED.avg_overall,
-                    assigned_budget = EXCLUDED.assigned_budget
-            """, (discord_id, display_name, club_name or None, float(avg_ovr), int(budget)))
-        except Exception:
-            pass
-
-        conn.commit()
-        return assigned_players, avg_ovr, int(budget)
-
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        conn.close()
-
-
-def _sync_signup_reject_db(req, request_id, handled_by):
-    discord_id = str(req.get("discord_id") or "").strip()
-
-    conn = connect()
-    cur = conn.cursor()
-
-    try:
-        cur.execute("""
-            UPDATE signup_requests
-            SET status = 'rejected',
-                handled_by = %s,
-                handled_at = CURRENT_TIMESTAMP
-            WHERE id = %s
-        """, (str(handled_by), int(request_id)))
-
-        cur.execute("""
-            UPDATE players
-            SET owner_discord_id = NULL,
-                sold_price = NULL
-            WHERE owner_discord_id = %s
-        """, (discord_id,))
-
-        cur.execute("""
-            UPDATE fc26_clubs
-            SET assigned_to = NULL,
-                assigned_at = NULL
-            WHERE assigned_to = %s
-        """, (discord_id,))
-
-        cur.execute("DELETE FROM managers WHERE discord_id = %s", (discord_id,))
-        cur.execute("DELETE FROM real_team_assignments WHERE discord_id = %s", (discord_id,))
-
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        conn.close()
-
-
-def build_signup_result_embed(req, action, club_name=None, handled_by_name=None, request_id=None, assigned_players=None, budget=None):
-    discord_id = str(req.get("discord_id") or "")
-    real_name = str(req.get("real_name") or req.get("discord_name") or "-")
-    platform = str(req.get("platform") or "-")
-    game_id = str(req.get("game_id") or req.get("ea_id") or req.get("psn_id") or "-")
-    request_id = request_id or req.get("id") or "-"
-
-    if action == "accepted":
-        embed = discord.Embed(
-            title="✅ Iscrizione accettata",
-            description=f"Richiesta **#{request_id}** accettata.",
-            color=discord.Color.green()
-        )
-    else:
-        embed = discord.Embed(
-            title="❌ Iscrizione rifiutata",
-            description=f"Richiesta **#{request_id}** rifiutata.",
-            color=discord.Color.red()
-        )
-
-    embed.add_field(name="Player", value=f"<@{discord_id}>", inline=False)
-    embed.add_field(name="Nome", value=real_name, inline=True)
-    embed.add_field(name="Piattaforma", value=platform, inline=True)
-    embed.add_field(name="ID PSN/Xbox/EA", value=game_id, inline=False)
-
-    if club_name:
-        embed.add_field(name="Club assegnato", value=f"**{club_name}**", inline=False)
-
-    if assigned_players is not None:
-        embed.add_field(name="Giocatori assegnati", value=str(assigned_players), inline=True)
-
-    if budget is not None:
-        embed.add_field(name="Budget", value=f"{budget} crediti", inline=True)
-
-    if handled_by_name:
-        embed.add_field(name="Gestita da", value=str(handled_by_name), inline=False)
-
-    embed.set_footer(text="Bordo Campo • BC FC")
-    return embed
-
-
-async def find_signup_staff_message(request_id, req=None):
-    channel_id = None
-    message_id = None
-
-    try:
-        if req:
-            channel_id = req.get("staff_channel_id")
-            message_id = req.get("staff_message_id")
-    except Exception:
-        pass
-
-    if not channel_id:
-        channel_id = SIGNUP_STAFF_CHANNEL_ID
-
-    try:
-        channel = bot.get_channel(int(channel_id))
-        if not channel:
-            channel = await bot.fetch_channel(int(channel_id))
-    except Exception:
-        return None
-
-    if message_id:
-        try:
-            return await channel.fetch_message(int(message_id))
-        except Exception:
-            pass
-
-    try:
-        async for msg in channel.history(limit=100):
-            for emb in msg.embeds:
-                haystack = f"{emb.title or ''}\n{emb.description or ''}"
-                if f"Richiesta ID: **{request_id}**" in haystack or f"#{request_id}" in haystack:
-                    return msg
-    except Exception:
-        pass
-
-    return None
-
-
-async def update_original_signup_message(request_id, req, action, club_name=None, handled_by_name=None, assigned_players=None, budget=None):
-    msg = await find_signup_staff_message(request_id, req)
-
-    embed = build_signup_result_embed(
-        req,
-        action,
-        club_name=club_name,
-        handled_by_name=handled_by_name,
-        request_id=request_id,
-        assigned_players=assigned_players,
-        budget=budget
-    )
-
-    if msg:
-        try:
-            await msg.edit(embed=embed, view=None)
-            return True
-        except Exception as e:
-            print(f"[WEBSITE SYNC] Errore edit messaggio staff: {e}")
-
-    return False
-
-
-async def publish_signup_result_channels(req, action, club_name=None, handled_by_name=None, request_id=None, assigned_players=None, budget=None):
-    embed = build_signup_result_embed(
-        req,
-        action,
-        club_name=club_name,
-        handled_by_name=handled_by_name,
-        request_id=request_id,
-        assigned_players=assigned_players,
-        budget=budget
-    )
-
-    target_channel_id = SIGNUP_ACCEPT_CHANNEL_ID if action == "accepted" else SIGNUP_REJECT_CHANNEL_ID
-
-    try:
-        channel = bot.get_channel(int(target_channel_id))
-        if not channel:
-            channel = await bot.fetch_channel(int(target_channel_id))
-        await channel.send(embed=embed)
-    except Exception as e:
-        print(f"[WEBSITE SYNC] Errore invio canale esito: {e}")
-
-
-async def apply_signup_accept_from_website(req, request_id, club_name, handled_by, handled_by_name):
-    discord_id = str(req.get("discord_id") or "").strip()
-
-    assigned_players, avg_ovr, budget = await asyncio.to_thread(
-        _sync_signup_accept_db,
-        req,
-        request_id,
-        club_name,
-        handled_by,
-        handled_by_name
-    )
-
-    guild = bot.get_guild(int(GUILD_ID))
-    member = await get_member_safe(guild, discord_id) if guild and discord_id else None
-
-    if guild and member:
-        try:
-            await apply_signup_role_accepted(
-                guild,
-                member,
-                reason="Iscrizione accettata dal sito"
-            )
-        except Exception as e:
-            print(f"[WEBSITE SYNC] Errore ruoli accepted: {e}")
-
-    dm_text = (
-        f"La tua iscrizione a **BC FC** è stata accettata.\n\n"
-        f"🏟️ Club assegnato: **{club_name or 'N/D'}**\n"
-        f"👥 Giocatori assegnati: **{assigned_players}**\n"
-        f"💰 Budget: **{budget} crediti**"
-    )
-
-    await safe_dm_signup_result(
-        discord_id,
-        "✅ Iscrizione BC FC accettata",
-        dm_text,
-        discord.Color.green()
-    )
-
-    return assigned_players, budget
-
-
-async def apply_signup_reject_from_website(req, request_id, handled_by, handled_by_name):
-    discord_id = str(req.get("discord_id") or "").strip()
-
-    await asyncio.to_thread(
-        _sync_signup_reject_db,
-        req,
-        request_id,
-        handled_by
-    )
-
-    guild = bot.get_guild(int(GUILD_ID))
-    member = await get_member_safe(guild, discord_id) if guild and discord_id else None
-
-    if guild and member:
-        try:
-            await apply_signup_role_rejected(
-                guild,
-                member,
-                reason="Iscrizione rifiutata dal sito"
-            )
-        except Exception as e:
-            print(f"[WEBSITE SYNC] Errore ruoli rejected: {e}")
-
-    await safe_dm_signup_result(
-        discord_id,
-        "❌ Iscrizione BC FC rifiutata",
-        "La tua richiesta di iscrizione a **BC FC** è stata rifiutata. Puoi contattare lo staff per maggiori informazioni.",
-        discord.Color.red()
-    )
-
-
-async def process_website_signup_action(action_row):
-    action_id = int(action_row["id"])
-    request_id = int(action_row["request_id"])
-    action = str(action_row["action"])
-    club_name = action_row.get("club_name")
-    handled_by = action_row.get("handled_by") or "website"
-    handled_by_name = action_row.get("handled_by_name") or handled_by
-
-    conn = connect()
-    cur = conn.cursor()
-
-    try:
-        cur.execute("SELECT * FROM signup_requests WHERE id = %s LIMIT 1", (request_id,))
-        req = cur.fetchone()
-
-        if not req:
-            raise Exception("Richiesta non trovata")
-
-        current_status = str(req.get("status") or "pending")
-        if current_status not in {"pending", "choosing_club"}:
-            raise Exception(f"Richiesta già gestita: {current_status}")
-
-    except Exception as e:
-        try:
-            cur.execute("""
-                UPDATE signup_staff_actions
-                SET processed = true,
-                    processed_at = CURRENT_TIMESTAMP,
-                    error = %s
-                WHERE id = %s
-            """, (str(e), action_id))
-            conn.commit()
-        except Exception:
-            pass
-        conn.close()
-        print(f"[WEBSITE SYNC] Azione #{action_id} non processata: {e}")
-        return
-
-    conn.close()
-
-    assigned_players = None
-    budget = None
-
-    try:
-        if action == "accepted":
-            assigned_players, budget = await apply_signup_accept_from_website(
-                req,
-                request_id,
-                club_name,
-                handled_by,
-                handled_by_name
-            )
-        elif action == "rejected":
-            await apply_signup_reject_from_website(req, request_id, handled_by, handled_by_name)
-        else:
-            raise Exception(f"Azione non valida: {action}")
-
-        conn = connect()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM signup_requests WHERE id = %s LIMIT 1", (request_id,))
-        updated_req = cur.fetchone()
-        conn.close()
-
-        await update_original_signup_message(
-            request_id,
-            updated_req or req,
-            action,
-            club_name=club_name,
-            handled_by_name=handled_by_name,
-            assigned_players=assigned_players,
-            budget=budget
-        )
-
-        await publish_signup_result_channels(
-            updated_req or req,
-            action,
-            club_name=club_name,
-            handled_by_name=handled_by_name,
-            request_id=request_id,
-            assigned_players=assigned_players,
-            budget=budget
-        )
-
-        conn = connect()
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE signup_staff_actions
-            SET processed = true,
-                processed_at = CURRENT_TIMESTAMP,
-                error = NULL
-            WHERE id = %s
-        """, (action_id,))
-        conn.commit()
-        conn.close()
-
-        print(f"[WEBSITE SYNC] Azione #{action_id} processata: {action} richiesta #{request_id}")
-
-    except Exception as e:
-        print(f"[WEBSITE SYNC] Errore processamento azione #{action_id}: {e}")
-        conn = connect()
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE signup_staff_actions
-            SET processed = false,
-                processed_at = CURRENT_TIMESTAMP,
-                error = %s
-            WHERE id = %s
-        """, (str(e), action_id))
-        conn.commit()
-        conn.close()
-
-
-async def publish_website_signup_request_to_discord(req):
-    request_id = int(req["id"])
-    discord_id = str(req.get("discord_id") or "").strip()
-
-    guild = bot.get_guild(int(GUILD_ID))
-    member = await get_member_safe(guild, discord_id) if guild and discord_id else None
-
-    if guild and member:
-        try:
-            await apply_signup_role_pending(
-                guild,
-                member,
-                reason="Richiesta iscrizione FC26 dal sito"
-            )
-        except Exception as e:
-            print(f"[WEBSITE REQUEST SYNC] Errore ruolo PRE ISCRITTO: {e}")
-
-    published = await publish_signup_request_once(request_id, guild, source="website")
-    if not published:
-        return False
-
-    if discord_id:
-        await safe_dm_signup_result(
-            discord_id,
-            "📩 Richiesta iscrizione ricevuta",
-            (
-                "La tua richiesta di iscrizione a **BC FC** è stata ricevuta correttamente.\n"
-                "Lo staff la controllerà appena possibile."
-            ),
-            discord.Color.orange()
-        )
-
-    print(f"[WEBSITE REQUEST SYNC] Richiesta sito #{request_id} pubblicata su Discord.")
-    return True
-
-
-def _fetch_pending_website_signup_requests():
-    conn = connect()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT *
-            FROM signup_requests
-            WHERE status = 'pending'
-              AND (staff_message_id IS NULL OR staff_message_id = '')
-            ORDER BY id ASC
-            LIMIT 10
-        """)
-        return cur.fetchall()
-    finally:
-        conn.close()
-
-
-def _fetch_pending_website_signup_actions():
-    conn = connect()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT *
-            FROM signup_staff_actions
-            WHERE processed = false
-            ORDER BY id ASC
-            LIMIT 10
-        """)
-        return cur.fetchall()
-    finally:
-        conn.close()
-
-
-def _fetch_all_player_activity_rows():
-    ensure_registered_players_in_activity()
-    conn = connect()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT * FROM player_activity")
-        return cur.fetchall()
-    finally:
-        conn.close()
-
-
-async def process_website_signup_requests_loop():
-    await bot.wait_until_ready()
-    await asyncio.to_thread(ensure_website_signup_sync_tables)
-
-    while not bot.is_closed():
-        try:
-            rows = await asyncio.to_thread(_fetch_pending_website_signup_requests)
-            for row in rows:
-                try:
-                    await publish_website_signup_request_to_discord(row)
-                except Exception as e:
-                    print(f"[WEBSITE REQUEST SYNC] Errore pubblicazione richiesta #{row.get('id')}: {e}")
-        except Exception as e:
-            print(f"[WEBSITE REQUEST LOOP] Errore: {e}")
-
-        await asyncio.sleep(5)
-
-
-async def process_website_signup_actions_loop():
-    await bot.wait_until_ready()
-    await asyncio.to_thread(ensure_website_signup_sync_tables)
-
-    while not bot.is_closed():
-        try:
-            rows = await asyncio.to_thread(_fetch_pending_website_signup_actions)
-            for row in rows:
-                try:
-                    await process_website_signup_action(row)
-                except Exception as e:
-                    print(f"[WEBSITE SIGNUP ACTION LOOP] Errore singola azione #{row.get('id')}: {e}")
-        except Exception as e:
-            print(f"[WEBSITE SIGNUP ACTION LOOP] Errore: {e}")
-
-        await asyncio.sleep(5)
-
-# ===========================================================
-# FINE WEBSITE/DISCORD SIGNUP SYNC PATCH v4
-# ===========================================================
-
-
-
-async def reset_league_roles_background(guild_id: int):
-    await bot.wait_until_ready()
-    guild = bot.get_guild(int(guild_id))
-    if not guild:
-        return
-
-    pre_role = guild.get_role(int(PRE_SIGNUP_ROLE_ID)) if PRE_SIGNUP_ROLE_ID else None
-    registered_role = guild.get_role(int(REGISTERED_ROLE_ID)) if REGISTERED_ROLE_ID else None
-
-    changed = 0
-    failed = 0
-
-    try:
-        async for member in guild.fetch_members(limit=None):
-            if member.bot:
-                continue
-
-            roles_to_remove = []
-            if pre_role and pre_role in member.roles:
-                roles_to_remove.append(pre_role)
-            if registered_role and registered_role in member.roles:
-                roles_to_remove.append(registered_role)
-
-            if not roles_to_remove:
-                continue
-
-            try:
-                await member.remove_roles(*roles_to_remove, reason="Reset totale competizione BC FC")
-                changed += 1
-                await asyncio.sleep(0.35)
-            except Exception:
-                failed += 1
-                await asyncio.sleep(1.5)
-    except Exception as e:
-        print(f"[RESET LEAGUE ROLES] Errore: {e}")
-
-    print(f"[RESET LEAGUE ROLES] Completato. Modificati={changed}, errori={failed}")
-
-
-@tree.command(name="reset_league", description="Owner staff: reset totale competizione, iscrizioni, club, rose e ruoli")
-async def reset_league(interaction: discord.Interaction):
-    if not can_use_dangerous_commands(interaction.user):
-        await interaction.response.send_message("❌ Non hai i permessi per usare questo comando.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    def reset_database_sync():
-        conn = connect()
-        cur = conn.cursor()
-
-        statements = [
-            """
-            UPDATE signup_requests
-            SET status = 'reset',
-                club_name = NULL,
-                handled_by = NULL,
-                handled_at = NULL,
-                staff_message_id = NULL,
-                staff_channel_id = NULL
-            """,
-            "DELETE FROM managers",
-            "DELETE FROM real_team_assignments",
-            """
-            UPDATE fc26_clubs
-            SET assigned_to = NULL,
-                assigned_at = NULL,
-                previous_owner_id = NULL,
-                previous_owner_name = NULL
-            """,
-            """
-            UPDATE players
-            SET owner_discord_id = NULL,
-                sold_price = NULL
-            """,
-            "DELETE FROM signup_staff_actions"
-        ]
-
-        optional = [
-            "UPDATE auctions SET status = 'closed' WHERE status = 'open'",
-            "DELETE FROM trade_offers",
-            "DELETE FROM player_trade_offers",
-            "DELETE FROM transfer_history",
-            "DELETE FROM bid_history"
-        ]
-
-        for sql in statements:
-            try:
-                cur.execute(sql)
-            except Exception as e:
-                print(f"[RESET LEAGUE DB] Errore: {e}")
-
-        for sql in optional:
-            try:
-                cur.execute(sql)
-            except Exception:
-                pass
-
-        conn.commit()
-        conn.close()
-
-    await asyncio.to_thread(reset_database_sync)
-
-    if interaction.guild:
-        bot.loop.create_task(reset_league_roles_background(interaction.guild.id))
-
-    await interaction.followup.send(
-        "✅ Reset database completato. Il reset ruoli Discord continua in background.",
-        ephemeral=True
-    )
-
-
-bot.run(TOKEN)
