@@ -2757,10 +2757,6 @@ async def risultati_lista(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Errore risultati: `{type(e).__name__}`", ephemeral=True)
 
 
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN non configurato nelle variabili ambiente.")
-
-bot.run(TOKEN)
 # e quindi non venivano mai caricati prima dell'avvio del bot.
 def _fetch_all_player_activity_rows():
     """Legge i dati attività giocatori da Supabase.
@@ -5026,7 +5022,7 @@ async def on_ready():
         print(f"[ON_READY] AuctionView non registrata: {e}")
 
     try:
-        local_commands = tree.get_commands()
+        local_commands = tree.get_commands(guild=None)
         print(f"[SYNC DEBUG] Comandi registrati localmente prima del sync: {len(local_commands)}")
         print("[SYNC DEBUG] Nomi comandi:", ", ".join(cmd.name for cmd in local_commands[:120]))
 
@@ -5035,6 +5031,7 @@ async def on_ready():
             tree.copy_global_to(guild=guild)
             synced = await tree.sync(guild=guild)
             print(f"[SYNC OK] Comandi sincronizzati nel server {GUILD_ID}: {len(synced)}")
+            print("[SYNC DEBUG] Comandi syncati:", ", ".join(cmd.name for cmd in synced[:120]))
         else:
             synced = await tree.sync()
             print(f"[SYNC OK] Comandi globali sincronizzati: {len(synced)}")
@@ -10622,5 +10619,8 @@ async def classifica(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed)
 
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN non configurato nelle variabili ambiente.")
 
-
+print("[BOOT] Avvio finale bot.run(TOKEN)")
+bot.run(TOKEN)
