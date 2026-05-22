@@ -7979,92 +7979,123 @@ class TradeView(discord.ui.View):
         super().__init__(timeout=86400)
         self.trade_id = trade_id
 
+    async def _disable_public_message(self, interaction: discord.Interaction, content: str):
+        """Modifica il messaggio dello scambio senza usare interaction.response dopo operazioni lente."""
+        try:
+            if interaction.message:
+                await interaction.message.edit(content=content, embed=None, view=None)
+                return
+        except Exception as e:
+            print(f"[TRADE MESSAGE EDIT] Errore modifica messaggio scambio: {e}")
+
+        try:
+            await interaction.followup.send(content, ephemeral=True)
+        except Exception:
+            pass
+
     @discord.ui.button(label="ACCETTA", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Risposta immediata: evita Unknown interaction quando DB/Discord impiegano più di 3 secondi.
+        await safe_defer(interaction, ephemeral=True, thinking=True)
+
         conn = connect()
         cur = conn.cursor()
 
-        cur.execute("SELECT * FROM trade_offers WHERE id = %s AND status = 'pending'", (self.trade_id,))
-        trade = cur.fetchone()
+        try:
+            cur.execute("SELECT * FROM trade_offers WHERE id = %s AND status = 'pending'", (self.trade_id,))
+            trade = cur.fetchone()
 
-        if not trade:
-            conn.close()
-            await interaction.response.send_message("Scambio non trovato o già concluso.", ephemeral=True)
-            return
-
-        if str(interaction.user.id) != str(trade["target_id"]):
-            conn.close()
-            await interaction.response.send_message("Solo il destinatario dello scambio può accettare.", ephemeral=True)
-            return
-
-        proposer_id = str(trade["proposer_id"])
-        target_id = str(trade["target_id"])
-        offer_player_id = trade["offer_player_id"]
-        request_player_id = trade["request_player_id"]
-        credits_to_target = safe_int(trade["credits_to_target"])
-        credits_to_proposer = safe_int(trade["credits_to_proposer"])
-
-        offer_player_name = None
-        request_player_name = None
-
-        if offer_player_id:
-            cur.execute("SELECT name, owner_discord_id FROM players WHERE id = CAST(%s AS BIGINT)", (offer_player_id,))
-            p = cur.fetchone()
-            if not p or str(p["owner_discord_id"]) != proposer_id:
+            if not trade:
                 conn.close()
-                await interaction.response.send_message("Scambio non valido: il proponente non possiede più il giocatore offerto.", ephemeral=True)
+                await interaction.followup.send("Scambio non trovato o già concluso.", ephemeral=True)
                 return
-            offer_player_name = p["name"]
 
-        if request_player_id:
-            cur.execute("SELECT name, owner_discord_id FROM players WHERE id = CAST(%s AS BIGINT)", (request_player_id,))
-            p = cur.fetchone()
-            if not p or str(p["owner_discord_id"]) != target_id:
+            if str(interaction.user.id) != str(trade["target_id"]):
                 conn.close()
-                await interaction.response.send_message("Scambio non valido: non possiedi più il giocatore richiesto.", ephemeral=True)
+                await interaction.followup.send("Solo il destinatario dello scambio può accettare.", ephemeral=True)
                 return
-            request_player_name = p["name"]
 
-        cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (proposer_id,))
-        proposer = cur.fetchone()
-        cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (target_id,))
-        target = cur.fetchone()
+            proposer_id = str(trade["proposer_id"])
+            target_id = str(trade["target_id"])
+            offer_player_id = trade["offer_player_id"]
+            request_player_id = trade["request_player_id"]
+            credits_to_target = safe_int(trade["credits_to_target"])
+            credits_to_proposer = safe_int(trade["credits_to_proposer"])
 
-        if not proposer or not target:
-            conn.close()
-            await interaction.response.send_message("Uno dei due utenti non è registrato.", ephemeral=True)
+            offer_player_name = None
+            request_player_name = None
+
+            if offer_player_id:
+                cur.execute("SELECT name, owner_discord_id FROM players WHERE id = CAST(%s AS BIGINT)", (offer_player_id,))
+                p = cur.fetchone()
+                if not p or str(p["owner_discord_id"]) != proposer_id:
+                    conn.close()
+                    await interaction.followup.send("Scambio non valido: il proponente non possiede più il giocatore offerto.", ephemeral=True)
+                    return
+                offer_player_name = p["name"]
+
+            if request_player_id:
+                cur.execute("SELECT name, owner_discord_id FROM players WHERE id = CAST(%s AS BIGINT)", (request_player_id,))
+                p = cur.fetchone()
+                if not p or str(p["owner_discord_id"]) != target_id:
+                    conn.close()
+                    await interaction.followup.send("Scambio non valido: non possiedi più il giocatore richiesto.", ephemeral=True)
+                    return
+                request_player_name = p["name"]
+
+            cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (proposer_id,))
+            proposer = cur.fetchone()
+            cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (target_id,))
+            target = cur.fetchone()
+
+            if not proposer or not target:
+                conn.close()
+                await interaction.followup.send("Uno dei due utenti non è registrato.", ephemeral=True)
+                return
+
+            tax_target = int((credits_to_target * MARKET_TAX) / 100)
+            tax_proposer = int((credits_to_proposer * MARKET_TAX) / 100)
+
+            if safe_int(proposer["budget"]) < credits_to_target + tax_target:
+                conn.close()
+                await interaction.followup.send("Scambio non valido: il proponente non ha abbastanza crediti.", ephemeral=True)
+                return
+
+            if safe_int(target["budget"]) < credits_to_proposer + tax_proposer:
+                conn.close()
+                await interaction.followup.send("Scambio non valido: non hai abbastanza crediti.", ephemeral=True)
+                return
+
+            if credits_to_target:
+                cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (credits_to_target + tax_target, proposer_id))
+                cur.execute("UPDATE managers SET budget = budget + %s WHERE discord_id = %s", (credits_to_target, target_id))
+
+            if credits_to_proposer:
+                cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (credits_to_proposer + tax_proposer, target_id))
+                cur.execute("UPDATE managers SET budget = budget + %s WHERE discord_id = %s", (credits_to_proposer, proposer_id))
+
+            if offer_player_id:
+                cur.execute("UPDATE players SET owner_discord_id = %s WHERE id = CAST(%s AS BIGINT)", (target_id, offer_player_id))
+
+            if request_player_id:
+                cur.execute("UPDATE players SET owner_discord_id = %s WHERE id = CAST(%s AS BIGINT)", (proposer_id, request_player_id))
+
+            cur.execute("UPDATE trade_offers SET status = 'accepted' WHERE id = %s", (self.trade_id,))
+            conn.commit()
+
+        except Exception as e:
+            conn.rollback()
+            print(f"[TRADE ACCEPT] Errore: {e}")
+            try:
+                await interaction.followup.send("❌ Errore durante l'accettazione dello scambio. Controlla i log.", ephemeral=True)
+            except Exception:
+                pass
             return
-
-        tax_target = int((credits_to_target * MARKET_TAX) / 100)
-        tax_proposer = int((credits_to_proposer * MARKET_TAX) / 100)
-
-        if safe_int(proposer["budget"]) < credits_to_target + tax_target:
-            conn.close()
-            await interaction.response.send_message("Scambio non valido: il proponente non ha abbastanza crediti.", ephemeral=True)
-            return
-
-        if safe_int(target["budget"]) < credits_to_proposer + tax_proposer:
-            conn.close()
-            await interaction.response.send_message("Scambio non valido: non hai abbastanza crediti.", ephemeral=True)
-            return
-
-        if credits_to_target:
-            cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (credits_to_target + tax_target, proposer_id))
-            cur.execute("UPDATE managers SET budget = budget + %s WHERE discord_id = %s", (credits_to_target, target_id))
-
-        if credits_to_proposer:
-            cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (credits_to_proposer + tax_proposer, target_id))
-            cur.execute("UPDATE managers SET budget = budget + %s WHERE discord_id = %s", (credits_to_proposer, proposer_id))
-
-        if offer_player_id:
-            cur.execute("UPDATE players SET owner_discord_id = %s WHERE id = CAST(%s AS BIGINT)", (target_id, offer_player_id))
-
-        if request_player_id:
-            cur.execute("UPDATE players SET owner_discord_id = %s WHERE id = CAST(%s AS BIGINT)", (proposer_id, request_player_id))
-
-        cur.execute("UPDATE trade_offers SET status = 'accepted' WHERE id = %s", (self.trade_id,))
-        conn.commit()
-        conn.close()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
         # Aggiorna la pagina mercato del sito:
         # ogni giocatore che cambia proprietario viene registrato in transfer_history.
@@ -8101,11 +8132,7 @@ class TradeView(discord.ui.View):
             credits_to_proposer
         )
 
-        await interaction.response.edit_message(
-            content="✅ Scambio accettato e completato.",
-            embed=None,
-            view=None
-        )
+        await self._disable_public_message(interaction, "✅ Scambio accettato e completato.")
         await notify_trade_completed(proposer_id, target_id, summary)
         await send_trade_history_log(
             interaction.guild,
@@ -8114,32 +8141,91 @@ class TradeView(discord.ui.View):
             color=discord.Color.green()
         )
 
+        try:
+            await interaction.followup.send("✅ Scambio accettato e completato.", ephemeral=True)
+        except Exception:
+            pass
+
     @discord.ui.button(label="RIFIUTA", style=discord.ButtonStyle.danger)
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await safe_defer(interaction, ephemeral=True, thinking=True)
+
         conn = connect()
         cur = conn.cursor()
 
-        cur.execute("SELECT * FROM trade_offers WHERE id = %s AND status = 'pending'", (self.trade_id,))
-        trade = cur.fetchone()
+        try:
+            cur.execute("SELECT * FROM trade_offers WHERE id = %s AND status = 'pending'", (self.trade_id,))
+            trade = cur.fetchone()
 
-        if not trade:
-            conn.close()
-            await interaction.response.send_message("Scambio non trovato o già concluso.", ephemeral=True)
+            if not trade:
+                conn.close()
+                await interaction.followup.send("Scambio non trovato o già concluso.", ephemeral=True)
+                return
+
+            if str(interaction.user.id) != str(trade["target_id"]):
+                conn.close()
+                await interaction.followup.send("Solo il destinatario dello scambio può rifiutare.", ephemeral=True)
+                return
+
+            proposer_id = str(trade["proposer_id"])
+            target_id = str(trade["target_id"])
+            request_player_id = trade["request_player_id"]
+            offer_player_id = trade["offer_player_id"]
+            credits_to_target = safe_int(trade["credits_to_target"])
+            credits_to_proposer = safe_int(trade["credits_to_proposer"])
+
+            cur.execute("UPDATE trade_offers SET status = 'rejected' WHERE id = %s", (self.trade_id,))
+            conn.commit()
+
+        except Exception as e:
+            conn.rollback()
+            print(f"[TRADE REJECT] Errore: {e}")
+            try:
+                await interaction.followup.send("❌ Errore durante il rifiuto dello scambio. Controlla i log.", ephemeral=True)
+            except Exception:
+                pass
             return
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
-        if str(interaction.user.id) != str(trade["target_id"]):
-            conn.close()
-            await interaction.response.send_message("Solo il destinatario dello scambio può rifiutare.", ephemeral=True)
-            return
+        summary = format_trade_summary_for_message(
+            self.trade_id,
+            proposer_id,
+            target_id,
+            request_player_id,
+            offer_player_id,
+            credits_to_target,
+            credits_to_proposer
+        )
 
-        cur.execute("UPDATE trade_offers SET status = 'rejected' WHERE id = %s", (self.trade_id,))
-        conn.commit()
-        conn.close()
+        await self._disable_public_message(interaction, "❌ Scambio rifiutato.")
 
-        await interaction.response.edit_message(content="❌ Scambio rifiutato.", embed=None, view=None)
+        # Notifica entrambi in privato, se possibile.
+        for user_id in {str(proposer_id), str(target_id)}:
+            try:
+                user = await bot.fetch_user(int(user_id))
+                await user.send(f"❌ **Scambio rifiutato.**\n\n{summary}")
+            except Exception:
+                pass
+
+        await send_trade_history_log(
+            interaction.guild,
+            "❌ Scambio rifiutato",
+            summary,
+            color=discord.Color.red()
+        )
+
+        try:
+            await interaction.followup.send("❌ Scambio rifiutato.", ephemeral=True)
+        except Exception:
+            pass
 
     @discord.ui.button(label="CONTROFFERTA", style=discord.ButtonStyle.primary)
     async def counter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Questa risposta apre solo un menu ephemeral: qui possiamo rispondere subito.
         conn = connect()
         cur = conn.cursor()
         cur.execute("SELECT * FROM trade_offers WHERE id = %s AND status = 'pending'", (self.trade_id,))
@@ -8155,7 +8241,6 @@ class TradeView(discord.ui.View):
 
         proposer_players = fetch_roster_players(trade['proposer_id'])
         if not proposer_players:
-            await interaction.response.send_message("Il proponente non ha giocatori in rosa. Puoi chiedere solo budget scegliendo Nessun giocatore.", ephemeral=True)
             proposer_players = []
 
         await interaction.response.send_message(
