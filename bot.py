@@ -5101,6 +5101,15 @@ async def on_ready():
     print("[PATCH] Timer asta grafico attivo + finale asta inviato nel canale ASTA")
     print("[PATCH] Fix definitivo iscrizioni squadre reali: players.id = CAST(%s AS BIGINT)")
     print("[PATCH] Fix globale players.id BIGINT per aste, iscrizioni, mercato e scambi")
+    global _classifiche_auto_sync_task_started
+    try:
+        if not _classifiche_auto_sync_task_started:
+            bot.loop.create_task(classifiche_auto_sync_loop())
+            _classifiche_auto_sync_task_started = True
+            print("[CLASSIFICHE AUTO SYNC] Loop automatico avviato.")
+    except Exception as e:
+        print(f"[CLASSIFICHE AUTO SYNC] Avvio loop fallito: {e}")
+
     print(f"Bot online come {bot.user}")
 
 
@@ -11997,42 +12006,340 @@ async def risultato_coppa(
 
 
 
-@tree.command(name="classifica", description="Mostra la classifica del campionato")
-async def classifica(interaction: discord.Interaction):
-    if not is_standings_channel(interaction):
-        await interaction.response.send_message("❌ La classifica si vede solo nel canale CLASSIFICHE.", delete_after=10)
-        return
 
-    champ = active_championship()
-    if not champ:
-        await interaction.response.send_message("Nessun campionato attivo.", ephemeral=True)
-        return
+# ================= CLASSIFICHE INTERATTIVE + AUTO SYNC =================
 
+CLASSIFICHE_URL = "https://www.bordocampobc.com/torneo/classifiche"
+_classifiche_auto_sync_task_started = False
+
+
+def sync_all_site_competitions_now():
+    """Aggiorna automaticamente classifiche/tabelloni leggendo i risultati confermati."""
+    try:
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id
+            FROM championships
+            WHERE status = 'active'
+            ORDER BY id ASC
+        """)
+        champs = cur.fetchall()
+        conn.close()
+
+        for champ in champs:
+            try:
+                sync_site_standings_for_championship(champ["id"])
+            except Exception as e:
+                print(f"[CLASSIFICHE AUTO SYNC] Errore campionato {champ['id']}: {e}")
+
+        return True
+    except Exception as e:
+        print(f"[CLASSIFICHE AUTO SYNC ERROR] {e}")
+        return False
+
+
+async def classifiche_auto_sync_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await asyncio.to_thread(sync_all_site_competitions_now)
+        except Exception as e:
+            print(f"[CLASSIFICHE AUTO SYNC LOOP ERROR] {e}")
+        await asyncio.sleep(600)
+
+
+def get_user_competitions_for_classifica(discord_id):
+    """Restituisce solo le competizioni a cui il player partecipa."""
+    discord_id = str(discord_id)
+    club_name = get_site_club_name(discord_id, None)
+
+    competitions = {}
     conn = connect()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM championship_groups WHERE championship_id = %s ORDER BY id ASC", (champ["id"],))
-    groups = cur.fetchall()
+
+    # Campionati/gruppi dove il player è iscritto.
+    try:
+        cur.execute("""
+            SELECT 
+                c.name AS championship_name,
+                g.name AS group_name
+            FROM championship_players cp
+            JOIN championships c ON c.id = cp.championship_id
+            JOIN championship_groups g ON g.id = cp.group_id
+            WHERE cp.discord_id = %s
+            ORDER BY c.id DESC, g.id ASC
+        """, (discord_id,))
+        for r in cur.fetchall():
+            name = r.get("group_name") or r.get("championship_name") or "Campionato"
+            competitions[f"standings|Campionati|{name}"] = {
+                "kind": "standings",
+                "type": "Campionati",
+                "name": name,
+                "label": f"📊 {name}",
+                "description": "Classifica campionato"
+            }
+    except Exception as e:
+        print(f"[CLASSIFICA] Errore ricerca campionati utente: {e}")
+
+    # Competizioni presenti nella tabella standings dove compare il club del player.
+    if club_name:
+        try:
+            cur.execute("""
+                SELECT DISTINCT competition_name, competition_type
+                FROM standings
+                WHERE LOWER(club_name) = LOWER(%s)
+                ORDER BY competition_type ASC, competition_name ASC
+            """, (club_name,))
+            for r in cur.fetchall():
+                ctype = r.get("competition_type") or "Competizione"
+                cname = r.get("competition_name") or "Classifica"
+                competitions[f"standings|{ctype}|{cname}"] = {
+                    "kind": "standings",
+                    "type": ctype,
+                    "name": cname,
+                    "label": f"📊 {cname}",
+                    "description": ctype
+                }
+        except Exception as e:
+            print(f"[CLASSIFICA] Errore standings utente: {e}")
+
+    # Coppe/tabelloni dove compare il club del player.
+    if club_name:
+        try:
+            cur.execute("""
+                SELECT DISTINCT competition_name
+                FROM cup_matches
+                WHERE LOWER(home_team) = LOWER(%s)
+                   OR LOWER(away_team) = LOWER(%s)
+                ORDER BY competition_name ASC
+            """, (club_name, club_name))
+            for r in cur.fetchall():
+                cname = r.get("competition_name") or "Coppa"
+                competitions[f"bracket|Coppa|{cname}"] = {
+                    "kind": "bracket",
+                    "type": "Coppa",
+                    "name": cname,
+                    "label": f"🏆 {cname}",
+                    "description": "Tabellone coppa"
+                }
+        except Exception as e:
+            print(f"[CLASSIFICA] Errore coppe utente: {e}")
+
+    conn.close()
+    return list(competitions.values())
+
+
+def build_standings_embed(competition_type, competition_name):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM standings
+        WHERE competition_type = %s
+          AND competition_name = %s
+        ORDER BY points DESC, (goals_for - goals_against) DESC, goals_for DESC, club_name ASC
+    """, (competition_type, competition_name))
+    rows = cur.fetchall()
     conn.close()
 
     embed = discord.Embed(
-        title=f"📊 Classifica — {champ['name']}",
+        title=f"📊 Classifica — {competition_name}",
+        description=f"Tipo: **{competition_type}**",
         color=discord.Color.green()
     )
 
-    for g in groups:
-        standings = calculate_group_standings(champ["id"], g["id"])
-        if not standings:
-            value = "Nessun dato."
-        else:
-            lines = []
-            for i, row in enumerate(standings, start=1):
-                lines.append(
-                    f"**{i}. {row['name']}** — {row['pts']} pt | {row['pg']} PG | {row['w']}V {row['d']}N {row['l']}P | DR {row['gd']}"
-                )
-            value = "\n".join(lines[:10])
-        embed.add_field(name=g["name"], value=value, inline=False)
+    if not rows:
+        embed.add_field(name="Classifica", value="Nessun dato disponibile.", inline=False)
+    else:
+        lines = []
+        for i, r in enumerate(rows, start=1):
+            gf = safe_int(r.get("goals_for"))
+            ga = safe_int(r.get("goals_against"))
+            gd = gf - ga
+            lines.append(
+                f"**{i}. {r.get('club_name')}** — **{safe_int(r.get('points'))} pt** | "
+                f"{safe_int(r.get('played'))} PG | {safe_int(r.get('wins'))}V "
+                f"{safe_int(r.get('draws'))}N {safe_int(r.get('losses'))}P | "
+                f"GF {gf} GA {ga} DR {gd:+d}"
+            )
 
-    await interaction.response.send_message(embed=embed)
+        chunk = ""
+        field_index = 1
+        for line in lines:
+            if len(chunk) + len(line) + 1 > 1000:
+                embed.add_field(
+                    name="Classifica" if field_index == 1 else f"Classifica {field_index}",
+                    value=chunk,
+                    inline=False
+                )
+                field_index += 1
+                chunk = line
+            else:
+                chunk = f"{chunk}\\n{line}".strip()
+        if chunk:
+            embed.add_field(
+                name="Classifica" if field_index == 1 else f"Classifica {field_index}",
+                value=chunk,
+                inline=False
+            )
+
+    embed.add_field(
+        name="🌐 Classifiche complete",
+        value=f"Per vedere tutte le classifiche entra su {CLASSIFICHE_URL}",
+        inline=False
+    )
+    return embed
+
+
+def build_bracket_embed(competition_name):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM cup_matches
+        WHERE competition_name = %s
+        ORDER BY created_at ASC, id ASC
+    """, (competition_name,))
+    rows = cur.fetchall()
+    conn.close()
+
+    embed = discord.Embed(
+        title=f"🏆 Tabellone — {competition_name}",
+        color=discord.Color.orange()
+    )
+
+    if not rows:
+        embed.description = "Nessun tabellone disponibile."
+    else:
+        by_round = {}
+        for r in rows:
+            by_round.setdefault(r.get("round") or "Turno", []).append(r)
+
+        for round_name, matches in list(by_round.items())[:10]:
+            lines = []
+            for m in matches[:12]:
+                hs = m.get("home_score")
+                aw = m.get("away_score")
+                status = m.get("status") or ""
+                score = f"{safe_int(hs)} - {safe_int(aw)}" if hs is not None and aw is not None else "vs"
+                winner = f" ✅ {m.get('winner')}" if m.get("winner") else ""
+                lines.append(f"**{m.get('home_team')}** {score} **{m.get('away_team')}**{winner}")
+            embed.add_field(name=str(round_name), value="\\n".join(lines) or "Nessun match.", inline=False)
+
+    embed.add_field(
+        name="🌐 Classifiche complete",
+        value=f"Per vedere tutte le classifiche entra su {CLASSIFICHE_URL}",
+        inline=False
+    )
+    return embed
+
+
+class ClassificaSelect(discord.ui.Select):
+    def __init__(self, competitions, page=0):
+        self.competitions = competitions
+        self.page = page
+        start = page * 25
+        current = competitions[start:start + 25]
+
+        options = [
+            discord.SelectOption(
+                label=c["label"][:100],
+                value=f"{start + i}",
+                description=str(c.get("description") or "")[:100]
+            )
+            for i, c in enumerate(current)
+        ]
+
+        super().__init__(
+            placeholder="Scegli la competizione...",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await safe_defer(interaction, ephemeral=True, thinking=True)
+
+        try:
+            await asyncio.to_thread(sync_all_site_competitions_now)
+        except Exception:
+            pass
+
+        idx = safe_int(self.values[0])
+        comp = self.competitions[idx]
+
+        if comp["kind"] == "bracket":
+            embed = build_bracket_embed(comp["name"])
+        else:
+            embed = build_standings_embed(comp["type"], comp["name"])
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class ClassificaView(discord.ui.View):
+    def __init__(self, competitions, page=0):
+        super().__init__(timeout=180)
+        self.competitions = competitions
+        self.page = page
+        self.max_page = max(0, (len(competitions) - 1) // 25)
+        self.add_item(ClassificaSelect(competitions, page))
+
+    @discord.ui.button(label="⬅️", style=discord.ButtonStyle.secondary)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page <= 0:
+            await interaction.response.send_message("Sei già alla prima pagina.", ephemeral=True)
+            return
+        await interaction.response.edit_message(view=ClassificaView(self.competitions, self.page - 1))
+
+    @discord.ui.button(label="➡️", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page >= self.max_page:
+            await interaction.response.send_message("Sei già all'ultima pagina.", ephemeral=True)
+            return
+        await interaction.response.edit_message(view=ClassificaView(self.competitions, self.page + 1))
+
+
+@tree.command(name="classifica", description="Scegli una competizione e visualizza classifica o tabellone")
+async def classifica(interaction: discord.Interaction):
+    if not is_standings_channel(interaction):
+        await interaction.response.send_message("❌ La classifica si vede solo nel canale CLASSIFICHE.", ephemeral=True)
+        return
+
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    try:
+        await asyncio.to_thread(sync_all_site_competitions_now)
+    except Exception as e:
+        print(f"[CLASSIFICA] Auto sync fallito: {e}")
+
+    competitions = get_user_competitions_for_classifica(interaction.user.id)
+
+    if not competitions:
+        await interaction.followup.send(
+            "Non risultano competizioni collegate alla tua squadra.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="📊 Le tue competizioni",
+        description=(
+            "Scegli dal menu la competizione da visualizzare.\n"
+            "Vedrai la classifica completa oppure il tabellone della coppa."
+        ),
+        color=discord.Color.green()
+    )
+    embed.set_footer(text=f"Pagina 1/{max(1, (len(competitions) - 1) // 25 + 1)}")
+
+    await interaction.followup.send(
+        embed=embed,
+        view=ClassificaView(competitions, 0),
+        ephemeral=True
+    )
+
+# ========================================================
+
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN non configurato nelle variabili ambiente.")
