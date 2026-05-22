@@ -1959,7 +1959,8 @@ DANGEROUS_ACTIONS = {
     "inizio_stagione",
     "nuova_stagione",
     "reset_modalita",
-    "reset_competizione"
+    "reset_competizione",
+    "reset_totale"
 }
 
 
@@ -12393,4 +12394,215 @@ if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN non configurato nelle variabili ambiente.")
 
 print("[BOOT] Avvio finale bot.run(TOKEN)")
+
+
+# ================= RESET TOTALE BOT + RUOLI =================
+
+RESET_TOTAL_REGISTERED_ROLE_ID = 1398332847655358554   # ISCRITTO
+RESET_TOTAL_REQUEST_ROLE_ID = 1398323695558332604      # RICHIESTA ISCRIZIONE
+
+
+def reset_total_database_state():
+    """Reset totale database: libera squadre/rose, mercato, iscrizioni e competizioni."""
+    conn = connect()
+    cur = conn.cursor()
+
+    try:
+        # Tabelle che possono non esistere in alcune versioni del DB.
+        tables_to_truncate = [
+            "auctions",
+            "bid_history",
+            "transfer_history",
+            "blacklist_players",
+            "trade_offers",
+            "player_trade_offers",
+            "signup_requests",
+            "real_team_assignments",
+            "championship_matches",
+            "match_scorers",
+            "championship_players",
+            "championship_groups",
+            "championships",
+            "national_cup_matches",
+            "national_cups",
+            "european_cup_players",
+            "european_cups",
+            "hall_of_fame",
+            "media_news",
+            "standings",
+            "match_results",
+            "cup_matches"
+        ]
+
+        existing = []
+        for table in tables_to_truncate:
+            cur.execute("""
+                SELECT to_regclass(%s) AS table_name
+            """, (f"public.{table}",))
+            row = cur.fetchone()
+            if row and row.get("table_name"):
+                existing.append(table)
+
+        if existing:
+            cur.execute(
+                "TRUNCATE TABLE " + ", ".join(existing) + " RESTART IDENTITY CASCADE"
+            )
+
+        # Libera tutti i player assegnati.
+        cur.execute("""
+            UPDATE players
+            SET owner_discord_id = NULL,
+                sold_price = NULL
+        """)
+
+        # Reset manager, ma mantiene i record per evitare errori su utenti già noti.
+        cur.execute("""
+            UPDATE managers
+            SET club_name = NULL,
+                budget = %s
+        """, (DEFAULT_BUDGET,))
+
+        # Libera tutti i club.
+        cur.execute("""
+            UPDATE fc26_clubs
+            SET assigned_to = NULL,
+                assigned_at = NULL,
+                previous_owner_id = NULL,
+                previous_owner_name = NULL
+        """)
+
+        # Stato mercato chiuso dopo reset.
+        cur.execute("""
+            INSERT INTO league_settings (key, value)
+            VALUES ('market_open', 'closed')
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """)
+
+        conn.commit()
+        return True, None
+
+    except Exception as e:
+        conn.rollback()
+        return False, str(e)
+
+    finally:
+        conn.close()
+
+
+class ConfirmResetTotaleView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="CONFERMA RESET TOTALE", style=discord.ButtonStyle.danger, emoji="⚠️")
+    async def confirm_reset_total(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not can_use_dangerous_commands(interaction.user):
+            await interaction.response.send_message("❌ Non hai i permessi per confermare il reset totale.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        ok, error = await asyncio.to_thread(reset_total_database_state)
+        if not ok:
+            await interaction.followup.send(
+                f"❌ Errore durante il reset database:\n```{error}```",
+                ephemeral=True
+            )
+            return
+
+        guild = interaction.guild
+        registered_role = guild.get_role(RESET_TOTAL_REGISTERED_ROLE_ID) if guild else None
+        request_role = guild.get_role(RESET_TOTAL_REQUEST_ROLE_ID) if guild else None
+
+        updated = 0
+        role_errors = 0
+
+        if guild and registered_role and request_role:
+            try:
+                async for member in guild.fetch_members(limit=None):
+                    try:
+                        member_roles = [r.id for r in getattr(member, "roles", [])]
+                        if RESET_TOTAL_REGISTERED_ROLE_ID in member_roles:
+                            await member.remove_roles(registered_role, reason="Reset totale campionato")
+                            if RESET_TOTAL_REQUEST_ROLE_ID not in member_roles:
+                                await member.add_roles(request_role, reason="Reset totale campionato")
+                            updated += 1
+                            await asyncio.sleep(0.2)
+                    except Exception as e:
+                        role_errors += 1
+                        print(f"[RESET TOTALE RUOLI] Errore su {member}: {e}")
+            except Exception as e:
+                role_errors += 1
+                print(f"[RESET TOTALE RUOLI] Errore fetch membri: {e}")
+
+        else:
+            role_errors += 1
+            print("[RESET TOTALE RUOLI] Ruoli non trovati o guild non disponibile.")
+
+        embed = discord.Embed(
+            title="✅ Reset totale completato",
+            description=(
+                "Database resettato completamente.\n"
+                "Squadre, rose, iscrizioni, mercato, competizioni, partite, classifiche e tabelloni sono stati azzerati.\n\n"
+                f"👥 Player aggiornati da **ISCRITTO** a **RICHIESTA ISCRIZIONE**: **{updated}**\n"
+                f"⚠️ Errori ruoli: **{role_errors}**"
+            ),
+            color=discord.Color.green()
+        )
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+        try:
+            await send_staff_log(
+                interaction.guild,
+                "⚠️ Reset totale eseguito",
+                (
+                    f"Eseguito da {interaction.user.mention}\n"
+                    f"Player ruoli aggiornati: **{updated}**\n"
+                    f"Errori ruoli: **{role_errors}**"
+                ),
+                user=interaction.user,
+                color=discord.Color.red()
+            )
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Annulla", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def cancel_reset_total(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="❌ Reset totale annullato.",
+            embed=None,
+            view=None
+        )
+
+
+@tree.command(name="reset_totale", description="Reset totale database e ruoli iscrizione")
+async def reset_totale(interaction: discord.Interaction):
+    if not can_use_dangerous_commands(interaction.user):
+        await interaction.response.send_message("❌ Non hai i permessi per usare questo comando.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="⚠️ Conferma reset totale",
+        description=(
+            "Questa azione cancella/resetta:\n"
+            "• squadre assegnate\n"
+            "• rose player\n"
+            "• iscrizioni\n"
+            "• mercato, aste e scambi\n"
+            "• campionati, coppe, partite, risultati, classifiche e tabelloni\n\n"
+            "Inoltre rimuove il ruolo **ISCRITTO** `1398332847655358554` "
+            "e assegna **RICHIESTA ISCRIZIONE** `1398323695558332604` ai player iscritti.\n\n"
+            "**Operazione irreversibile: fai prima un backup.**"
+        ),
+        color=discord.Color.red()
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=ConfirmResetTotaleView(),
+        ephemeral=True
+    )
+
+# ===========================================================
+
 bot.run(TOKEN)
