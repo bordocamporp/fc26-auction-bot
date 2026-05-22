@@ -12455,12 +12455,15 @@ def reset_total_database_state():
                 sold_price = NULL
         """)
 
-        # Reset manager, ma mantiene i record per evitare errori su utenti già noti.
-        cur.execute("""
-            UPDATE managers
-            SET club_name = NULL,
-                budget = %s
-        """, (DEFAULT_BUDGET,))
+        # Reset completo managers/iscritti anche lato sito.
+        # Dopo il reset nessun player deve risultare iscritto sul sito.
+        cur.execute("DELETE FROM managers")
+
+        # Elimina anche eventuali assegnazioni squadre reali.
+        try:
+            cur.execute("DELETE FROM real_team_assignments")
+        except Exception:
+            pass
 
         # Libera tutti i club.
         cur.execute("""
