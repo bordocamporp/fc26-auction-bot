@@ -545,6 +545,15 @@ def ensure_extra_tables():
     except Exception:
         pass
 
+    try:
+        cur.execute("ALTER TABLE managers ADD COLUMN IF NOT EXISTS discord_tag TEXT")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE managers ADD COLUMN IF NOT EXISTS username TEXT")
+    except Exception:
+        pass
+
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS bid_history (
@@ -1175,14 +1184,53 @@ def record_bid(auction_id, player_id, bidder_id, bidder_name, amount):
 
 
 def record_transfer(player_id, player_name, manager_id, manager_name, price, source="auction"):
+    """
+    Registra ogni movimento di mercato per il sito /mercato.
+
+    Questa tabella viene letta da Next.js:
+    - aste concluse
+    - scambi accettati
+    - trasferimenti manuali futuri
+
+    IMPORTANTE:
+    - non salva/mostra ID Discord nel sito;
+    - manager_id serve solo internamente;
+    - manager_name è il tag/nome pubblico da mostrare.
+    """
     conn = connect()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO transfer_history (player_id, player_name, manager_id, manager_name, price, source)
-        VALUES (%s, %s, %s, %s, %s, %s)
-    """, (str(player_id), player_name, str(manager_id), manager_name, int(price or 0), source))
-    conn.commit()
-    conn.close()
+    try:
+        cur.execute("""
+            INSERT INTO transfer_history (player_id, player_name, manager_id, manager_name, price, source)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (
+            str(player_id),
+            str(player_name or ""),
+            str(manager_id),
+            str(manager_name or manager_id),
+            int(price or 0),
+            str(source or "mercato")
+        ))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[MARKET HISTORY] Errore record_transfer: {e}")
+    finally:
+        conn.close()
+
+
+def record_player_owner_change_for_site(player_id, player_name, new_owner_id, new_owner_name, price=0, source="scambio"):
+    """
+    Helper usato dagli scambi: registra l'aggiornamento visibile nella pagina mercato.
+    """
+    record_transfer(
+        player_id=player_id,
+        player_name=player_name,
+        manager_id=new_owner_id,
+        manager_name=new_owner_name,
+        price=price,
+        source=source
+    )
 
 
 def is_blacklisted(player_id):
@@ -7956,6 +8004,9 @@ class TradeView(discord.ui.View):
         credits_to_target = safe_int(trade["credits_to_target"])
         credits_to_proposer = safe_int(trade["credits_to_proposer"])
 
+        offer_player_name = None
+        request_player_name = None
+
         if offer_player_id:
             cur.execute("SELECT name, owner_discord_id FROM players WHERE id = CAST(%s AS BIGINT)", (offer_player_id,))
             p = cur.fetchone()
@@ -7963,6 +8014,7 @@ class TradeView(discord.ui.View):
                 conn.close()
                 await interaction.response.send_message("Scambio non valido: il proponente non possiede più il giocatore offerto.", ephemeral=True)
                 return
+            offer_player_name = p["name"]
 
         if request_player_id:
             cur.execute("SELECT name, owner_discord_id FROM players WHERE id = CAST(%s AS BIGINT)", (request_player_id,))
@@ -7971,6 +8023,7 @@ class TradeView(discord.ui.View):
                 conn.close()
                 await interaction.response.send_message("Scambio non valido: non possiedi più il giocatore richiesto.", ephemeral=True)
                 return
+            request_player_name = p["name"]
 
         cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (proposer_id,))
         proposer = cur.fetchone()
@@ -8012,6 +8065,31 @@ class TradeView(discord.ui.View):
         cur.execute("UPDATE trade_offers SET status = 'accepted' WHERE id = %s", (self.trade_id,))
         conn.commit()
         conn.close()
+
+        # Aggiorna la pagina mercato del sito:
+        # ogni giocatore che cambia proprietario viene registrato in transfer_history.
+        try:
+            if offer_player_id:
+                record_player_owner_change_for_site(
+                    offer_player_id,
+                    offer_player_name,
+                    target_id,
+                    trade.get("target_name") or str(target_id),
+                    credits_to_proposer,
+                    source="scambio"
+                )
+
+            if request_player_id:
+                record_player_owner_change_for_site(
+                    request_player_id,
+                    request_player_name,
+                    proposer_id,
+                    trade.get("proposer_name") or str(proposer_id),
+                    credits_to_target,
+                    source="scambio"
+                )
+        except Exception as e:
+            print(f"[MARKET HISTORY] Errore registrazione scambio per sito: {e}")
 
         summary = format_trade_summary_for_message(
             self.trade_id,
