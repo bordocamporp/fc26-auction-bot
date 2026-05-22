@@ -7509,7 +7509,7 @@ def fetch_player_by_id(player_id):
     return row
 
 
-def make_trade_embed(trade_id, proposer_id, target_id, request_player_id, offer_player_id=None, credits_to_target=0, title="🔁 Nuova proposta di scambio"):
+def make_trade_embed(trade_id, proposer_id, target_id, request_player_id, offer_player_id=None, credits_to_target=0, credits_to_proposer=0, title="🔁 Nuova proposta di scambio"):
     proposer = fetch_manager_info(proposer_id)
     target = fetch_manager_info(target_id)
     requested = fetch_player_by_id(request_player_id)
@@ -7541,10 +7541,16 @@ def make_trade_embed(trade_id, proposer_id, target_id, request_player_id, offer_
         inline=False
     )
     embed.add_field(
-        name="💰 Budget offerto",
+        name="💰 Budget al destinatario",
         value=f"**{safe_int(credits_to_target)} crediti**",
         inline=True
     )
+    if safe_int(credits_to_proposer) > 0:
+        embed.add_field(
+            name="💰 Budget al proponente",
+            value=f"**{safe_int(credits_to_proposer)} crediti**",
+            inline=True
+        )
     embed.set_footer(text="Il destinatario può accettare, rifiutare o fare una controfferta.")
     return embed
 
@@ -7610,7 +7616,7 @@ async def send_trade_history_log(guild, title, summary, *, color=None):
         print(f"[TRADE LOG] Errore invio storico scambio: {e}")
 
 
-async def post_trade_offer(interaction, trade_id, proposer_id, target_id, request_player_id, offer_player_id, credits_to_target, *, title="🔁 Nuova proposta di scambio"):
+async def post_trade_offer(interaction, trade_id, proposer_id, target_id, request_player_id, offer_player_id, credits_to_target, credits_to_proposer=0, *, title="🔁 Nuova proposta di scambio"):
     embed = make_trade_embed(
         trade_id,
         proposer_id,
@@ -7618,6 +7624,7 @@ async def post_trade_offer(interaction, trade_id, proposer_id, target_id, reques
         request_player_id,
         offer_player_id,
         credits_to_target,
+        credits_to_proposer,
         title=title
     )
 
@@ -7929,28 +7936,73 @@ class CounterOfferModal(discord.ui.Modal, title="Controfferta"):
             await interaction.followup.send("Il proponente non ha abbastanza budget per questa controfferta.", ephemeral=True)
             return
 
+        # La controfferta ribalta il turno:
+        # - chi riceveva la prima proposta diventa proponente della controfferta;
+        # - chi aveva aperto lo scambio diventa destinatario e sarà l'unico a poter ACCETTARE/RIFIUTARE/CONTROFFERTA.
+        old_proposer_id = str(trade['proposer_id'])
+        old_target_id = str(trade['target_id'])
+        old_proposer_name = trade.get('proposer_name') or old_proposer_id
+        old_target_name = trade.get('target_name') or old_target_id
+        old_requested_player_id = trade['request_player_id']
+
         cur.execute("""
             UPDATE trade_offers
-            SET offer_player_id = %s,
-                credits_to_target = %s,
-                credits_to_proposer = 0,
+            SET proposer_id = %s,
+                proposer_name = %s,
+                target_id = %s,
+                target_name = %s,
+                offer_player_id = %s,
+                request_player_id = %s,
+                credits_to_target = 0,
+                credits_to_proposer = %s,
                 status = 'pending'
             WHERE id = %s
-        """, (self.selected_offer_player_id, credits, self.trade_id))
+        """, (
+            old_target_id,
+            old_target_name,
+            old_proposer_id,
+            old_proposer_name,
+            old_requested_player_id,
+            self.selected_offer_player_id,
+            credits,
+            self.trade_id
+        ))
         conn.commit()
         conn.close()
 
         await post_trade_offer(
             interaction,
             self.trade_id,
-            trade['proposer_id'],
-            trade['target_id'],
-            trade['request_player_id'],
+            old_target_id,
+            old_proposer_id,
             self.selected_offer_player_id,
+            old_requested_player_id,
+            0,
             credits,
             title="🔁 Controfferta proposta"
         )
-        await interaction.followup.send("✅ Controfferta pubblicata.", ephemeral=True)
+
+        summary = format_trade_summary_for_message(
+            self.trade_id,
+            old_target_id,
+            old_proposer_id,
+            self.selected_offer_player_id,
+            old_requested_player_id,
+            0,
+            credits
+        )
+        for user_id in {old_proposer_id, old_target_id}:
+            try:
+                user = await bot.fetch_user(int(user_id))
+                await user.send(
+                    f"🔁 **È stata proposta una controfferta.**\n\n"
+                    f"{summary}\n\n"
+                    "Solo il destinatario della controfferta può rispondere dai pulsanti nel canale scambi/aste."
+                )
+            except Exception:
+                pass
+        await send_trade_history_log(interaction.guild, "🔁 Controfferta proposta", summary, color=discord.Color.orange())
+        await interaction.followup.send("✅ Controfferta pubblicata. Ora può rispondere solo il destinatario della controfferta.", ephemeral=True)
 
 
 class CounterOfferPlayerSelect(discord.ui.Select):
