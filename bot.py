@@ -12131,7 +12131,7 @@ async def classifiche_auto_sync_loop():
             await asyncio.to_thread(sync_all_site_competitions_now)
         except Exception as e:
             print(f"[CLASSIFICHE AUTO SYNC LOOP ERROR] {e}")
-        await asyncio.sleep(600)
+        await asyncio.sleep(1800)
 
 
 def get_user_competitions_for_classifica(discord_id):
@@ -12219,63 +12219,34 @@ def build_standings_embed(competition_type, competition_name):
     conn = connect()
     cur = conn.cursor()
     cur.execute("""
-        SELECT *
+        SELECT club_name, played, points
         FROM standings
         WHERE competition_type = %s
           AND competition_name = %s
-        ORDER BY points DESC, (goals_for - goals_against) DESC, goals_for DESC, club_name ASC
+        ORDER BY points DESC, played ASC, club_name ASC
     """, (competition_type, competition_name))
     rows = cur.fetchall()
     conn.close()
 
     embed = discord.Embed(
         title=f"📊 Classifica — {competition_name}",
-        description=f"Tipo: **{competition_type}**",
         color=discord.Color.green()
     )
 
     if not rows:
-        embed.add_field(name="Classifica", value="Nessun dato disponibile.", inline=False)
+        embed.description = "Nessun dato disponibile."
     else:
         lines = []
         for i, r in enumerate(rows, start=1):
-            gf = safe_int(r.get("goals_for"))
-            ga = safe_int(r.get("goals_against"))
-            gd = gf - ga
-            lines.append(
-                f"**{i}. {r.get('club_name')}** — **{safe_int(r.get('points'))} pt** | "
-                f"{safe_int(r.get('played'))} PG | {safe_int(r.get('wins'))}V "
-                f"{safe_int(r.get('draws'))}N {safe_int(r.get('losses'))}P | "
-                f"GF {gf} GA {ga} DR {gd:+d}"
-            )
+            club = str(r.get("club_name") or "Club")
+            played = safe_int(r.get("played"))
+            points = safe_int(r.get("points"))
+            lines.append(f"**{i}. {club}**  |  PG **{played}**  |  PT **{points}**")
 
-        chunk = ""
-        field_index = 1
-        for line in lines:
-            if len(chunk) + len(line) + 1 > 1000:
-                embed.add_field(
-                    name="Classifica" if field_index == 1 else f"Classifica {field_index}",
-                    value=chunk,
-                    inline=False
-                )
-                field_index += 1
-                chunk = line
-            else:
-                chunk = f"{chunk}\\n{line}".strip()
-        if chunk:
-            embed.add_field(
-                name="Classifica" if field_index == 1 else f"Classifica {field_index}",
-                value=chunk,
-                inline=False
-            )
+        embed.description = "\n".join(lines[:30])
 
-    embed.add_field(
-        name="🌐 Classifiche complete",
-        value=f"Per vedere tutte le classifiche entra su {CLASSIFICHE_URL}",
-        inline=False
-    )
+    embed.set_footer(text=f"Per vedere tutte le classifiche entra su {CLASSIFICHE_URL}")
     return embed
-
 
 def build_bracket_embed(competition_name):
     conn = connect()
@@ -12346,11 +12317,6 @@ class ClassificaSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         await safe_defer(interaction, ephemeral=True, thinking=True)
 
-        try:
-            await asyncio.to_thread(sync_all_site_competitions_now)
-        except Exception:
-            pass
-
         idx = safe_int(self.values[0])
         comp = self.competitions[idx]
 
@@ -12395,9 +12361,8 @@ async def classifica(interaction: discord.Interaction):
 
     try:
         await asyncio.to_thread(ensure_site_standings_columns)
-        await asyncio.to_thread(sync_all_site_competitions_now)
     except Exception as e:
-        print(f"[CLASSIFICA] Auto sync fallito: {e}")
+        print(f"[CLASSIFICA] Migrazione classifiche fallita: {e}")
 
     competitions = get_user_competitions_for_classifica(interaction.user.id)
 
@@ -12410,10 +12375,7 @@ async def classifica(interaction: discord.Interaction):
 
     embed = discord.Embed(
         title="📊 Le tue competizioni",
-        description=(
-            "Scegli dal menu la competizione da visualizzare.\n"
-            "Vedrai la classifica completa oppure il tabellone della coppa."
-        ),
+        description="Scegli la competizione dal menu.",
         color=discord.Color.green()
     )
     embed.set_footer(text=f"Pagina 1/{max(1, (len(competitions) - 1) // 25 + 1)}")
