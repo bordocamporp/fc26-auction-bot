@@ -12013,9 +12013,94 @@ CLASSIFICHE_URL = "https://www.bordocampobc.com/torneo/classifiche"
 _classifiche_auto_sync_task_started = False
 
 
+
+def ensure_site_standings_columns():
+    """Migrazione sicura: aggiunge le colonne mancanti alle tabelle sito/classifiche."""
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS standings (
+                id SERIAL PRIMARY KEY,
+                competition_name TEXT,
+                competition_type TEXT,
+                club_name TEXT,
+                logo_url TEXT,
+                played INTEGER DEFAULT 0,
+                wins INTEGER DEFAULT 0,
+                draws INTEGER DEFAULT 0,
+                losses INTEGER DEFAULT 0,
+                goals_for INTEGER DEFAULT 0,
+                goals_against INTEGER DEFAULT 0,
+                points INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        for sql in [
+            "ALTER TABLE standings ADD COLUMN IF NOT EXISTS competition_name TEXT",
+            "ALTER TABLE standings ADD COLUMN IF NOT EXISTS competition_type TEXT",
+            "ALTER TABLE standings ADD COLUMN IF NOT EXISTS club_name TEXT",
+            "ALTER TABLE standings ADD COLUMN IF NOT EXISTS logo_url TEXT",
+            "ALTER TABLE standings ADD COLUMN IF NOT EXISTS played INTEGER DEFAULT 0",
+            "ALTER TABLE standings ADD COLUMN IF NOT EXISTS wins INTEGER DEFAULT 0",
+            "ALTER TABLE standings ADD COLUMN IF NOT EXISTS draws INTEGER DEFAULT 0",
+            "ALTER TABLE standings ADD COLUMN IF NOT EXISTS losses INTEGER DEFAULT 0",
+            "ALTER TABLE standings ADD COLUMN IF NOT EXISTS goals_for INTEGER DEFAULT 0",
+            "ALTER TABLE standings ADD COLUMN IF NOT EXISTS goals_against INTEGER DEFAULT 0",
+            "ALTER TABLE standings ADD COLUMN IF NOT EXISTS points INTEGER DEFAULT 0",
+            "ALTER TABLE standings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        ]:
+            cur.execute(sql)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cup_matches (
+                id SERIAL PRIMARY KEY,
+                source_table TEXT,
+                source_match_id TEXT,
+                competition_name TEXT,
+                round TEXT,
+                home_team TEXT,
+                away_team TEXT,
+                home_score INTEGER DEFAULT 0,
+                away_score INTEGER DEFAULT 0,
+                winner TEXT,
+                status TEXT DEFAULT 'played',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        for sql in [
+            "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS source_table TEXT",
+            "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS source_match_id TEXT",
+            "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS competition_name TEXT",
+            'ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS "round" TEXT',
+            "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS home_team TEXT",
+            "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS away_team TEXT",
+            "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS home_score INTEGER DEFAULT 0",
+            "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS away_score INTEGER DEFAULT 0",
+            "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS winner TEXT",
+            "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'played'",
+            "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE cup_matches ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        ]:
+            cur.execute(sql)
+
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        print(f"[SITE MIGRATION] Errore colonne classifiche: {e}")
+        return False
+    finally:
+        conn.close()
+
+
 def sync_all_site_competitions_now():
     """Aggiorna automaticamente classifiche/tabelloni leggendo i risultati confermati."""
     try:
+        ensure_site_standings_columns()
         conn = connect()
         cur = conn.cursor()
         cur.execute("""
@@ -12309,6 +12394,7 @@ async def classifica(interaction: discord.Interaction):
     await safe_defer(interaction, ephemeral=True, thinking=True)
 
     try:
+        await asyncio.to_thread(ensure_site_standings_columns)
         await asyncio.to_thread(sync_all_site_competitions_now)
     except Exception as e:
         print(f"[CLASSIFICA] Auto sync fallito: {e}")
