@@ -7512,6 +7512,56 @@ async def notify_trade_dm(target_id, request_player_name):
         pass
 
 
+def format_trade_summary_for_message(trade_id, proposer_id, target_id, request_player_id, offer_player_id=None, credits_to_target=0, credits_to_proposer=0):
+    proposer = fetch_manager_info(proposer_id)
+    target = fetch_manager_info(target_id)
+    requested = fetch_player_by_id(request_player_id)
+    offered = fetch_player_by_id(offer_player_id) if offer_player_id else None
+
+    proposer_club = proposer['club_name'] if proposer else 'Club non impostato'
+    target_club = target['club_name'] if target else 'Club non impostato'
+    requested_name = requested['name'] if requested else str(request_player_id)
+    offered_name = offered['name'] if offered else 'Nessun giocatore'
+
+    return (
+        f"ID scambio: **{trade_id}**\n"
+        f"📤 Proponente: <@{proposer_id}> — **{proposer_club}**\n"
+        f"📥 Destinatario: <@{target_id}> — **{target_club}**\n\n"
+        f"🎯 Giocatore passato al proponente: **{requested_name}**\n"
+        f"🔄 Giocatore passato al destinatario: **{offered_name}**\n"
+        f"💰 Crediti al destinatario: **{safe_int(credits_to_target)}**\n"
+        f"💰 Crediti al proponente: **{safe_int(credits_to_proposer)}**"
+    )
+
+
+async def notify_trade_completed(proposer_id, target_id, summary):
+    for user_id in {str(proposer_id), str(target_id)}:
+        try:
+            user = await bot.fetch_user(int(user_id))
+            await user.send(f"✅ **Scambio accettato e completato!**\n\n{summary}")
+        except Exception:
+            pass
+
+
+async def send_trade_history_log(guild, title, summary, *, color=None):
+    try:
+        channel = None
+        if guild:
+            channel = guild.get_channel(int(AUCTION_LOG_CHANNEL_ID))
+        if not channel:
+            channel = await bot.fetch_channel(int(AUCTION_LOG_CHANNEL_ID))
+
+        embed = discord.Embed(
+            title=title,
+            description=summary,
+            color=color or discord.Color.green()
+        )
+        embed.set_footer(text="FC26 • Storico aste e scambi")
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"[TRADE LOG] Errore invio storico scambio: {e}")
+
+
 async def post_trade_offer(interaction, trade_id, proposer_id, target_id, request_player_id, offer_player_id, credits_to_target, *, title="🔁 Nuova proposta di scambio"):
     embed = make_trade_embed(
         trade_id,
@@ -7737,47 +7787,59 @@ class TradeBudgetModal(discord.ui.Modal, title="Budget offerto"):
         self.offer_player_id = str(offer_player_id) if offer_player_id else None
 
     async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except Exception as e:
+            print(f"[TRADE MODAL] Defer non riuscito: {e}")
+
         raw_budget = str(self.budget.value).strip()
         if not raw_budget.isdigit():
-            await interaction.response.send_message("Il budget deve essere un numero intero.", ephemeral=True)
+            await interaction.followup.send("Il budget deve essere un numero intero.", ephemeral=True)
             return
         credits = int(raw_budget)
 
         if not self.offer_player_id and credits <= 0:
-            await interaction.response.send_message("Devi offrire almeno un giocatore o un budget maggiore di 0.", ephemeral=True)
+            await interaction.followup.send("Devi offrire almeno un giocatore o un budget maggiore di 0.", ephemeral=True)
             return
 
         proposer = fetch_manager_info(self.proposer_id)
         if not proposer:
-            await interaction.response.send_message("Non sei registrato come manager.", ephemeral=True)
+            await interaction.followup.send("Non sei registrato come manager.", ephemeral=True)
             return
         if safe_int(proposer['budget']) < credits:
-            await interaction.response.send_message("Budget insufficiente.", ephemeral=True)
+            await interaction.followup.send("Budget insufficiente.", ephemeral=True)
             return
 
         conn = connect()
         cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO trade_offers
-            (proposer_id, proposer_name, target_id, target_name, offer_player_id, request_player_id, credits_to_target, credits_to_proposer, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 0, 'pending')
-            RETURNING id
-        """, (
-            self.proposer_id,
-            interaction.user.display_name,
-            self.target_id,
-            str(self.target_id),
-            self.offer_player_id,
-            self.request_player_id,
-            credits
-        ))
-        row = cur.fetchone()
-        trade_id = row['id'] if isinstance(row, dict) or hasattr(row, 'get') else row[0]
-        conn.commit()
-        conn.close()
+        try:
+            cur.execute("""
+                INSERT INTO trade_offers
+                (proposer_id, proposer_name, target_id, target_name, offer_player_id, request_player_id, credits_to_target, credits_to_proposer, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 0, 'pending')
+                RETURNING id
+            """, (
+                self.proposer_id,
+                interaction.user.display_name,
+                self.target_id,
+                str(self.target_id),
+                self.offer_player_id,
+                self.request_player_id,
+                credits
+            ))
+            row = cur.fetchone()
+            trade_id = row['id'] if isinstance(row, dict) or hasattr(row, 'get') else row[0]
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"[TRADE MODAL] Errore creazione offerta: {e}")
+            await interaction.followup.send("❌ Errore durante la creazione dell'offerta. Riprova.", ephemeral=True)
+            return
+        finally:
+            conn.close()
 
         await post_trade_offer(interaction, trade_id, self.proposer_id, self.target_id, self.request_player_id, self.offer_player_id, credits)
-        await interaction.response.send_message("✅ Offerta inviata nel canale scambi/aste.", ephemeral=True)
+        await interaction.followup.send("✅ Offerta inviata nel canale scambi/aste.", ephemeral=True)
 
 
 class CounterOfferModal(discord.ui.Modal, title="Controfferta"):
@@ -7789,9 +7851,14 @@ class CounterOfferModal(discord.ui.Modal, title="Controfferta"):
         self.selected_offer_player_id = None if selected_offer_player_id == "none" else str(selected_offer_player_id)
 
     async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except Exception as e:
+            print(f"[COUNTER MODAL] Defer non riuscito: {e}")
+
         raw_budget = str(self.budget.value).strip()
         if not raw_budget.isdigit():
-            await interaction.response.send_message("Il budget deve essere un numero intero.", ephemeral=True)
+            await interaction.followup.send("Il budget deve essere un numero intero.", ephemeral=True)
             return
         credits = int(raw_budget)
 
@@ -7801,17 +7868,17 @@ class CounterOfferModal(discord.ui.Modal, title="Controfferta"):
         trade = cur.fetchone()
         if not trade:
             conn.close()
-            await interaction.response.send_message("Scambio non trovato o già concluso.", ephemeral=True)
+            await interaction.followup.send("Scambio non trovato o già concluso.", ephemeral=True)
             return
         if str(interaction.user.id) != str(trade['target_id']):
             conn.close()
-            await interaction.response.send_message("Solo il destinatario può fare una controfferta.", ephemeral=True)
+            await interaction.followup.send("Solo il destinatario può fare una controfferta.", ephemeral=True)
             return
 
         proposer = fetch_manager_info(trade['proposer_id'])
         if proposer and safe_int(proposer['budget']) < credits:
             conn.close()
-            await interaction.response.send_message("Il proponente non ha abbastanza budget per questa controfferta.", ephemeral=True)
+            await interaction.followup.send("Il proponente non ha abbastanza budget per questa controfferta.", ephemeral=True)
             return
 
         cur.execute("""
@@ -7835,7 +7902,7 @@ class CounterOfferModal(discord.ui.Modal, title="Controfferta"):
             credits,
             title="🔁 Controfferta proposta"
         )
-        await interaction.response.send_message("✅ Controfferta pubblicata.", ephemeral=True)
+        await interaction.followup.send("✅ Controfferta pubblicata.", ephemeral=True)
 
 
 class CounterOfferPlayerSelect(discord.ui.Select):
@@ -7946,7 +8013,28 @@ class TradeView(discord.ui.View):
         conn.commit()
         conn.close()
 
-        await interaction.response.edit_message(content="✅ Scambio accettato e completato.", embed=None, view=None)
+        summary = format_trade_summary_for_message(
+            self.trade_id,
+            proposer_id,
+            target_id,
+            request_player_id,
+            offer_player_id,
+            credits_to_target,
+            credits_to_proposer
+        )
+
+        await interaction.response.edit_message(
+            content="✅ Scambio accettato e completato.",
+            embed=None,
+            view=None
+        )
+        await notify_trade_completed(proposer_id, target_id, summary)
+        await send_trade_history_log(
+            interaction.guild,
+            "✅ Scambio accettato",
+            summary,
+            color=discord.Color.green()
+        )
 
     @discord.ui.button(label="RIFIUTA", style=discord.ButtonStyle.danger)
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
