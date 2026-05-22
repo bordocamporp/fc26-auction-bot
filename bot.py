@@ -6580,6 +6580,276 @@ async def rosa(interaction: discord.Interaction):
 
 
 
+def split_discord_text(text, limit=1000):
+    """Divide un testo in parti compatibili con i limiti dei field Embed di Discord."""
+    text = str(text or "").strip()
+    if not text:
+        return []
+
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(text[:cut].strip())
+        text = text[cut:].strip()
+
+    if text:
+        chunks.append(text)
+
+    return chunks
+
+
+class RoseCampionatoSelect(discord.ui.Select):
+    def __init__(self, campionati):
+        options = []
+        for campionato in campionati[:25]:
+            name = campionato["name"]
+            club_count = campionato.get("club_count", 0) if hasattr(campionato, "get") else 0
+            options.append(
+                discord.SelectOption(
+                    label=str(name)[:100],
+                    value=str(name),
+                    description=f"Club iscritti: {club_count}"[:100]
+                )
+            )
+
+        super().__init__(
+            placeholder="Scegli il campionato...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="rose_select_campionato"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        campionato = self.values[0]
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                c.name,
+                c.assigned_to,
+                COALESCE(m.name, m.manager_name, c.assigned_to) AS manager_name,
+                COALESCE(m.budget, 0) AS budget,
+                COUNT(p.id) AS player_count
+            FROM fc26_clubs c
+            LEFT JOIN managers m ON m.discord_id = c.assigned_to
+            LEFT JOIN players p ON p.owner_discord_id = c.assigned_to
+            WHERE LOWER(COALESCE(c.league, 'Senza campionato')) = LOWER(%s)
+              AND c.assigned_to IS NOT NULL
+              AND TRIM(c.assigned_to) != ''
+            GROUP BY c.name, c.assigned_to, COALESCE(m.name, m.manager_name, c.assigned_to), COALESCE(m.budget, 0)
+            ORDER BY c.name ASC
+        """, (campionato,))
+        clubs = cur.fetchall()
+        conn.close()
+
+        if not clubs:
+            await interaction.response.send_message(
+                "Nessun club iscritto trovato per questo campionato.",
+                ephemeral=True
+            )
+            return
+
+        preview = []
+        for club in clubs[:15]:
+            preview.append(
+                f"• **{club['name']}** — Manager: **{club['manager_name']}** — {club['player_count']} giocatori"
+            )
+
+        embed = discord.Embed(
+            title=f"🏆 {campionato}",
+            description="Scegli un club iscritto per vedere la rosa completa.",
+            color=discord.Color.green()
+        )
+        embed.add_field(
+            name="Club iscritti",
+            value="\n".join(preview) if preview else "Nessun club disponibile.",
+            inline=False
+        )
+        if len(clubs) > 25:
+            embed.set_footer(text="Mostro solo i primi 25 club nella tendina per limite Discord.")
+
+        await interaction.response.edit_message(
+            embed=embed,
+            view=RoseClubView(campionato, clubs)
+        )
+
+
+class RoseClubSelect(discord.ui.Select):
+    def __init__(self, campionato, clubs):
+        self.campionato = campionato
+        options = []
+
+        for club in clubs[:25]:
+            options.append(
+                discord.SelectOption(
+                    label=str(club["name"])[:100],
+                    value=str(club["assigned_to"]),
+                    description=f"{club['manager_name']} • {club['player_count']} giocatori"[:100]
+                )
+            )
+
+        super().__init__(
+            placeholder="Scegli il club iscritto...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="rose_select_club"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        owner_id = self.values[0]
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                COALESCE(m.name, m.manager_name, m.discord_id) AS manager_name,
+                COALESCE(m.club_name, r.team_name, fc.name) AS club_name,
+                COALESCE(m.budget, 0) AS budget
+            FROM managers m
+            LEFT JOIN real_team_assignments r ON r.discord_id = m.discord_id
+            LEFT JOIN fc26_clubs fc ON fc.assigned_to = m.discord_id
+            WHERE m.discord_id = %s
+            LIMIT 1
+        """, (str(owner_id),))
+        manager = cur.fetchone()
+
+        cur.execute("""
+            SELECT name, team, position, overall, sold_price
+            FROM players
+            WHERE owner_discord_id = %s
+            ORDER BY
+                CASE
+                    WHEN UPPER(position) IN ('GK', 'POR') THEN 1
+                    WHEN UPPER(position) IN ('CB','LB','RB','LWB','RWB','DC','TS','TD','DIF') THEN 2
+                    WHEN UPPER(position) IN ('CDM','CM','CAM','LM','RM','MCO','CDC','CC','CEN') THEN 3
+                    WHEN UPPER(position) IN ('ST','CF','LW','RW','LF','RF','ATT','AS','AD','P') THEN 4
+                    ELSE 5
+                END,
+                overall DESC NULLS LAST,
+                name ASC
+        """, (str(owner_id),))
+        players = cur.fetchall()
+        conn.close()
+
+        if not manager:
+            await interaction.response.send_message("Manager non trovato.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title=f"📋 Rosa {manager['club_name'] or manager['manager_name']}",
+            description=(
+                f"Manager: **{manager['manager_name']}**\n"
+                f"Giocatori: **{len(players)}**\n"
+                f"Budget residuo: **{manager['budget']} crediti**"
+            ),
+            color=discord.Color.green() if players else discord.Color.dark_grey()
+        )
+
+        if not players:
+            embed.add_field(name="Giocatori", value="Questo club non ha giocatori assegnati.", inline=False)
+        else:
+            grouped = {
+                "🧤 Portieri": [],
+                "🛡️ Difensori": [],
+                "🎯 Centrocampisti": [],
+                "⚽ Attaccanti": [],
+                "📌 Altro": []
+            }
+
+            for p in players:
+                line = f"**{p['name']}** — {p['position']} • OVR {p['overall']} • {p['team']}"
+                group = role_group(p["position"])
+                if group == "GK":
+                    grouped["🧤 Portieri"].append(line)
+                elif group == "DEF":
+                    grouped["🛡️ Difensori"].append(line)
+                elif group == "MID":
+                    grouped["🎯 Centrocampisti"].append(line)
+                elif group == "ATT":
+                    grouped["⚽ Attaccanti"].append(line)
+                else:
+                    grouped["📌 Altro"].append(line)
+
+            for title, items in grouped.items():
+                if not items:
+                    continue
+                for index, chunk in enumerate(split_discord_text("\n".join(items), 1000), start=1):
+                    embed.add_field(
+                        name=title if index == 1 else f"{title} {index}",
+                        value=chunk,
+                        inline=False
+                    )
+
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class RoseCampionatoView(discord.ui.View):
+    def __init__(self, campionati):
+        super().__init__(timeout=180)
+        self.add_item(RoseCampionatoSelect(campionati))
+
+
+class RoseClubView(discord.ui.View):
+    def __init__(self, campionato, clubs):
+        super().__init__(timeout=180)
+        self.add_item(RoseClubSelect(campionato, clubs))
+
+
+@tree.command(name="rose", description="Mostra campionati, club iscritti e rose")
+async def rose(interaction: discord.Interaction):
+    if not is_rose_channel(interaction):
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            COALESCE(league, 'Senza campionato') AS name,
+            COUNT(*) AS club_count
+        FROM fc26_clubs
+        WHERE assigned_to IS NOT NULL
+          AND TRIM(assigned_to) != ''
+        GROUP BY COALESCE(league, 'Senza campionato')
+        ORDER BY COALESCE(league, 'Senza campionato') ASC
+    """)
+    campionati = cur.fetchall()
+    conn.close()
+
+    if not campionati:
+        await interaction.response.send_message("Nessun campionato con club iscritti trovato.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="📋 Rose campionati",
+        description="Scegli un campionato, poi un club iscritto. Verranno mostrati solo i club già assegnati/iscritti.",
+        color=discord.Color.green()
+    )
+
+    preview = [f"• **{c['name']}** — {c['club_count']} club iscritti" for c in campionati[:15]]
+    embed.add_field(name="Campionati", value="\n".join(preview), inline=False)
+    if len(campionati) > 25:
+        embed.set_footer(text="Mostro solo i primi 25 campionati nella tendina per limite Discord.")
+
+    await interaction.response.send_message(embed=embed, view=RoseCampionatoView(campionati), ephemeral=True)
+
+
+@tree.command(name="mia_squadra", description="Mostra direttamente la tua squadra")
+async def mia_squadra(interaction: discord.Interaction):
+    if not is_rose_channel(interaction):
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale ROSE.", ephemeral=True)
+        return
+
+    embed = build_roster_embed(interaction.user.id, interaction.user.display_name)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+
 
 @tree.command(name="mercato", description="Mostra giocatori liberi filtrabili")
 @app_commands.describe(ruolo="Ruolo, es. ST, CM, CB", overall_min="Overall minimo", overall_max="Overall massimo")
@@ -7110,12 +7380,491 @@ async def storico(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=StoricoView(managers), ephemeral=True)
 
 
+# ================= SISTEMA SCAMBI GUIDATO =================
+
+TRADE_PAGE_SIZE = 25
+
+
+def trade_player_line(player):
+    return f"**{player['name']}** — {player['position']} • OVR {player['overall']} • {player['team']}"
+
+
+def fetch_trade_managers(exclude_discord_id=None):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            m.discord_id,
+            COALESCE(m.name, m.manager_name, m.discord_id) AS manager_name,
+            COALESCE(m.club_name, r.team_name, c.name, 'Club non impostato') AS club_name,
+            COALESCE(m.budget, 0) AS budget
+        FROM managers m
+        LEFT JOIN real_team_assignments r ON r.discord_id = m.discord_id
+        LEFT JOIN fc26_clubs c ON c.assigned_to = m.discord_id
+        WHERE m.discord_id IS NOT NULL
+          AND m.discord_id != ''
+          AND (%s IS NULL OR m.discord_id != %s)
+        ORDER BY club_name ASC, manager_name ASC
+    """, (str(exclude_discord_id) if exclude_discord_id else None, str(exclude_discord_id) if exclude_discord_id else None))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def fetch_manager_info(discord_id):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            m.discord_id,
+            COALESCE(m.name, m.manager_name, m.discord_id) AS manager_name,
+            COALESCE(m.club_name, r.team_name, c.name, 'Club non impostato') AS club_name,
+            COALESCE(m.budget, 0) AS budget
+        FROM managers m
+        LEFT JOIN real_team_assignments r ON r.discord_id = m.discord_id
+        LEFT JOIN fc26_clubs c ON c.assigned_to = m.discord_id
+        WHERE m.discord_id = %s
+        LIMIT 1
+    """, (str(discord_id),))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def fetch_roster_players(owner_id):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, name, team, position, overall, owner_discord_id, sold_price
+        FROM players
+        WHERE owner_discord_id = %s
+        ORDER BY overall DESC NULLS LAST, name ASC
+    """, (str(owner_id),))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def fetch_player_by_id(player_id):
+    if not player_id:
+        return None
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, name, team, position, overall, owner_discord_id
+        FROM players
+        WHERE id = CAST(%s AS BIGINT)
+        LIMIT 1
+    """, (str(player_id),))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def make_trade_embed(trade_id, proposer_id, target_id, request_player_id, offer_player_id=None, credits_to_target=0, title="🔁 Nuova proposta di scambio"):
+    proposer = fetch_manager_info(proposer_id)
+    target = fetch_manager_info(target_id)
+    requested = fetch_player_by_id(request_player_id)
+    offered = fetch_player_by_id(offer_player_id) if offer_player_id else None
+
+    proposer_name = proposer['manager_name'] if proposer else str(proposer_id)
+    proposer_club = proposer['club_name'] if proposer else 'Club non impostato'
+    target_name = target['manager_name'] if target else str(target_id)
+    target_club = target['club_name'] if target else 'Club non impostato'
+
+    embed = discord.Embed(
+        title=title,
+        description=(
+            f"Offerta ID: **{trade_id}**\n\n"
+            f"📤 Proponente: <@{proposer_id}> — **{proposer_club}**\n"
+            f"📥 Destinatario: <@{target_id}> — **{target_club}**"
+        ),
+        color=discord.Color.orange()
+    )
+
+    embed.add_field(
+        name="🎯 Giocatore richiesto",
+        value=trade_player_line(requested) if requested else "Giocatore non trovato",
+        inline=False
+    )
+    embed.add_field(
+        name="🔄 Giocatore offerto",
+        value=trade_player_line(offered) if offered else "Nessun giocatore offerto",
+        inline=False
+    )
+    embed.add_field(
+        name="💰 Budget offerto",
+        value=f"**{safe_int(credits_to_target)} crediti**",
+        inline=True
+    )
+    embed.set_footer(text="Il destinatario può accettare, rifiutare o fare una controfferta.")
+    return embed
+
+
+async def notify_trade_dm(target_id, request_player_name):
+    try:
+        user = await bot.fetch_user(int(target_id))
+        await user.send(
+            f"🔁 Ti è stata fatta un'offerta per **{request_player_name}**. "
+            f"Vai a vedere nel canale aste/scambi per accettare, rifiutare o fare una controfferta."
+        )
+    except Exception:
+        pass
+
+
+async def post_trade_offer(interaction, trade_id, proposer_id, target_id, request_player_id, offer_player_id, credits_to_target, *, title="🔁 Nuova proposta di scambio"):
+    embed = make_trade_embed(
+        trade_id,
+        proposer_id,
+        target_id,
+        request_player_id,
+        offer_player_id,
+        credits_to_target,
+        title=title
+    )
+
+    channel = None
+    for cid in (SCAMBI_CHANNEL_ID, AUCTION_CHANNEL_ID):
+        try:
+            channel = interaction.guild.get_channel(int(cid)) if interaction.guild else None
+            if not channel:
+                channel = await bot.fetch_channel(int(cid))
+            if channel:
+                break
+        except Exception:
+            channel = None
+
+    if channel:
+        await channel.send(embed=embed, view=TradeView(trade_id))
+
+    requested = fetch_player_by_id(request_player_id)
+    await notify_trade_dm(target_id, requested['name'] if requested else 'un tuo giocatore')
+
+
+class TradeManagerSelect(discord.ui.Select):
+    def __init__(self, managers, page=0):
+        self.managers = managers
+        self.page = page
+        start = page * TRADE_PAGE_SIZE
+        chunk = managers[start:start + TRADE_PAGE_SIZE]
+
+        options = []
+        for manager in chunk:
+            club = str(manager['club_name'] or 'Club non impostato')
+            name = str(manager['manager_name'] or manager['discord_id'])
+            options.append(discord.SelectOption(
+                label=f"@{name}"[:100],
+                description=f"Club: {club}"[:100],
+                value=str(manager['discord_id'])
+            ))
+
+        super().__init__(placeholder="Scegli il player/manager con cui trattare...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        target_id = self.values[0]
+        roster = fetch_roster_players(target_id)
+        target = fetch_manager_info(target_id)
+
+        if not roster:
+            await interaction.response.send_message("Questo player non ha giocatori in rosa.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title=f"🔁 Scambio con @{target['manager_name'] if target else target_id}",
+            description=(
+                f"Club: **{target['club_name'] if target else 'Club non impostato'}**\n"
+                "Scegli il giocatore che vuoi chiedere."
+            ),
+            color=discord.Color.blurple()
+        )
+        embed.add_field(
+            name="Rosa disponibile",
+            value="\n".join(f"• {trade_player_line(p)}" for p in roster[:15]),
+            inline=False
+        )
+        if len(roster) > 15:
+            embed.set_footer(text=f"Mostrati 15 giocatori su {len(roster)}. Nel menu li trovi tutti, divisi a pagine se necessario.")
+
+        await interaction.response.edit_message(embed=embed, view=TradeTargetPlayerView(interaction.user.id, target_id, roster, page=0))
+
+
+class TradeManagerView(discord.ui.View):
+    def __init__(self, requester_id, managers, page=0):
+        super().__init__(timeout=300)
+        self.requester_id = str(requester_id)
+        self.managers = managers
+        self.page = page
+        self.max_page = max(0, (len(managers) - 1) // TRADE_PAGE_SIZE)
+        self.add_item(TradeManagerSelect(managers, page))
+
+    @discord.ui.button(label="⬅️", style=discord.ButtonStyle.secondary)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.requester_id:
+            await interaction.response.send_message("Questo menu non è tuo.", ephemeral=True)
+            return
+        new_page = max(0, self.page - 1)
+        await interaction.response.edit_message(view=TradeManagerView(self.requester_id, self.managers, new_page))
+
+    @discord.ui.button(label="➡️", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.requester_id:
+            await interaction.response.send_message("Questo menu non è tuo.", ephemeral=True)
+            return
+        new_page = min(self.max_page, self.page + 1)
+        await interaction.response.edit_message(view=TradeManagerView(self.requester_id, self.managers, new_page))
+
+
+class TradeTargetPlayerSelect(discord.ui.Select):
+    def __init__(self, proposer_id, target_id, players, page=0):
+        self.proposer_id = str(proposer_id)
+        self.target_id = str(target_id)
+        self.players = players
+        self.page = page
+        chunk = players[page * TRADE_PAGE_SIZE:(page + 1) * TRADE_PAGE_SIZE]
+        options = [discord.SelectOption(
+            label=str(p['name'])[:100],
+            description=f"{p['position']} • OVR {p['overall']} • {p['team']}"[:100],
+            value=str(p['id'])
+        ) for p in chunk]
+        super().__init__(placeholder="Scegli il giocatore che vuoi dall'altra rosa...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.proposer_id:
+            await interaction.response.send_message("Questo menu non è tuo.", ephemeral=True)
+            return
+
+        request_player_id = self.values[0]
+        own_roster = fetch_roster_players(self.proposer_id)
+        if not own_roster:
+            await interaction.response.send_message("Non hai giocatori in rosa da usare per uno scambio.", ephemeral=True)
+            return
+
+        requested = fetch_player_by_id(request_player_id)
+        embed = discord.Embed(
+            title="🔁 Crea offerta",
+            description=(
+                f"Giocatore richiesto: **{requested['name'] if requested else request_player_id}**\n\n"
+                "Ora scegli il giocatore da offrire oppure scegli **Nessun giocatore**. Dopo ti verrà chiesto il budget."
+            ),
+            color=discord.Color.orange()
+        )
+        await interaction.response.edit_message(embed=embed, view=TradeOwnPlayerView(self.proposer_id, self.target_id, request_player_id, own_roster, page=0))
+
+
+class TradeTargetPlayerView(discord.ui.View):
+    def __init__(self, proposer_id, target_id, players, page=0):
+        super().__init__(timeout=300)
+        self.proposer_id = str(proposer_id)
+        self.target_id = str(target_id)
+        self.players = players
+        self.page = page
+        self.max_page = max(0, (len(players) - 1) // TRADE_PAGE_SIZE)
+        self.add_item(TradeTargetPlayerSelect(proposer_id, target_id, players, page))
+
+    @discord.ui.button(label="⬅️", style=discord.ButtonStyle.secondary)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.proposer_id:
+            await interaction.response.send_message("Questo menu non è tuo.", ephemeral=True)
+            return
+        await interaction.response.edit_message(view=TradeTargetPlayerView(self.proposer_id, self.target_id, self.players, max(0, self.page - 1)))
+
+    @discord.ui.button(label="➡️", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.proposer_id:
+            await interaction.response.send_message("Questo menu non è tuo.", ephemeral=True)
+            return
+        await interaction.response.edit_message(view=TradeTargetPlayerView(self.proposer_id, self.target_id, self.players, min(self.max_page, self.page + 1)))
+
+
+class TradeOwnPlayerSelect(discord.ui.Select):
+    def __init__(self, proposer_id, target_id, request_player_id, players, page=0):
+        self.proposer_id = str(proposer_id)
+        self.target_id = str(target_id)
+        self.request_player_id = str(request_player_id)
+        self.players = players
+        self.page = page
+        chunk = players[page * (TRADE_PAGE_SIZE - 1):page * (TRADE_PAGE_SIZE - 1) + (TRADE_PAGE_SIZE - 1)]
+        options = [discord.SelectOption(label="Nessun giocatore", description="Offri solo budget", value="none")]
+        options.extend(discord.SelectOption(
+            label=str(p['name'])[:100],
+            description=f"{p['position']} • OVR {p['overall']} • {p['team']}"[:100],
+            value=str(p['id'])
+        ) for p in chunk)
+        super().__init__(placeholder="Scegli il tuo giocatore da offrire...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.proposer_id:
+            await interaction.response.send_message("Questo menu non è tuo.", ephemeral=True)
+            return
+        offer_player_id = None if self.values[0] == "none" else self.values[0]
+        await interaction.response.send_modal(TradeBudgetModal(self.proposer_id, self.target_id, self.request_player_id, offer_player_id))
+
+
+class TradeOwnPlayerView(discord.ui.View):
+    def __init__(self, proposer_id, target_id, request_player_id, players, page=0):
+        super().__init__(timeout=300)
+        self.proposer_id = str(proposer_id)
+        self.target_id = str(target_id)
+        self.request_player_id = str(request_player_id)
+        self.players = players
+        self.page = page
+        self.max_page = max(0, (len(players) - 1) // (TRADE_PAGE_SIZE - 1))
+        self.add_item(TradeOwnPlayerSelect(proposer_id, target_id, request_player_id, players, page))
+
+    @discord.ui.button(label="⬅️", style=discord.ButtonStyle.secondary)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.proposer_id:
+            await interaction.response.send_message("Questo menu non è tuo.", ephemeral=True)
+            return
+        await interaction.response.edit_message(view=TradeOwnPlayerView(self.proposer_id, self.target_id, self.request_player_id, self.players, max(0, self.page - 1)))
+
+    @discord.ui.button(label="➡️", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.proposer_id:
+            await interaction.response.send_message("Questo menu non è tuo.", ephemeral=True)
+            return
+        await interaction.response.edit_message(view=TradeOwnPlayerView(self.proposer_id, self.target_id, self.request_player_id, self.players, min(self.max_page, self.page + 1)))
+
+
+class TradeBudgetModal(discord.ui.Modal, title="Budget offerto"):
+    budget = discord.ui.TextInput(label="Budget da offrire", placeholder="Scrivi 0 se offri solo un giocatore", required=True, max_length=8)
+
+    def __init__(self, proposer_id, target_id, request_player_id, offer_player_id=None):
+        super().__init__()
+        self.proposer_id = str(proposer_id)
+        self.target_id = str(target_id)
+        self.request_player_id = str(request_player_id)
+        self.offer_player_id = str(offer_player_id) if offer_player_id else None
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw_budget = str(self.budget.value).strip()
+        if not raw_budget.isdigit():
+            await interaction.response.send_message("Il budget deve essere un numero intero.", ephemeral=True)
+            return
+        credits = int(raw_budget)
+
+        if not self.offer_player_id and credits <= 0:
+            await interaction.response.send_message("Devi offrire almeno un giocatore o un budget maggiore di 0.", ephemeral=True)
+            return
+
+        proposer = fetch_manager_info(self.proposer_id)
+        if not proposer:
+            await interaction.response.send_message("Non sei registrato come manager.", ephemeral=True)
+            return
+        if safe_int(proposer['budget']) < credits:
+            await interaction.response.send_message("Budget insufficiente.", ephemeral=True)
+            return
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO trade_offers
+            (proposer_id, proposer_name, target_id, target_name, offer_player_id, request_player_id, credits_to_target, credits_to_proposer, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 0, 'pending')
+            RETURNING id
+        """, (
+            self.proposer_id,
+            interaction.user.display_name,
+            self.target_id,
+            str(self.target_id),
+            self.offer_player_id,
+            self.request_player_id,
+            credits
+        ))
+        row = cur.fetchone()
+        trade_id = row['id'] if isinstance(row, dict) or hasattr(row, 'get') else row[0]
+        conn.commit()
+        conn.close()
+
+        await post_trade_offer(interaction, trade_id, self.proposer_id, self.target_id, self.request_player_id, self.offer_player_id, credits)
+        await interaction.response.send_message("✅ Offerta inviata nel canale scambi/aste.", ephemeral=True)
+
+
+class CounterOfferModal(discord.ui.Modal, title="Controfferta"):
+    budget = discord.ui.TextInput(label="Budget richiesto", placeholder="Esempio: 50 oppure 0", required=True, max_length=8)
+
+    def __init__(self, trade_id, selected_offer_player_id):
+        super().__init__()
+        self.trade_id = int(trade_id)
+        self.selected_offer_player_id = None if selected_offer_player_id == "none" else str(selected_offer_player_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw_budget = str(self.budget.value).strip()
+        if not raw_budget.isdigit():
+            await interaction.response.send_message("Il budget deve essere un numero intero.", ephemeral=True)
+            return
+        credits = int(raw_budget)
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM trade_offers WHERE id = %s AND status = 'pending'", (self.trade_id,))
+        trade = cur.fetchone()
+        if not trade:
+            conn.close()
+            await interaction.response.send_message("Scambio non trovato o già concluso.", ephemeral=True)
+            return
+        if str(interaction.user.id) != str(trade['target_id']):
+            conn.close()
+            await interaction.response.send_message("Solo il destinatario può fare una controfferta.", ephemeral=True)
+            return
+
+        proposer = fetch_manager_info(trade['proposer_id'])
+        if proposer and safe_int(proposer['budget']) < credits:
+            conn.close()
+            await interaction.response.send_message("Il proponente non ha abbastanza budget per questa controfferta.", ephemeral=True)
+            return
+
+        cur.execute("""
+            UPDATE trade_offers
+            SET offer_player_id = %s,
+                credits_to_target = %s,
+                credits_to_proposer = 0,
+                status = 'pending'
+            WHERE id = %s
+        """, (self.selected_offer_player_id, credits, self.trade_id))
+        conn.commit()
+        conn.close()
+
+        await post_trade_offer(
+            interaction,
+            self.trade_id,
+            trade['proposer_id'],
+            trade['target_id'],
+            trade['request_player_id'],
+            self.selected_offer_player_id,
+            credits,
+            title="🔁 Controfferta proposta"
+        )
+        await interaction.response.send_message("✅ Controfferta pubblicata.", ephemeral=True)
+
+
+class CounterOfferPlayerSelect(discord.ui.Select):
+    def __init__(self, trade_id, proposer_players):
+        self.trade_id = int(trade_id)
+        options = [discord.SelectOption(label="Nessun giocatore", description="Chiedo solo più budget", value="none")]
+        options.extend(discord.SelectOption(
+            label=str(p['name'])[:100],
+            description=f"{p['position']} • OVR {p['overall']} • {p['team']}"[:100],
+            value=str(p['id'])
+        ) for p in proposer_players[:24])
+        super().__init__(placeholder="Scegli il giocatore che vuoi chiedere in controfferta...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(CounterOfferModal(self.trade_id, self.values[0]))
+
+
+class CounterOfferView(discord.ui.View):
+    def __init__(self, trade_id, proposer_players):
+        super().__init__(timeout=180)
+        self.add_item(CounterOfferPlayerSelect(trade_id, proposer_players))
+
+
 class TradeView(discord.ui.View):
     def __init__(self, trade_id):
         super().__init__(timeout=86400)
         self.trade_id = trade_id
 
-    @discord.ui.button(label="Accetta", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="ACCETTA", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         conn = connect()
         cur = conn.cursor()
@@ -7140,7 +7889,6 @@ class TradeView(discord.ui.View):
         credits_to_target = safe_int(trade["credits_to_target"])
         credits_to_proposer = safe_int(trade["credits_to_proposer"])
 
-        # Validate players ownership.
         if offer_player_id:
             cur.execute("SELECT name, owner_discord_id FROM players WHERE id = CAST(%s AS BIGINT)", (offer_player_id,))
             p = cur.fetchone()
@@ -7157,7 +7905,6 @@ class TradeView(discord.ui.View):
                 await interaction.response.send_message("Scambio non valido: non possiedi più il giocatore richiesto.", ephemeral=True)
                 return
 
-        # Validate budgets.
         cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (proposer_id,))
         proposer = cur.fetchone()
         cur.execute("SELECT budget FROM managers WHERE discord_id = %s", (target_id,))
@@ -7168,19 +7915,18 @@ class TradeView(discord.ui.View):
             await interaction.response.send_message("Uno dei due utenti non è registrato.", ephemeral=True)
             return
 
-        if safe_int(proposer["budget"]) < credits_to_target:
+        tax_target = int((credits_to_target * MARKET_TAX) / 100)
+        tax_proposer = int((credits_to_proposer * MARKET_TAX) / 100)
+
+        if safe_int(proposer["budget"]) < credits_to_target + tax_target:
             conn.close()
             await interaction.response.send_message("Scambio non valido: il proponente non ha abbastanza crediti.", ephemeral=True)
             return
 
-        if safe_int(target["budget"]) < credits_to_proposer:
+        if safe_int(target["budget"]) < credits_to_proposer + tax_proposer:
             conn.close()
             await interaction.response.send_message("Scambio non valido: non hai abbastanza crediti.", ephemeral=True)
             return
-
-        # Money movements.
-        tax_target = int((credits_to_target * MARKET_TAX) / 100)
-        tax_proposer = int((credits_to_proposer * MARKET_TAX) / 100)
 
         if credits_to_target:
             cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (credits_to_target + tax_target, proposer_id))
@@ -7190,7 +7936,6 @@ class TradeView(discord.ui.View):
             cur.execute("UPDATE managers SET budget = budget - %s WHERE discord_id = %s", (credits_to_proposer + tax_proposer, target_id))
             cur.execute("UPDATE managers SET budget = budget + %s WHERE discord_id = %s", (credits_to_proposer, proposer_id))
 
-        # Player movements.
         if offer_player_id:
             cur.execute("UPDATE players SET owner_discord_id = %s WHERE id = CAST(%s AS BIGINT)", (target_id, offer_player_id))
 
@@ -7203,7 +7948,7 @@ class TradeView(discord.ui.View):
 
         await interaction.response.edit_message(content="✅ Scambio accettato e completato.", embed=None, view=None)
 
-    @discord.ui.button(label="Rifiuta", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="RIFIUTA", style=discord.ButtonStyle.danger)
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         conn = connect()
         cur = conn.cursor()
@@ -7227,6 +7972,64 @@ class TradeView(discord.ui.View):
 
         await interaction.response.edit_message(content="❌ Scambio rifiutato.", embed=None, view=None)
 
+    @discord.ui.button(label="CONTROFFERTA", style=discord.ButtonStyle.primary)
+    async def counter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM trade_offers WHERE id = %s AND status = 'pending'", (self.trade_id,))
+        trade = cur.fetchone()
+        conn.close()
+
+        if not trade:
+            await interaction.response.send_message("Scambio non trovato o già concluso.", ephemeral=True)
+            return
+        if str(interaction.user.id) != str(trade['target_id']):
+            await interaction.response.send_message("Solo il destinatario può fare una controfferta.", ephemeral=True)
+            return
+
+        proposer_players = fetch_roster_players(trade['proposer_id'])
+        if not proposer_players:
+            await interaction.response.send_message("Il proponente non ha giocatori in rosa. Puoi chiedere solo budget scegliendo Nessun giocatore.", ephemeral=True)
+            proposer_players = []
+
+        await interaction.response.send_message(
+            "Scegli il giocatore che vuoi chiedere nella controfferta, poi inserisci il budget richiesto.",
+            view=CounterOfferView(self.trade_id, proposer_players),
+            ephemeral=True
+        )
+
+
+@tree.command(name="scambi", description="Crea una proposta di scambio guidata")
+async def scambi(interaction: discord.Interaction):
+    if not is_scambi_channel(interaction):
+        await interaction.response.send_message("❌ Usa questo comando solo nel canale SCAMBI.", ephemeral=True)
+        return
+
+    requester = fetch_manager_info(interaction.user.id)
+    if not requester:
+        await interaction.response.send_message("Prima devi essere registrato/iscritto come manager.", ephemeral=True)
+        return
+
+    managers = fetch_trade_managers(exclude_discord_id=interaction.user.id)
+    if not managers:
+        await interaction.response.send_message("Non ci sono altri player disponibili per gli scambi.", ephemeral=True)
+        return
+
+    description_lines = []
+    for m in managers[:TRADE_PAGE_SIZE]:
+        description_lines.append(f"• <@{m['discord_id']}> — **{m['club_name']}**")
+
+    embed = discord.Embed(
+        title="🔁 Scambi",
+        description="Scegli il player/manager con cui vuoi trattare.\n\n" + "\n".join(description_lines),
+        color=discord.Color.blurple()
+    )
+    if len(managers) > TRADE_PAGE_SIZE:
+        embed.set_footer(text=f"Pagina 1 di {(len(managers) - 1) // TRADE_PAGE_SIZE + 1}")
+
+    await interaction.response.send_message(embed=embed, view=TradeManagerView(interaction.user.id, managers, page=0), ephemeral=True)
+
+# ========================================================================
 
 
 @tree.command(name="blacklist_add", description="Admin: aggiungi un giocatore alla blacklist")
