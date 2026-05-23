@@ -1315,7 +1315,7 @@ CLUB_NAME_ALIASES = {
     "roma": ["roma", "as roma"],
     "lazio": ["lazio", "ss lazio"],
     "napoli": ["napoli", "ssc napoli"],
-    "bayern monaco": ["bayern monaco", "bayern munich", "fc bayern"],
+    "bayern monaco": ["bayern monaco", "bayer monaco", "fc bayern monaco", "bayern munich", "fc bayern munich", "bayern münchen", "fc bayern münchen", "bayern munchen", "fc bayern munchen", "fc bayern"],
     "barcellona": ["barcellona", "barcelona", "fc barcelona"],
     "psg": ["psg", "paris saint-germain", "paris sg"],
     "manchester united": ["manchester united", "man united", "man utd"],
@@ -1372,7 +1372,7 @@ TEAM_ALIASES = {
     "real madrid": ["real madrid", "real madrid cf"],
     "barcellona": ["barcellona", "barcelona", "fc barcelona"],
     "psg": ["psg", "paris saint germain", "paris saint-germain"],
-    "bayern monaco": ["bayern monaco", "bayern munich", "fc bayern munich"],
+    "bayern monaco": ["bayern monaco", "bayer monaco", "fc bayern monaco", "bayern munich", "fc bayern munich", "bayern münchen", "fc bayern münchen", "bayern munchen", "fc bayern munchen"],
 }
 
 
@@ -12607,5 +12607,374 @@ async def reset_totale(interaction: discord.Interaction):
     )
 
 # ===========================================================
+
+
+
+# ================= FIX ISCRIZIONE COMPLETA =================
+
+def find_best_real_team_name_for_club(club_name: str):
+    club_name = str(club_name or "").strip()
+    if not club_name:
+        return None
+
+    wanted = normalize_team_name(club_name)
+    aliases = get_team_aliases(club_name)
+    aliases.add(wanted)
+
+    extra_aliases = {
+        "bayern monaco": [
+            "bayern monaco", "bayer monaco", "fc bayern monaco", "bayern munich",
+            "fc bayern munich", "bayern munchen", "fc bayern munchen",
+            "bayern münchen", "fc bayern münchen"
+        ],
+        "bayer monaco": [
+            "bayer monaco", "bayern monaco", "fc bayern monaco", "bayern munich",
+            "fc bayern munich", "bayern münchen", "fc bayern münchen"
+        ],
+        "as monaco": ["as monaco", "monaco"],
+    }
+
+    for key, values in extra_aliases.items():
+        normalized_values = [normalize_team_name(v) for v in values]
+        if wanted == normalize_team_name(key) or wanted in normalized_values:
+            aliases.update(normalized_values)
+
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT team, COUNT(*) AS total
+        FROM players
+        WHERE team IS NOT NULL AND team != ''
+        GROUP BY team
+        ORDER BY total DESC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    best_team = None
+    best_score = -1
+
+    for r in rows:
+        team = r.get("team")
+        norm = normalize_team_name(team)
+        score = 0
+
+        if norm in aliases:
+            score = 1000
+        elif wanted and wanted in norm:
+            score = 800
+        elif wanted and norm in wanted:
+            score = 700
+        else:
+            wanted_tokens = [t for t in wanted.replace("-", " ").split() if len(t) >= 4]
+            norm_tokens = [t for t in norm.replace("-", " ").split() if len(t) >= 4]
+            common = set(wanted_tokens) & set(norm_tokens)
+            if common:
+                score = 300 + len(common) * 50
+
+        score += min(safe_int(r.get("total")), 50)
+
+        if score > best_score:
+            best_score = score
+            best_team = team
+
+    return best_team if best_score >= 300 else None
+
+
+def fix_signup_database_state(discord_id: str, fallback_name: str = None, club_name: str = None):
+    discord_id = str(discord_id).strip()
+    fallback_name = str(fallback_name or discord_id).strip()
+
+    conn = connect()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT *
+            FROM signup_requests
+            WHERE discord_id = %s
+            ORDER BY id DESC
+            LIMIT 1
+        """, (discord_id,))
+        req = cur.fetchone()
+
+        request_id = req.get("id") if req else None
+        discord_name = (req.get("discord_name") if req else None) or fallback_name or discord_id
+
+        if not club_name:
+            club_name = (req.get("club_name") if req else None) or None
+
+        if not club_name:
+            cur.execute("""
+                SELECT name
+                FROM fc26_clubs
+                WHERE assigned_to = %s
+                LIMIT 1
+            """, (discord_id,))
+            club_row = cur.fetchone()
+            if club_row:
+                club_name = club_row.get("name")
+
+        if not club_name and req and req.get("club_preferences"):
+            club_name = str(req.get("club_preferences")).split(",")[0].strip()
+
+        if not club_name:
+            raise Exception("Nessun club trovato nella richiesta, nei club assegnati o nelle preferenze.")
+
+        club_name = str(club_name).strip()
+
+        cur.execute("""
+            SELECT name
+            FROM fc26_clubs
+            WHERE LOWER(name) = LOWER(%s)
+            LIMIT 1
+        """, (club_name,))
+        club_row = cur.fetchone()
+
+        if not club_row:
+            cur.execute("""
+                SELECT name
+                FROM fc26_clubs
+                WHERE LOWER(name) LIKE LOWER(%s)
+                   OR LOWER(%s) LIKE '%' || LOWER(name) || '%'
+                ORDER BY name ASC
+                LIMIT 1
+            """, (f"%{club_name}%", club_name))
+            club_row = cur.fetchone()
+
+        canonical_club_name = club_row.get("name") if club_row else club_name
+
+        real_team_name = find_best_real_team_name_for_club(canonical_club_name)
+        if not real_team_name:
+            real_team_name = find_best_real_team_name_for_club(club_name)
+
+        if not real_team_name:
+            raise Exception(f"Nessuna squadra trovata in players.team per club '{club_name}'.")
+
+        cur.execute("""
+            SELECT id, overall
+            FROM players
+            WHERE LOWER(team) = LOWER(%s)
+            ORDER BY overall DESC NULLS LAST
+        """, (real_team_name,))
+        players = cur.fetchall()
+
+        if not players:
+            raise Exception(f"Nessun giocatore trovato per team reale '{real_team_name}'.")
+
+        avg_ovr = sum(safe_int(p.get("overall")) for p in players) / len(players)
+        budget = budget_from_team_overall(avg_ovr)
+
+        cur.execute("""
+            UPDATE players
+            SET owner_discord_id = NULL,
+                sold_price = NULL
+            WHERE owner_discord_id = %s
+        """, (discord_id,))
+
+        cur.execute("""
+            UPDATE fc26_clubs
+            SET assigned_to = NULL,
+                assigned_at = NULL
+            WHERE assigned_to = %s
+        """, (discord_id,))
+
+        cur.execute("""
+            INSERT INTO managers (discord_id, name, manager_name, club_name, budget)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (discord_id) DO UPDATE SET
+                name = EXCLUDED.name,
+                manager_name = EXCLUDED.manager_name,
+                club_name = EXCLUDED.club_name,
+                budget = EXCLUDED.budget
+        """, (discord_id, discord_name, discord_name, canonical_club_name, int(budget)))
+
+        cur.execute("""
+            UPDATE fc26_clubs
+            SET assigned_to = %s,
+                assigned_at = CURRENT_TIMESTAMP
+            WHERE LOWER(name) = LOWER(%s)
+        """, (discord_id, canonical_club_name))
+
+        if cur.rowcount == 0:
+            cur.execute("""
+                INSERT INTO fc26_clubs (name, assigned_to, assigned_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (name) DO UPDATE SET
+                    assigned_to = EXCLUDED.assigned_to,
+                    assigned_at = EXCLUDED.assigned_at
+            """, (canonical_club_name, discord_id))
+
+        cur.execute("""
+            UPDATE players
+            SET owner_discord_id = %s,
+                sold_price = 0
+            WHERE LOWER(team) = LOWER(%s)
+        """, (discord_id, real_team_name))
+        assigned_players = cur.rowcount or 0
+
+        cur.execute("""
+            INSERT INTO real_team_assignments
+            (discord_id, manager_name, team_name, avg_overall, assigned_budget)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (discord_id) DO UPDATE SET
+                manager_name = EXCLUDED.manager_name,
+                team_name = EXCLUDED.team_name,
+                avg_overall = EXCLUDED.avg_overall,
+                assigned_budget = EXCLUDED.assigned_budget
+        """, (discord_id, discord_name, real_team_name, float(avg_ovr), int(budget)))
+
+        try:
+            cur.execute("""
+                UPDATE signup_requests
+                SET status = 'accepted',
+                    club_name = %s,
+                    handled_at = CURRENT_TIMESTAMP
+                WHERE discord_id = %s
+            """, (canonical_club_name, discord_id))
+        except Exception:
+            pass
+
+        conn.commit()
+
+        return {
+            "request_id": request_id,
+            "discord_id": discord_id,
+            "discord_name": discord_name,
+            "club_name": canonical_club_name,
+            "real_team_name": real_team_name,
+            "players": assigned_players,
+            "avg_ovr": avg_ovr,
+            "budget": int(budget),
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+async def apply_fixed_signup_roles(guild, discord_id: str):
+    if not guild:
+        return False, "Guild non disponibile"
+
+    member = await get_member_safe(guild, discord_id)
+    if not member:
+        return False, "Membro non trovato nel server"
+
+    try:
+        request_role = guild.get_role(int(REQUEST_ROLE_ID))
+        pre_role = guild.get_role(int(PRE_ISCRITTO_ROLE_ID))
+        registered_role = guild.get_role(int(LEAGUE_PLAYER_ROLE_ID))
+
+        to_remove = [
+            role for role in (request_role, pre_role)
+            if role and role in getattr(member, "roles", [])
+        ]
+
+        if to_remove:
+            await member.remove_roles(*to_remove, reason="Fix iscrizione completata")
+
+        if registered_role and registered_role not in getattr(member, "roles", []):
+            await member.add_roles(registered_role, reason="Fix iscrizione completata")
+
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+@tree.command(name="fix_iscrizione", description="Admin: sistema iscrizione, club, rosa, budget e ruoli leggendo dal database")
+@app_commands.describe(
+    discord_id="ID Discord del player da sistemare",
+    club="Club da assegnare/fixare. Se vuoto legge richiesta o club già assegnato."
+)
+async def fix_iscrizione(interaction: discord.Interaction, discord_id: str, club: str = None):
+    if not can_use_normal_staff(interaction.user):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    member = await get_member_safe(interaction.guild, discord_id)
+    fallback_name = member.display_name if member else str(discord_id)
+
+    try:
+        result = await asyncio.to_thread(fix_signup_database_state, discord_id, fallback_name, club)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Fix iscrizione fallito:\n```{e}```", ephemeral=True)
+        return
+
+    roles_ok, roles_error = await apply_fixed_signup_roles(interaction.guild, discord_id)
+
+    try:
+        embed_dm = discord.Embed(
+            title="✅ Iscrizione completata",
+            description=(
+                f"La tua iscrizione è stata sistemata correttamente.\n\n"
+                f"🏟️ Club: **{result['club_name']}**\n"
+                f"🎮 Team reale: **{result['real_team_name']}**\n"
+                f"👥 Giocatori assegnati: **{result['players']}**\n"
+                f"⭐ Overall medio: **{result['avg_ovr']:.2f}**\n"
+                f"💰 Budget: **{result['budget']} crediti**"
+            ),
+            color=discord.Color.green()
+        )
+        await safe_dm(discord_id, embed=embed_dm)
+    except Exception:
+        pass
+
+    try:
+        await publish_manager_change_news_if_important(
+            interaction.guild,
+            result["club_name"],
+            old_manager="nessuno",
+            new_manager=result["discord_name"],
+            inherited=False,
+            has_trophies=False
+        )
+    except Exception:
+        pass
+
+    embed = discord.Embed(
+        title="✅ Fix iscrizione completato",
+        description=(
+            f"Player: <@{discord_id}> (`{discord_id}`)\n"
+            f"Nome: **{result['discord_name']}**\n"
+            f"Club bot/sito: **{result['club_name']}**\n"
+            f"Team reale players: **{result['real_team_name']}**\n"
+            f"Giocatori assegnati: **{result['players']}**\n"
+            f"Overall medio: **{result['avg_ovr']:.2f}**\n"
+            f"Budget assegnato: **{result['budget']} crediti**\n"
+            f"Ruoli Discord: **{'OK' if roles_ok else 'ERRORE'}**"
+        ),
+        color=discord.Color.green() if roles_ok else discord.Color.orange()
+    )
+
+    if roles_error:
+        embed.add_field(name="Errore ruoli", value=str(roles_error)[:1000], inline=False)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    try:
+        await send_staff_log(
+            interaction.guild,
+            "🛠️ Fix iscrizione eseguito",
+            (
+                f"Staff: {interaction.user.mention}\n"
+                f"Player: <@{discord_id}> (`{discord_id}`)\n"
+                f"Club: **{result['club_name']}**\n"
+                f"Team reale: **{result['real_team_name']}**\n"
+                f"Giocatori: **{result['players']}**\n"
+                f"Budget: **{result['budget']}**\n"
+                f"Ruoli: **{'OK' if roles_ok else 'ERRORE'}**"
+            ),
+            user=interaction.user,
+            color=discord.Color.green()
+        )
+    except Exception:
+        pass
+
+# ==========================================================
 
 bot.run(TOKEN)
