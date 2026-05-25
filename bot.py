@@ -2032,6 +2032,146 @@ async def send_staff_log(guild, title, description, *, user=None, color=None):
         print(f"[STAFF LOG] Errore invio log: {e}")
 
 
+# ================= LOG AUTOMATICO COMANDI / BOTTONI / MENU / MODAL =================
+# Tutte le interazioni Discord vengono comunicate allo staff nel canale STAFF_LOG_CHANNEL_ID.
+# Usa bot.listen invece di @bot.event per non interferire con gli slash command già registrati.
+
+STAFF_INTERACTION_LOG_ENABLED = True
+
+
+def _shorten_log_value(value, limit=900):
+    text = str(value or "-")
+    if len(text) > limit:
+        return text[:limit - 1] + "…"
+    return text
+
+
+def _format_interaction_options(options, prefix=""):
+    """Formatta le opzioni dei comandi slash, inclusi subcommand e gruppi."""
+    lines = []
+    for opt in options or []:
+        name = opt.get("name", "?")
+        value = opt.get("value")
+        nested = opt.get("options") or []
+        full_name = f"{prefix}{name}"
+        if nested:
+            lines.extend(_format_interaction_options(nested, prefix=f"{full_name} "))
+        else:
+            lines.append(f"• `{full_name}` = `{_shorten_log_value(value, 120)}`")
+    return lines
+
+
+def _format_modal_components(data):
+    """Estrae i campi scritti dentro un modal Discord."""
+    lines = []
+    for row in data.get("components", []) or []:
+        for component in row.get("components", []) or []:
+            custom_id = component.get("custom_id", "campo")
+            value = component.get("value", "")
+            lines.append(f"• `{custom_id}` = `{_shorten_log_value(value, 180)}`")
+    return lines
+
+
+async def send_interaction_staff_log(interaction: discord.Interaction):
+    if not STAFF_INTERACTION_LOG_ENABLED:
+        return
+
+    try:
+        # Evita log da DM o interazioni senza guild.
+        if not interaction.guild:
+            return
+
+        data = getattr(interaction, "data", {}) or {}
+        interaction_type = getattr(interaction, "type", None)
+        title = "📌 Interazione Discord"
+        color = discord.Color.blurple()
+        details = []
+
+        if interaction.type == discord.InteractionType.application_command:
+            command_name = data.get("name") or getattr(getattr(interaction, "command", None), "name", "sconosciuto")
+            title = "📌 Comando slash usato"
+            color = discord.Color.blue()
+            details.append(f"**Comando:** `/{command_name}`")
+
+            option_lines = _format_interaction_options(data.get("options", []))
+            if option_lines:
+                details.append("**Opzioni:**\n" + "\n".join(option_lines[:15]))
+
+        elif interaction.type == discord.InteractionType.component:
+            component_type = data.get("component_type")
+            custom_id = data.get("custom_id", "-")
+            values = data.get("values") or []
+
+            if component_type == 2:
+                title = "🔘 Bottone premuto"
+                color = discord.Color.green()
+                details.append(f"**Button ID:** `{custom_id}`")
+            elif component_type in (3, 5, 6, 7, 8):
+                title = "📋 Menu selezionato"
+                color = discord.Color.teal()
+                details.append(f"**Select ID:** `{custom_id}`")
+                if values:
+                    details.append("**Valori scelti:** `" + "`, `".join(_shorten_log_value(v, 80) for v in values[:10]) + "`")
+            else:
+                title = "🧩 Componente usato"
+                details.append(f"**Custom ID:** `{custom_id}`")
+
+            try:
+                if interaction.message:
+                    details.append(f"**Messaggio:** [apri](https://discord.com/channels/{interaction.guild.id}/{interaction.channel_id}/{interaction.message.id})")
+            except Exception:
+                pass
+
+        elif interaction.type == discord.InteractionType.modal_submit:
+            title = "📝 Modal inviato"
+            color = discord.Color.orange()
+            details.append(f"**Modal ID:** `{data.get('custom_id', '-')}`")
+            modal_lines = _format_modal_components(data)
+            if modal_lines:
+                details.append("**Campi:**\n" + "\n".join(modal_lines[:10]))
+
+        else:
+            details.append(f"**Tipo interazione:** `{interaction_type}`")
+            if data.get("custom_id"):
+                details.append(f"**Custom ID:** `{data.get('custom_id')}`")
+
+        user = interaction.user
+        channel_text = f"<#{interaction.channel_id}>" if interaction.channel_id else "N/D"
+
+        embed = discord.Embed(
+            title=title,
+            description="\n".join(details)[:3900] if details else "Interazione rilevata.",
+            color=color,
+            timestamp=datetime.now(UTC)
+        )
+        embed.add_field(name="Utente", value=f"{user.mention} (`{user.id}`)", inline=False)
+        embed.add_field(name="Canale", value=channel_text, inline=True)
+        embed.add_field(name="Server", value=f"{interaction.guild.name} (`{interaction.guild.id}`)", inline=False)
+        embed.set_footer(text="FC26 Staff Log • Interazioni automatiche")
+
+        channel = interaction.guild.get_channel(int(STAFF_LOG_CHANNEL_ID))
+        if not channel:
+            channel = bot.get_channel(int(STAFF_LOG_CHANNEL_ID))
+        if not channel:
+            channel = await bot.fetch_channel(int(STAFF_LOG_CHANNEL_ID))
+
+        await channel.send(embed=embed)
+
+    except Exception as e:
+        print(f"[STAFF INTERACTION LOG] Errore invio log interazione: {type(e).__name__}: {e}")
+
+
+@bot.listen("on_interaction")
+async def automatic_staff_interaction_logger(interaction: discord.Interaction):
+    # Task separato: il log non rallenta né blocca comandi, bottoni, select o modal.
+    try:
+        asyncio.create_task(send_interaction_staff_log(interaction))
+    except Exception as e:
+        print(f"[STAFF INTERACTION LOG] Errore create_task: {type(e).__name__}: {e}")
+
+# ================================================================================
+
+
 class ConfirmDangerView(discord.ui.View):
     def __init__(self, action_name, callback_func, *, timeout=180):
         super().__init__(timeout=timeout)
