@@ -8514,6 +8514,121 @@ class TradeView(discord.ui.View):
         )
 
 
+
+@tree.command(name="annulla_scambio", description="Staff: annulla uno scambio ancora in attesa")
+@app_commands.describe(
+    id_scambio="ID dello scambio da annullare",
+    motivo="Motivo dell'annullamento, opzionale"
+)
+async def annulla_scambio(interaction: discord.Interaction, id_scambio: int, motivo: str = "Annullato dallo staff"):
+    """Annulla uno scambio pending senza spostare giocatori o budget.
+
+    Uso staff: /annulla_scambio id_scambio:<id>
+    Cambia lo stato in cancelled solo se lo scambio è ancora pending.
+    """
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    conn = connect()
+    cur = conn.cursor()
+    trade = None
+
+    try:
+        cur.execute("SELECT * FROM trade_offers WHERE id = %s", (int(id_scambio),))
+        trade = cur.fetchone()
+
+        if not trade:
+            conn.close()
+            await interaction.followup.send("❌ Scambio non trovato.", ephemeral=True)
+            return
+
+        if str(trade.get("status") or "") != "pending":
+            conn.close()
+            await interaction.followup.send(
+                f"⚠️ Questo scambio non è più in attesa. Stato attuale: **{trade.get('status') or 'N/D'}**.",
+                ephemeral=True
+            )
+            return
+
+        proposer_id = str(trade.get("proposer_id") or "")
+        target_id = str(trade.get("target_id") or "")
+        request_player_id = trade.get("request_player_id")
+        offer_player_id = trade.get("offer_player_id")
+        credits_to_target = safe_int(trade.get("credits_to_target"))
+        credits_to_proposer = safe_int(trade.get("credits_to_proposer"))
+
+        cur.execute("UPDATE trade_offers SET status = 'cancelled' WHERE id = %s AND status = 'pending'", (int(id_scambio),))
+        if cur.rowcount == 0:
+            conn.rollback()
+            conn.close()
+            await interaction.followup.send("⚠️ Scambio già concluso o modificato da un altro processo.", ephemeral=True)
+            return
+
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        print(f"[TRADE CANCEL STAFF] Errore: {type(e).__name__}: {e}")
+        try:
+            await interaction.followup.send("❌ Errore durante l'annullamento dello scambio. Controlla i log.", ephemeral=True)
+        except Exception:
+            pass
+        return
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    summary = format_trade_summary_for_message(
+        id_scambio,
+        proposer_id,
+        target_id,
+        request_player_id,
+        offer_player_id,
+        credits_to_target,
+        credits_to_proposer
+    )
+
+    cancel_text = (
+        f"🛑 **Scambio annullato dallo staff.**\n\n"
+        f"{summary}\n\n"
+        f"📝 Motivo: **{motivo or 'Annullato dallo staff'}**\n"
+        f"🛡️ Staff: {interaction.user.mention}"
+    )
+
+    for user_id in {str(proposer_id), str(target_id)}:
+        if not user_id:
+            continue
+        try:
+            user = await bot.fetch_user(int(user_id))
+            await user.send(cancel_text)
+        except Exception:
+            pass
+
+    await send_trade_history_log(
+        interaction.guild,
+        "🛑 Scambio annullato dallo staff",
+        cancel_text,
+        color=discord.Color.red()
+    )
+
+    await send_staff_log(
+        interaction.guild,
+        "🛑 Scambio annullato",
+        cancel_text,
+        user=interaction.user,
+        color=discord.Color.red()
+    )
+
+    await interaction.followup.send(
+        f"✅ Scambio **#{id_scambio}** annullato correttamente.",
+        ephemeral=True
+    )
+
 @tree.command(name="scambi", description="Crea una proposta di scambio guidata")
 async def scambi(interaction: discord.Interaction):
     if not is_scambi_channel(interaction):
