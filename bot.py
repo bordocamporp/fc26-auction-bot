@@ -236,51 +236,6 @@ async def publish_manager_change_news_if_important(guild, club_name, old_manager
     )
 
 
-async def publish_signup_assignment_news(guild, *, discord_id, club_name, league_name=None, budget=None, players_count=None, avg_ovr=None, staff_user=None):
-    """Pubblica una news ufficiale quando un iscritto riceve una squadra.
-
-    Usata nelle iscrizioni FC26: ogni assegnazione club diventa una news
-    nel canale media, anche se il club non rientra tra i top club.
-    """
-    try:
-        lines = [
-            f"## 🏟️ Nuova squadra assegnata",
-            f"Il torneo accoglie ufficialmente <@{discord_id}> come nuovo manager.",
-            "",
-            f"🏟️ **Club assegnato:** {club_name or 'N/D'}",
-        ]
-
-        if league_name:
-            lines.append(f"🏆 **Competizione/Campionato:** {league_name}")
-        if budget is not None:
-            lines.append(f"💰 **Budget iniziale:** {budget} crediti")
-        if players_count is not None:
-            lines.append(f"👥 **Giocatori assegnati:** {players_count}")
-        if avg_ovr:
-            try:
-                lines.append(f"⭐ **OVR medio rosa:** {float(avg_ovr):.1f}")
-            except Exception:
-                lines.append(f"⭐ **OVR medio rosa:** {avg_ovr}")
-        if staff_user:
-            lines.append(f"🛡️ **Operazione registrata da:** {staff_user.mention}")
-
-        lines.append("")
-        lines.append("📲 Tutti i dettagli del torneo sono disponibili su **www.bordocampobc.com**")
-
-        return await publish_media_news(
-            guild,
-            "📰 BORDOCAMPO NEWS • NUOVA ASSEGNAZIONE",
-            "\n".join(lines),
-            category="manager_change",
-            club_name=club_name,
-            inherited=True,
-            force=True
-        )
-    except Exception as e:
-        print(f"[SIGNUP NEWS] Errore pubblicazione news assegnazione: {e}")
-        return False
-
-
 
 
 
@@ -2928,12 +2883,31 @@ def _parse_sqlite_datetime(value):
 
 # ================= SAFE ACTIVITY HELPERS =================
 # Definiti prima dei comandi/task: nel file originale erano dopo 
-@tree.command(name="calendario", description="Mostra il tuo calendario partite diviso per competizione")
+@tree.command(name="calendario", description="Mostra calendario partite da disputare divise per competizione")
 async def calendario(interaction: discord.Interaction):
-    if not is_calendar_channel(interaction):
-        await interaction.response.send_message("❌ Il calendario si vede solo nel canale CALENDARIO.", ephemeral=True)
-        return
-    await send_user_calendar_from_panel(interaction)
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+    try:
+        matches = unified_pending_matches(discord_id=None, only_user=False)
+        if not matches:
+            await interaction.followup.send("📅 Nessuna partita da disputare.", ephemeral=True)
+            return
+
+        grouped = {}
+        for m in matches:
+            key = f"{m['competition_name']} ({m['competition_type']})"
+            grouped.setdefault(key, []).append(m)
+
+        embeds = []
+        for comp, items in grouped.items():
+            lines = []
+            for m in items[:12]:
+                lines.append(f"• **{m['home_club']}** vs **{m['away_club']}** — {m['round']} {m['leg']}")
+            embeds.append(discord.Embed(title=f"📅 {comp}", description="\\n".join(lines), color=discord.Color.blurple()))
+
+        await interaction.followup.send(embeds=embeds[:10], ephemeral=True)
+    except Exception as e:
+        print(f"[CALENDARIO ERROR] {type(e).__name__}: {e}")
+        await interaction.followup.send(f"❌ Errore calendario: `{type(e).__name__}`", ephemeral=True)
 
 @tree.command(name="risultati_lista", description="Mostra ultimi risultati divisi per competizione")
 async def risultati_lista(interaction: discord.Interaction):
@@ -4145,15 +4119,6 @@ async def complete_signup_accept(interaction: discord.Interaction, request_id: i
     except Exception:
         await interaction.message.edit(embed=embed, view=None)
 
-    await publish_signup_assignment_news(
-        interaction.guild,
-        discord_id=str(member.id),
-        club_name=club_name,
-        league_name=league_name,
-        budget=budget,
-        staff_user=interaction.user
-    )
-
     # Nessuna seconda comunicazione nel log: resta solo il messaggio staff aggiornato.
 
 
@@ -4490,17 +4455,6 @@ class SignupClubSelect(discord.ui.Select):
             req=req,
             club_name=club_name,
             league=self.league,
-            budget=budget,
-            players_count=players_count,
-            avg_ovr=avg_ovr,
-            staff_user=interaction.user
-        )
-
-        await publish_signup_assignment_news(
-            interaction.guild,
-            discord_id=discord_id,
-            club_name=club_name,
-            league_name=self.league,
             budget=budget,
             players_count=players_count,
             avg_ovr=avg_ovr,
@@ -5255,22 +5209,6 @@ async def on_ready():
         bot.add_view(AuctionView())
     except Exception as e:
         print(f"[ON_READY] AuctionView non registrata: {e}")
-
-
-    try:
-        bot.add_view(AuctionPanelView())
-        bot.add_view(TradePanelView())
-        bot.add_view(SearchPlayersPanelView())
-        bot.add_view(MyTeamPanelView())
-    except Exception as e:
-        print(f"[ON_READY] Pannelli operativi non registrati: {e}")
-
-    try:
-        bot.add_view(CalendarPanelView())
-        bot.add_view(StandingsPanelView())
-        bot.add_view(StatsPanelView())
-    except Exception as e:
-        print(f"[ON_READY] Pannelli calendario/classifiche/statistiche non registrati: {e}")
 
     try:
         local_commands = tree.get_commands(guild=None)
@@ -7403,14 +7341,14 @@ def free_players_embed(title, groups, limit=15):
     conn = connect()
     cur = conn.cursor()
 
-    placeholders = ",".join(["%s"] * len(groups))
+    placeholders = ",".join(["?"] * len(groups))
     query = f"""
         SELECT *
         FROM players
         WHERE owner_discord_id IS NULL
           AND UPPER(position) IN ({placeholders})
         ORDER BY overall DESC
-        LIMIT %s
+        LIMIT ?
     """
 
     cur.execute(query, [g.upper() for g in groups] + [limit])
@@ -8512,6 +8450,117 @@ class TradeView(discord.ui.View):
             view=CounterOfferView(self.trade_id, proposer_players),
             ephemeral=True
         )
+
+
+@tree.command(name="annulla_scambio", description="Staff: annulla una proposta di scambio ancora in attesa")
+@app_commands.describe(
+    id_scambio="ID dello scambio da annullare",
+    motivo="Motivo dell'annullamento, opzionale"
+)
+async def annulla_scambio(interaction: discord.Interaction, id_scambio: int, motivo: str = "Annullato dallo staff"):
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    if not is_admin(interaction):
+        await interaction.followup.send("❌ Solo lo staff può annullare uno scambio.", ephemeral=True)
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT * FROM trade_offers WHERE id = %s", (int(id_scambio),))
+        trade = cur.fetchone()
+
+        if not trade:
+            conn.close()
+            await interaction.followup.send("❌ Scambio non trovato.", ephemeral=True)
+            return
+
+        if str(trade.get("status") or "") != "pending":
+            conn.close()
+            await interaction.followup.send(
+                f"⚠️ Questo scambio non è più in attesa. Stato attuale: **{trade.get('status')}**.",
+                ephemeral=True
+            )
+            return
+
+        proposer_id = str(trade.get("proposer_id"))
+        target_id = str(trade.get("target_id"))
+        request_player_id = trade.get("request_player_id")
+        offer_player_id = trade.get("offer_player_id")
+        credits_to_target = safe_int(trade.get("credits_to_target"))
+        credits_to_proposer = safe_int(trade.get("credits_to_proposer"))
+
+        cur.execute(
+            "UPDATE trade_offers SET status = 'cancelled_by_staff' WHERE id = %s AND status = 'pending'",
+            (int(id_scambio),)
+        )
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        print(f"[TRADE STAFF CANCEL] Errore annulla_scambio #{id_scambio}: {type(e).__name__}: {e}")
+        try:
+            await interaction.followup.send("❌ Errore durante l'annullamento dello scambio. Controlla i log.", ephemeral=True)
+        except Exception:
+            pass
+        return
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    summary = format_trade_summary_for_message(
+        id_scambio,
+        proposer_id,
+        target_id,
+        request_player_id,
+        offer_player_id,
+        credits_to_target,
+        credits_to_proposer
+    )
+
+    cancel_text = (
+        f"❌ **Scambio annullato dallo staff.**\n\n"
+        f"Motivo: **{motivo or 'Annullato dallo staff'}**\n"
+        f"Staff: {interaction.user.mention}\n\n"
+        f"{summary}"
+    )
+
+    # Notifica entrambi i player in privato, se hanno i DM aperti.
+    for user_id in {proposer_id, target_id}:
+        try:
+            user = await bot.fetch_user(int(user_id))
+            await user.send(cancel_text)
+        except Exception:
+            pass
+
+    try:
+        await send_trade_history_log(
+            interaction.guild,
+            "❌ Scambio annullato dallo staff",
+            cancel_text,
+            color=discord.Color.red()
+        )
+    except Exception:
+        pass
+
+    try:
+        await send_staff_log(
+            interaction.guild,
+            "❌ Scambio annullato",
+            cancel_text,
+            user=interaction.user,
+            color=discord.Color.red()
+        )
+    except Exception:
+        pass
+
+    await interaction.followup.send(
+        f"✅ Scambio **#{id_scambio}** annullato correttamente. I player sono stati notificati se hanno i DM aperti.",
+        ephemeral=True
+    )
 
 
 @tree.command(name="scambi", description="Crea una proposta di scambio guidata")
@@ -12591,442 +12640,6 @@ async def classifica(interaction: discord.Interaction):
 
 # ========================================================
 
-# ================= PANNELLI CANALI: CALENDARIO / CLASSIFICHE / STATISTICHE =================
-
-SITE_PUBLIC_URL = "https://www.bordocampobc.com"
-SITE_PUBLIC_TEXT = "Per vedere tutto puoi vedere sul sito www.bordocampobc.com"
-
-
-def _bc_panel_embed(title, description, color, emoji="⚽"):
-    embed = discord.Embed(
-        title=f"{emoji} {title}",
-        description=f"{description}\n\n🌐 **{SITE_PUBLIC_TEXT}**",
-        color=color
-    )
-    embed.set_footer(text="BordoCampo FC26 • Pannello rapido")
-    return embed
-
-
-def _chunk_text_lines(lines, limit=12):
-    if not lines:
-        return "Nessun dato disponibile."
-    return "\n".join(lines[:limit])
-
-
-async def send_user_calendar_from_panel(interaction: discord.Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
-    try:
-        matches = unified_pending_matches(discord_id=interaction.user.id, only_user=True)
-        if not matches:
-            embed = discord.Embed(
-                title="📅 Il tuo calendario",
-                description=f"Non hai partite da disputare al momento.\n\n🌐 **{SITE_PUBLIC_TEXT}**",
-                color=discord.Color.dark_grey()
-            )
-            embed.set_footer(text="BordoCampo FC26 • Calendario")
-            await interaction.followup.send(embed=embed, ephemeral=True)
-            return
-
-        grouped = {}
-        for m in matches:
-            key = f"{m.get('competition_name', 'Competizione')} ({m.get('competition_type', 'Torneo')})"
-            grouped.setdefault(key, []).append(m)
-
-        embeds = []
-        for comp, items in grouped.items():
-            lines = []
-            for m in items[:12]:
-                round_label = str(m.get("round") or "Turno")
-                leg = str(m.get("leg") or "").strip()
-                leg_text = f" • {leg}" if leg else ""
-                lines.append(
-                    f"• **{m.get('home_club', 'Casa')}** vs **{m.get('away_club', 'Trasferta')}**\n"
-                    f"  ↳ {round_label}{leg_text}"
-                )
-
-            embed = discord.Embed(
-                title=f"📅 {comp}",
-                description=_chunk_text_lines(lines, 12),
-                color=discord.Color.blurple()
-            )
-            embed.add_field(name="🌐 Sito", value=SITE_PUBLIC_TEXT, inline=False)
-            embed.set_footer(text="BordoCampo FC26 • Il tuo calendario")
-            embeds.append(embed)
-
-        await interaction.followup.send(embeds=embeds[:10], ephemeral=True)
-    except Exception as e:
-        print(f"[PANNELLO CALENDARIO ERROR] {type(e).__name__}: {e}")
-        await interaction.followup.send(f"❌ Errore calendario: `{type(e).__name__}`", ephemeral=True)
-
-
-def _classifica_category_matches(comp, category):
-    text = normalize_text(f"{comp.get('type', '')} {comp.get('name', '')} {comp.get('description', '')}")
-    kind = str(comp.get("kind") or "")
-    if category == "campionato":
-        return kind == "standings" and not any(k in text for k in ["coppa", "europe", "champions", "europa", "conference"])
-    if category == "europea":
-        return kind == "standings" and any(k in text for k in ["europe", "champions", "europa", "conference"])
-    if category == "nazionale":
-        return kind == "bracket" or ("coppa" in text and not any(k in text for k in ["europe", "champions", "europa", "conference"]))
-    return False
-
-
-def get_user_classifica_competitions_by_category(discord_id, category):
-    try:
-        competitions = get_user_competitions_for_classifica(discord_id)
-    except Exception as e:
-        print(f"[PANNELLO CLASSIFICA] Errore lettura competizioni: {e}")
-        competitions = []
-
-    filtered = [c for c in competitions if _classifica_category_matches(c, category)]
-
-    # Fallback importante: se una competizione è stata generata ma non è ancora stata
-    # sincronizzata nelle tabelle del sito, la ricaviamo dal calendario unificato.
-    # Così i pulsanti non rispondono "non iscritto" quando l'utente ha partite attive.
-    try:
-        pending = unified_pending_matches(discord_id=discord_id, only_user=True)
-        existing_keys = {f"{c.get('kind')}|{c.get('type')}|{c.get('name')}" for c in filtered}
-        for m in pending:
-            ctype = str(m.get("competition_type") or "")
-            cname = str(m.get("competition_name") or "Competizione")
-            group = competition_group_from_type(f"{ctype} {cname}")
-            add = False
-            kind = "standings"
-            description = group
-            if category == "campionato" and group == "Campionati":
-                add = True
-            elif category == "europea" and group == "Coppe Europee":
-                add = True
-            elif category == "nazionale" and group == "Coppa Nazionale":
-                add = True
-                kind = "bracket"
-                description = "Tabellone coppa nazionale"
-
-            key = f"{kind}|{ctype}|{cname}"
-            if add and key not in existing_keys:
-                filtered.append({
-                    "kind": kind,
-                    "type": ctype or group,
-                    "name": cname,
-                    "label": f"🏆 {cname}" if kind == "bracket" else f"📊 {cname}",
-                    "description": description,
-                })
-                existing_keys.add(key)
-    except Exception as e:
-        print(f"[PANNELLO CLASSIFICA] Fallback pending non disponibile: {e}")
-
-    return filtered
-
-
-def build_national_cup_bracket_embed_any(competition_name):
-    """Mostra il tabellone nazionale usando prima cup_matches, poi national_cup_matches."""
-    embed = build_bracket_embed(competition_name)
-    has_data = bool(embed.description and embed.description != "Nessun tabellone disponibile.") or bool(embed.fields and len(embed.fields) > 1)
-    if has_data:
-        return embed
-
-    conn = connect()
-    cur = conn.cursor()
-    rows = []
-    try:
-        cur.execute("""
-            SELECT m.*, nc.name AS competition_name
-            FROM national_cup_matches m
-            LEFT JOIN national_cups nc ON nc.id = m.cup_id
-            WHERE LOWER(COALESCE(nc.name, 'Coppa Nazionale')) = LOWER(%s)
-            ORDER BY m.round_number ASC, m.id ASC
-        """, (str(competition_name),))
-        rows = cur.fetchall()
-    except Exception as e:
-        print(f"[PANNELLO COPPA NAZIONALE] Errore lettura tabellone: {e}")
-        rows = []
-    finally:
-        conn.close()
-
-    embed = discord.Embed(
-        title=f"🏆 Tabellone — {competition_name}",
-        color=discord.Color.orange()
-    )
-
-    if not rows:
-        embed.description = "Nessun tabellone disponibile."
-    else:
-        by_round = {}
-        for r in rows:
-            by_round.setdefault(f"Turno {row_get(r, 'round_number', '?')}", []).append(r)
-        for round_name, matches in list(by_round.items())[:10]:
-            lines = []
-            for m in matches[:12]:
-                hg = row_get(m, "home_goals")
-                ag = row_get(m, "away_goals")
-                score = f"{safe_int(hg)} - {safe_int(ag)}" if hg is not None and ag is not None else "vs"
-                lines.append(f"**{row_get(m, 'home_name', 'Casa')}** {score} **{row_get(m, 'away_name', 'Trasferta')}**")
-            embed.add_field(name=round_name, value="\n".join(lines) or "Nessun match.", inline=False)
-
-    embed.add_field(name="🌐 Sito", value=SITE_PUBLIC_TEXT, inline=False)
-    embed.set_footer(text="BordoCampo FC26 • Coppa Nazionale")
-    return embed
-
-
-async def send_classifica_category_from_panel(interaction: discord.Interaction, category: str):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
-    try:
-        await asyncio.to_thread(ensure_site_standings_columns)
-    except Exception as e:
-        print(f"[PANNELLO CLASSIFICA] Migrazione classifiche fallita: {e}")
-
-    comps = get_user_classifica_competitions_by_category(interaction.user.id, category)
-    if not comps:
-        embed = discord.Embed(
-            title="❌ NON SEI ISCRITTO ALLA COMPETIZIONE",
-            description=f"Non risultano competizioni collegate alla tua squadra per questa sezione.\n\n🌐 **{SITE_PUBLIC_TEXT}**",
-            color=discord.Color.red()
-        )
-        embed.set_footer(text="BordoCampo FC26 • Classifiche")
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        return
-
-    embeds = []
-    for comp in comps[:10]:
-        if comp.get("kind") == "bracket":
-            if category == "nazionale":
-                embed = build_national_cup_bracket_embed_any(comp.get("name"))
-            else:
-                embed = build_bracket_embed(comp.get("name"))
-        else:
-            embed = build_standings_embed(comp.get("type"), comp.get("name"))
-        embed.add_field(name="🌐 Sito", value=SITE_PUBLIC_TEXT, inline=False)
-        embeds.append(embed)
-
-    await interaction.followup.send(embeds=embeds, ephemeral=True)
-
-
-def _stats_category_filter_sql(category):
-    if category == "campionato":
-        return "AND NOT (LOWER(COALESCE(mr.competition_type,'') || ' ' || COALESCE(mr.competition_name,'')) LIKE ANY(%s))", [
-            "%coppa%", "%europe%", "%champions%", "%europa%", "%conference%"
-        ]
-    if category == "europea":
-        return "AND (LOWER(COALESCE(mr.competition_type,'') || ' ' || COALESCE(mr.competition_name,'')) LIKE ANY(%s))", [
-            "%europe%", "%champions%", "%europa%", "%conference%"
-        ]
-    if category == "nazionale":
-        return "AND (LOWER(COALESCE(mr.competition_type,'') || ' ' || COALESCE(mr.competition_name,'')) LIKE %s OR LOWER(COALESCE(mr.competition_name,'')) LIKE %s)", [
-            "%coppa nazionale%", "%coppa%"
-        ]
-    return "", []
-
-
-def build_top_scorers_embed_for_competition(category, competition_name=None, competition_type=None):
-    title_map = {
-        "campionato": "⚽ Capocannoniere Campionato",
-        "europea": "🌍 Capocannoniere Coppa Europea",
-        "nazionale": "🏆 Capocannoniere Coppa Nazionale",
-    }
-    color_map = {
-        "campionato": discord.Color.green(),
-        "europea": discord.Color.blue(),
-        "nazionale": discord.Color.gold(),
-    }
-
-    conn = connect()
-    cur = conn.cursor()
-    rows = []
-    try:
-        params = []
-        where = ["g.player_name IS NOT NULL", "g.player_name <> ''"]
-        if competition_name:
-            where.append("LOWER(COALESCE(mr.competition_name,'')) = LOWER(%s)")
-            params.append(str(competition_name))
-        if competition_type and category != "nazionale":
-            where.append("LOWER(COALESCE(mr.competition_type,'')) = LOWER(%s)")
-            params.append(str(competition_type))
-
-        # Filtro categoria: funziona sui risultati sincronizzati nel sito.
-        category_sql, category_params = _stats_category_filter_sql(category)
-        query = f"""
-            SELECT
-                g.player_name,
-                COALESCE(g.club_name, '') AS club_name,
-                SUM(COALESCE(g.goals, 1)) AS total_goals
-            FROM goalscorers g
-            LEFT JOIN match_results mr
-              ON mr.source_table = g.source_table
-             AND mr.source_match_id::text = g.source_match_id::text
-            WHERE {' AND '.join(where)}
-            {category_sql}
-            GROUP BY g.player_name, g.club_name
-            ORDER BY total_goals DESC, g.player_name ASC
-            LIMIT 20
-        """
-        params.extend(category_params)
-        cur.execute(query, tuple(params))
-        rows = cur.fetchall()
-    except Exception as e:
-        print(f"[PANNELLO STATISTICHE] Errore capocannonieri: {e}")
-        rows = []
-    finally:
-        conn.close()
-
-    comp_label = f" — {competition_name}" if competition_name else ""
-    embed = discord.Embed(
-        title=f"{title_map.get(category, '⚽ Capocannoniere')}{comp_label}",
-        color=color_map.get(category, discord.Color.blurple())
-    )
-
-    if not rows:
-        embed.description = "Nessun marcatore disponibile per questa competizione."
-    else:
-        lines = []
-        for idx, r in enumerate(rows, start=1):
-            name = row_get(r, "player_name", "Giocatore")
-            club = row_get(r, "club_name", "")
-            goals = safe_int(row_get(r, "total_goals", 0))
-            club_text = f" • {club}" if club else ""
-            lines.append(f"**{idx}. {name}** — **{goals}** gol{club_text}")
-        embed.description = "\n".join(lines)
-
-    embed.add_field(name="🌐 Sito", value=SITE_PUBLIC_TEXT, inline=False)
-    embed.set_footer(text="BordoCampo FC26 • Statistiche")
-    return embed
-
-
-async def send_stats_category_from_panel(interaction: discord.Interaction, category: str):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
-
-    comps = get_user_classifica_competitions_by_category(interaction.user.id, category)
-    if not comps:
-        embed = discord.Embed(
-            title="❌ NON SEI ISCRITTO ALLA COMPETIZIONE",
-            description=f"Non risultano competizioni collegate alla tua squadra per questa sezione.\n\n🌐 **{SITE_PUBLIC_TEXT}**",
-            color=discord.Color.red()
-        )
-        embed.set_footer(text="BordoCampo FC26 • Statistiche")
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        return
-
-    embeds = []
-    for comp in comps[:10]:
-        embeds.append(build_top_scorers_embed_for_competition(
-            category,
-            competition_name=comp.get("name"),
-            competition_type=comp.get("type")
-        ))
-
-    await interaction.followup.send(embeds=embeds, ephemeral=True)
-
-
-class CalendarPanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="PREMI PER VEDERE IL TUO CALENDARIO",
-        style=discord.ButtonStyle.primary,
-        emoji="📅",
-        custom_id="bc_panel_calendar_user"
-    )
-    async def show_calendar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await send_user_calendar_from_panel(interaction)
-
-
-class StandingsPanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="CLASSIFICA CAMPIONATO", style=discord.ButtonStyle.success, emoji="📊", custom_id="bc_panel_standings_championship")
-    async def championship_standings(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await send_classifica_category_from_panel(interaction, "campionato")
-
-    @discord.ui.button(label="CLASSIFICA COPPA EUROPEA", style=discord.ButtonStyle.primary, emoji="🌍", custom_id="bc_panel_standings_europe")
-    async def european_standings(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await send_classifica_category_from_panel(interaction, "europea")
-
-    @discord.ui.button(label="TABELLONE COPPA NAZIONALE", style=discord.ButtonStyle.secondary, emoji="🏆", custom_id="bc_panel_standings_national_cup")
-    async def national_cup_bracket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await send_classifica_category_from_panel(interaction, "nazionale")
-
-
-class StatsPanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="CAPOCANNONIERE CAMPIONATO", style=discord.ButtonStyle.success, emoji="⚽", custom_id="bc_panel_stats_championship")
-    async def championship_scorers(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await send_stats_category_from_panel(interaction, "campionato")
-
-    @discord.ui.button(label="CAPOCANNONIERE COPPA EUROPEA", style=discord.ButtonStyle.primary, emoji="🌍", custom_id="bc_panel_stats_europe")
-    async def european_scorers(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await send_stats_category_from_panel(interaction, "europea")
-
-    @discord.ui.button(label="CAPOCANNONIERE COPPA NAZIONALE", style=discord.ButtonStyle.secondary, emoji="🏆", custom_id="bc_panel_stats_national_cup")
-    async def national_cup_scorers(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await send_stats_category_from_panel(interaction, "nazionale")
-
-
-async def _send_panel_to_channel(guild, channel_id, embed, view):
-    channel = None
-    if guild:
-        channel = guild.get_channel(int(channel_id))
-    if not channel:
-        channel = bot.get_channel(int(channel_id))
-    if not channel:
-        channel = await bot.fetch_channel(int(channel_id))
-    await channel.send(embed=embed, view=view)
-    return channel
-
-
-@tree.command(name="setup_pannelli_competizioni", description="Staff: pubblica i pannelli calendario, classifiche e statistiche")
-async def setup_pannelli_competizioni(interaction: discord.Interaction):
-    if not is_admin(interaction):
-        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
-        return
-
-    await safe_defer(interaction, ephemeral=True, thinking=True)
-
-    try:
-        calendar_embed = _bc_panel_embed(
-            "Calendario Partite",
-            (
-                "Consulta rapidamente il tuo calendario personale.\n"
-                "Il bot ti mostrerà solo le partite che devi disputare, divise per competizione."
-            ),
-            discord.Color.blurple(),
-            "📅"
-        )
-        standings_embed = _bc_panel_embed(
-            "Classifiche e Tabelloni",
-            (
-                "Scegli cosa vuoi consultare tra campionato, coppe europee e coppa nazionale.\n"
-                "Ogni pulsante mostra solo le competizioni a cui sei iscritto."
-            ),
-            discord.Color.green(),
-            "📊"
-        )
-        stats_embed = _bc_panel_embed(
-            "Statistiche Marcatori",
-            (
-                "Controlla i capocannonieri delle competizioni attive.\n"
-                "Le statistiche sono divise tra campionato, coppe europee e coppa nazionale."
-            ),
-            discord.Color.gold(),
-            "⚽"
-        )
-
-        await _send_panel_to_channel(interaction.guild, CALENDAR_CHANNEL_ID, calendar_embed, CalendarPanelView())
-        await _send_panel_to_channel(interaction.guild, STANDINGS_CHANNEL_ID, standings_embed, StandingsPanelView())
-        await _send_panel_to_channel(interaction.guild, STATS_CHANNEL_ID, stats_embed, StatsPanelView())
-
-        await interaction.followup.send(
-            "✅ Pannelli pubblicati correttamente nei canali calendario, classifiche e statistiche.",
-            ephemeral=True
-        )
-    except Exception as e:
-        print(f"[SETUP PANNELLI COMPETIZIONI] Errore: {type(e).__name__}: {e}")
-        await interaction.followup.send(f"❌ Errore pubblicazione pannelli: `{type(e).__name__}: {e}`", ephemeral=True)
-
-# ========================================================
-
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN non configurato nelle variabili ambiente.")
@@ -13563,15 +13176,13 @@ async def fix_iscrizione(interaction: discord.Interaction, discord_id: str, club
         pass
 
     try:
-        await publish_signup_assignment_news(
+        await publish_manager_change_news_if_important(
             interaction.guild,
-            discord_id=discord_id,
-            club_name=result["club_name"],
-            league_name=result.get("league") or result.get("competition") or None,
-            budget=result.get("budget"),
-            players_count=result.get("players"),
-            avg_ovr=result.get("avg_ovr"),
-            staff_user=interaction.user
+            result["club_name"],
+            old_manager="nessuno",
+            new_manager=result["discord_name"],
+            inherited=False,
+            has_trophies=False
         )
     except Exception:
         pass
@@ -13614,207 +13225,6 @@ async def fix_iscrizione(interaction: discord.Interaction, discord_id: str, club
         )
     except Exception:
         pass
-
-
-# ================= PANNELLI CANALI: ASTA / SCAMBI / RICERCA / ROSA =================
-# Pannelli fissi per rendere i canali più puliti: gli utenti usano i pulsanti
-# invece di digitare manualmente i comandi slash.
-
-BORDOCAMPO_SITE_TEXT = "🌐 Per vedere tutto puoi vedere sul sito **www.bordocampobc.com**"
-
-
-def _panel_embed(title: str, description: str, color):
-    embed = discord.Embed(
-        title=title,
-        description=description + "\n\n" + BORDOCAMPO_SITE_TEXT,
-        color=color
-    )
-    embed.set_footer(text="BordoCampo FC26 • Pannello interattivo")
-    return embed
-
-
-async def _send_or_replace_panel(guild, channel_id, embed, view):
-    channel = None
-    if guild:
-        channel = guild.get_channel(int(channel_id))
-    if not channel:
-        channel = bot.get_channel(int(channel_id))
-    if not channel:
-        channel = await bot.fetch_channel(int(channel_id))
-    if not channel:
-        raise RuntimeError(f"Canale non trovato: {channel_id}")
-
-    return await channel.send(embed=embed, view=view)
-
-
-class AuctionPanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="AVVIA ASTA",
-        style=discord.ButtonStyle.success,
-        emoji="🔨",
-        custom_id="panel_operativo_avvia_asta"
-    )
-    async def start_auction(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Usa la stessa logica del comando /asta: controlli canale, mercato aperto,
-        # scelta campionato → squadra → giocatore e avvio asta restano invariati.
-        await asta.callback(interaction)
-
-
-class TradePanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="AVVIA SCAMBIO",
-        style=discord.ButtonStyle.primary,
-        emoji="🔁",
-        custom_id="panel_operativo_avvia_scambio"
-    )
-    async def start_trade(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Usa la stessa logica del comando /scambi: controllo canale, manager,
-        # scelta destinatario, giocatori e crediti restano invariati.
-        await scambi.callback(interaction)
-
-
-class SearchPlayersPanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="AVVIA RICERCA",
-        style=discord.ButtonStyle.blurple,
-        emoji="🔎",
-        custom_id="panel_operativo_avvia_ricerca"
-    )
-    async def start_search(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Nel file attuale la ricerca giocatori liberi è gestita da /liberi.
-        # Il pulsante apre la stessa interfaccia a tendina per ruolo.
-        await liberi.callback(interaction)
-
-
-class MyTeamPanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="VEDI LA TUA SQUADRA",
-        style=discord.ButtonStyle.success,
-        emoji="📋",
-        custom_id="panel_operativo_vedi_mia_squadra"
-    )
-    async def show_my_team(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Usa la stessa logica del comando /mia_squadra.
-        await mia_squadra.callback(interaction)
-
-
-@tree.command(name="ricerca_giocatore", description="Apre la ricerca guidata dei giocatori liberi")
-async def ricerca_giocatore(interaction: discord.Interaction):
-    # Alias comodo richiesto per coerenza con il nome usato nel server.
-    await liberi.callback(interaction)
-
-
-@tree.command(name="setup_pannelli_operativi", description="Staff: pubblica i pannelli Asta, Scambi, Ricerca e Rosa")
-async def setup_pannelli_operativi(interaction: discord.Interaction):
-    try:
-        await safe_defer(interaction, ephemeral=True, thinking=True)
-    except Exception:
-        pass
-
-    if not is_admin(interaction):
-        await safe_send(interaction, "❌ Solo lo staff può pubblicare i pannelli.", ephemeral=True)
-        return
-
-    try:
-        auction_embed_panel = _panel_embed(
-            "🔨 Sala Aste",
-            (
-                "Da questo pannello puoi avviare un'asta guidata in modo semplice e pulito.\n\n"
-                "Premendo il pulsante sotto partirà la stessa procedura del comando **/asta**:\n"
-                "• scelta del campionato\n"
-                "• scelta della squadra\n"
-                "• scelta del giocatore libero\n"
-                "• apertura dell'asta con base, timer e pulsanti offerta già configurati"
-            ),
-            discord.Color.gold()
-        )
-
-        trade_embed_panel = _panel_embed(
-            "🔁 Area Scambi",
-            (
-                "Da questo pannello puoi creare una proposta di scambio guidata tra manager.\n\n"
-                "Premendo il pulsante sotto partirà la stessa procedura del comando **/scambi**:\n"
-                "• scelta del manager destinatario\n"
-                "• scelta dei giocatori coinvolti\n"
-                "• eventuale inserimento crediti\n"
-                "• invio della proposta con pulsanti accetta, rifiuta e controfferta"
-            ),
-            discord.Color.blurple()
-        )
-
-        search_embed_panel = _panel_embed(
-            "🔎 Ricerca Giocatori",
-            (
-                "Da questo pannello puoi cercare i giocatori liberi disponibili nel mercato.\n\n"
-                "Premendo il pulsante sotto partirà la ricerca guidata:\n"
-                "• portieri\n"
-                "• difensori\n"
-                "• centrocampisti\n"
-                "• attaccanti\n\n"
-                "La lista mostra i migliori giocatori liberi per ruolo."
-            ),
-            discord.Color.blue()
-        )
-
-        my_team_embed_panel = _panel_embed(
-            "📋 Rosa Chat",
-            (
-                "Da questo pannello puoi visualizzare rapidamente la tua squadra.\n\n"
-                "Premendo il pulsante sotto verrà mostrata la stessa schermata del comando **/mia_squadra**:\n"
-                "• club assegnato\n"
-                "• giocatori in rosa\n"
-                "• overall e ruoli\n"
-                "• riepilogo della tua squadra"
-            ),
-            discord.Color.green()
-        )
-
-        await _send_or_replace_panel(interaction.guild, AUCTION_CHANNEL_ID, auction_embed_panel, AuctionPanelView())
-        await _send_or_replace_panel(interaction.guild, SCAMBI_CHANNEL_ID, trade_embed_panel, TradePanelView())
-        await _send_or_replace_panel(interaction.guild, SEARCH_CHANNEL_ID, search_embed_panel, SearchPlayersPanelView())
-        await _send_or_replace_panel(interaction.guild, ROSE_CHANNEL_ID, my_team_embed_panel, MyTeamPanelView())
-
-        await interaction.followup.send(
-            "✅ Pannelli operativi pubblicati nei canali Asta, Scambi, Ricerca Giocatori e Rosa Chat.",
-            ephemeral=True
-        )
-
-        try:
-            await send_staff_log(
-                interaction.guild,
-                "🧩 Pannelli operativi pubblicati",
-                (
-                    f"Asta: <#{AUCTION_CHANNEL_ID}>\n"
-                    f"Scambi: <#{SCAMBI_CHANNEL_ID}>\n"
-                    f"Ricerca giocatori: <#{SEARCH_CHANNEL_ID}>\n"
-                    f"Rosa chat: <#{ROSE_CHANNEL_ID}>"
-                ),
-                user=interaction.user,
-                color=discord.Color.green()
-            )
-        except Exception:
-            pass
-
-    except Exception as e:
-        print(f"[SETUP PANNELLI OPERATIVI] Errore: {type(e).__name__}: {e}")
-        try:
-            await interaction.followup.send(f"❌ Errore pubblicazione pannelli: `{type(e).__name__}: {e}`", ephemeral=True)
-        except Exception:
-            pass
-
-# ============================================================================
 
 # ==========================================================
 
