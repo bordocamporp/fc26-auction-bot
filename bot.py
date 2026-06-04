@@ -5273,6 +5273,14 @@ async def on_ready():
         print(f"[ON_READY] Pannelli calendario/classifiche/statistiche non registrati: {e}")
 
     try:
+        if not getattr(bot, "_trade_auto_expire_task_started", False):
+            bot.loop.create_task(trade_auto_expire_loop())
+            bot._trade_auto_expire_task_started = True
+            print("[TRADE EXPIRE] Loop scadenza 24h avviato.")
+    except Exception as e:
+        print(f"[TRADE EXPIRE] Avvio loop fallito: {e}")
+
+    try:
         local_commands = tree.get_commands(guild=None)
         print(f"[SYNC DEBUG] Comandi registrati localmente prima del sync: {len(local_commands)}")
         print("[SYNC DEBUG] Nomi comandi:", ", ".join(cmd.name for cmd in local_commands[:120]))
@@ -7828,6 +7836,157 @@ async def send_trade_history_log(guild, title, summary, *, color=None):
         print(f"[TRADE LOG] Errore invio storico scambio: {e}")
 
 
+
+async def ensure_trade_offer_runtime_columns():
+    """Colonne di supporto per pulizia messaggi e scadenza automatica scambi."""
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        for sql in [
+            "ALTER TABLE trade_offers ADD COLUMN IF NOT EXISTS public_channel_id TEXT",
+            "ALTER TABLE trade_offers ADD COLUMN IF NOT EXISTS public_message_id TEXT",
+            "ALTER TABLE trade_offers ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP",
+            "ALTER TABLE trade_offers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP",
+            "CREATE INDEX IF NOT EXISTS idx_trade_offers_status_expires ON trade_offers(status, expires_at)",
+        ]:
+            try:
+                cur.execute(sql)
+            except Exception:
+                pass
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[TRADE RUNTIME COLUMNS] Errore: {e}")
+    finally:
+        conn.close()
+
+
+async def delete_trade_public_message_by_id(trade_id):
+    """Elimina dal canale pubblico il messaggio collegato a una proposta di scambio."""
+    await ensure_trade_offer_runtime_columns()
+
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT public_channel_id, public_message_id FROM trade_offers WHERE id = %s", (int(trade_id),))
+        row = cur.fetchone()
+    except Exception as e:
+        print(f"[TRADE DELETE PUBLIC] Errore lettura messaggio trade #{trade_id}: {e}")
+        row = None
+    finally:
+        conn.close()
+
+    if not row:
+        return False
+
+    channel_id = str(row.get("public_channel_id") or "").strip()
+    message_id = str(row.get("public_message_id") or "").strip()
+    if not channel_id or not message_id:
+        return False
+
+    try:
+        channel = bot.get_channel(int(channel_id))
+        if not channel:
+            channel = await bot.fetch_channel(int(channel_id))
+        msg = await channel.fetch_message(int(message_id))
+        await msg.delete()
+        return True
+    except discord.NotFound:
+        return False
+    except Exception as e:
+        print(f"[TRADE DELETE PUBLIC] Errore eliminazione messaggio trade #{trade_id}: {e}")
+        return False
+
+
+async def notify_trade_rejected_like(proposer_id, target_id, summary, *, title="❌ Scambio rifiutato"):
+    for user_id in {str(proposer_id), str(target_id)}:
+        try:
+            user = await bot.fetch_user(int(user_id))
+            await user.send(f"{title}\n\n{summary}")
+        except Exception:
+            pass
+
+
+async def trade_auto_expire_loop():
+    """Rifiuta automaticamente le proposte di scambio pending dopo 24 ore."""
+    await bot.wait_until_ready()
+    await ensure_trade_offer_runtime_columns()
+
+    while not bot.is_closed():
+        try:
+            conn = connect()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT *
+                FROM trade_offers
+                WHERE status = 'pending'
+                  AND (
+                        (expires_at IS NOT NULL AND expires_at <= CURRENT_TIMESTAMP)
+                        OR (expires_at IS NULL AND created_at <= CURRENT_TIMESTAMP - INTERVAL '24 hours')
+                      )
+                ORDER BY created_at ASC
+                LIMIT 25
+            """)
+            rows = cur.fetchall()
+            conn.close()
+
+            for trade in rows:
+                trade_id = int(trade["id"])
+                conn = connect()
+                cur = conn.cursor()
+                try:
+                    cur.execute("""
+                        UPDATE trade_offers
+                        SET status = 'expired', updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s AND status = 'pending'
+                        RETURNING *
+                    """, (trade_id,))
+                    updated = cur.fetchone()
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    print(f"[TRADE EXPIRE] Errore update trade #{trade_id}: {e}")
+                    updated = None
+                finally:
+                    conn.close()
+
+                if not updated:
+                    continue
+
+                proposer_id = str(updated.get("proposer_id"))
+                target_id = str(updated.get("target_id"))
+                summary = format_trade_summary_for_message(
+                    trade_id,
+                    proposer_id,
+                    target_id,
+                    updated.get("request_player_id"),
+                    updated.get("offer_player_id"),
+                    safe_int(updated.get("credits_to_target")),
+                    safe_int(updated.get("credits_to_proposer"))
+                )
+
+                await delete_trade_public_message_by_id(trade_id)
+                await notify_trade_rejected_like(
+                    proposer_id,
+                    target_id,
+                    summary,
+                    title="⏱️ Scambio scaduto automaticamente dopo 24 ore"
+                )
+
+                guild = bot.get_guild(int(GUILD_ID)) if GUILD_ID else None
+                await send_trade_history_log(
+                    guild,
+                    "⏱️ Scambio scaduto automaticamente",
+                    summary,
+                    color=discord.Color.dark_grey()
+                )
+
+        except Exception as e:
+            print(f"[TRADE EXPIRE LOOP] Errore: {type(e).__name__}: {e}")
+
+        await asyncio.sleep(600)
+
+
 async def post_trade_offer(interaction, trade_id, proposer_id, target_id, request_player_id, offer_player_id, credits_to_target, credits_to_proposer=0, *, title="🔁 Nuova proposta di scambio"):
     embed = make_trade_embed(
         trade_id,
@@ -7852,7 +8011,27 @@ async def post_trade_offer(interaction, trade_id, proposer_id, target_id, reques
             channel = None
 
     if channel:
-        await channel.send(embed=embed, view=TradeView(trade_id))
+        await ensure_trade_offer_runtime_columns()
+        await delete_trade_public_message_by_id(trade_id)
+        msg = await channel.send(embed=embed, view=TradeView(trade_id))
+
+        conn = connect()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                UPDATE trade_offers
+                SET public_channel_id = %s,
+                    public_message_id = %s,
+                    expires_at = CURRENT_TIMESTAMP + INTERVAL '24 hours',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+            """, (str(channel.id), str(msg.id), int(trade_id)))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"[TRADE PUBLIC MESSAGE] Errore salvataggio messaggio trade #{trade_id}: {e}")
+        finally:
+            conn.close()
 
     requested = fetch_player_by_id(request_player_id)
     await notify_trade_dm(target_id, requested['name'] if requested else 'un tuo giocatore')
@@ -8077,6 +8256,8 @@ class TradeBudgetModal(discord.ui.Modal, title="Budget offerto"):
             await interaction.followup.send("Budget insufficiente.", ephemeral=True)
             return
 
+        await ensure_trade_offer_runtime_columns()
+
         conn = connect()
         cur = conn.cursor()
         try:
@@ -8244,16 +8425,24 @@ class TradeView(discord.ui.View):
         self.trade_id = trade_id
 
     async def _disable_public_message(self, interaction: discord.Interaction, content: str):
-        """Modifica il messaggio dello scambio senza usare interaction.response dopo operazioni lente."""
+        """Rimuove il messaggio pubblico dello scambio dal canale.
+
+        Da ora gli esiti degli scambi non restano nel canale SCAMBI:
+        - accettato/rifiutato/annullato/scaduto vengono tracciati nello storico;
+        - i player ricevono DM quando possibile;
+        - nel canale pubblico resta solo il pannello fisso.
+        """
         try:
             if interaction.message:
-                await interaction.message.edit(content=content, embed=None, view=None)
+                await interaction.message.delete()
                 return
+        except discord.NotFound:
+            return
         except Exception as e:
-            print(f"[TRADE MESSAGE EDIT] Errore modifica messaggio scambio: {e}")
+            print(f"[TRADE MESSAGE DELETE] Errore rimozione messaggio scambio: {e}")
 
         try:
-            await interaction.followup.send(content, ephemeral=True)
+            await delete_trade_public_message_by_id(self.trade_id)
         except Exception:
             pass
 
@@ -8515,67 +8704,47 @@ class TradeView(discord.ui.View):
 
 
 
-@tree.command(name="annulla_scambio", description="Staff: annulla uno scambio ancora in attesa")
-@app_commands.describe(
-    id_scambio="ID dello scambio da annullare",
-    motivo="Motivo dell'annullamento, opzionale"
-)
+@tree.command(name="annulla_scambio", description="Staff: annulla una proposta di scambio ancora in attesa")
+@app_commands.describe(id_scambio="ID della proposta di scambio", motivo="Motivo opzionale dell'annullamento")
 async def annulla_scambio(interaction: discord.Interaction, id_scambio: int, motivo: str = "Annullato dallo staff"):
-    """Annulla uno scambio pending senza spostare giocatori o budget.
+    await safe_defer(interaction, ephemeral=True, thinking=True)
 
-    Uso staff: /annulla_scambio id_scambio:<id>
-    Cambia lo stato in cancelled solo se lo scambio è ancora pending.
-    """
     if not is_admin(interaction):
-        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        await interaction.followup.send("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         return
 
-    await safe_defer(interaction, ephemeral=True, thinking=True)
+    await ensure_trade_offer_runtime_columns()
 
     conn = connect()
     cur = conn.cursor()
-    trade = None
-
     try:
         cur.execute("SELECT * FROM trade_offers WHERE id = %s", (int(id_scambio),))
         trade = cur.fetchone()
-
         if not trade:
             conn.close()
             await interaction.followup.send("❌ Scambio non trovato.", ephemeral=True)
             return
 
-        if str(trade.get("status") or "") != "pending":
+        if str(trade.get("status")) != "pending":
             conn.close()
             await interaction.followup.send(
-                f"⚠️ Questo scambio non è più in attesa. Stato attuale: **{trade.get('status') or 'N/D'}**.",
+                f"⚠️ Questo scambio non è più in attesa. Stato attuale: **{trade.get('status')}**.",
                 ephemeral=True
             )
             return
 
-        proposer_id = str(trade.get("proposer_id") or "")
-        target_id = str(trade.get("target_id") or "")
-        request_player_id = trade.get("request_player_id")
-        offer_player_id = trade.get("offer_player_id")
-        credits_to_target = safe_int(trade.get("credits_to_target"))
-        credits_to_proposer = safe_int(trade.get("credits_to_proposer"))
-
-        cur.execute("UPDATE trade_offers SET status = 'cancelled' WHERE id = %s AND status = 'pending'", (int(id_scambio),))
-        if cur.rowcount == 0:
-            conn.rollback()
-            conn.close()
-            await interaction.followup.send("⚠️ Scambio già concluso o modificato da un altro processo.", ephemeral=True)
-            return
-
+        cur.execute("""
+            UPDATE trade_offers
+            SET status = 'cancelled_by_staff', updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s AND status = 'pending'
+            RETURNING *
+        """, (int(id_scambio),))
+        updated = cur.fetchone()
         conn.commit()
-
     except Exception as e:
         conn.rollback()
-        print(f"[TRADE CANCEL STAFF] Errore: {type(e).__name__}: {e}")
-        try:
-            await interaction.followup.send("❌ Errore durante l'annullamento dello scambio. Controlla i log.", ephemeral=True)
-        except Exception:
-            pass
+        print(f"[ANNULLA SCAMBIO] Errore: {e}")
+        await interaction.followup.send("❌ Errore durante l'annullamento dello scambio. Controlla i log.", ephemeral=True)
         return
     finally:
         try:
@@ -8583,51 +8752,39 @@ async def annulla_scambio(interaction: discord.Interaction, id_scambio: int, mot
         except Exception:
             pass
 
+    if not updated:
+        await interaction.followup.send("⚠️ Scambio non più annullabile.", ephemeral=True)
+        return
+
+    proposer_id = str(updated.get("proposer_id"))
+    target_id = str(updated.get("target_id"))
     summary = format_trade_summary_for_message(
-        id_scambio,
+        int(id_scambio),
         proposer_id,
         target_id,
-        request_player_id,
-        offer_player_id,
-        credits_to_target,
-        credits_to_proposer
+        updated.get("request_player_id"),
+        updated.get("offer_player_id"),
+        safe_int(updated.get("credits_to_target")),
+        safe_int(updated.get("credits_to_proposer"))
     )
+    summary += f"\n\n🛡️ **Annullato dallo staff:** {interaction.user.mention}\n📌 **Motivo:** {motivo or 'N/D'}"
 
-    cancel_text = (
-        f"🛑 **Scambio annullato dallo staff.**\n\n"
-        f"{summary}\n\n"
-        f"📝 Motivo: **{motivo or 'Annullato dallo staff'}**\n"
-        f"🛡️ Staff: {interaction.user.mention}"
+    await delete_trade_public_message_by_id(int(id_scambio))
+    await notify_trade_rejected_like(
+        proposer_id,
+        target_id,
+        summary,
+        title="🛡️ Scambio annullato dallo staff"
     )
-
-    for user_id in {str(proposer_id), str(target_id)}:
-        if not user_id:
-            continue
-        try:
-            user = await bot.fetch_user(int(user_id))
-            await user.send(cancel_text)
-        except Exception:
-            pass
-
     await send_trade_history_log(
         interaction.guild,
-        "🛑 Scambio annullato dallo staff",
-        cancel_text,
-        color=discord.Color.red()
+        "🛡️ Scambio annullato dallo staff",
+        summary,
+        color=discord.Color.orange()
     )
 
-    await send_staff_log(
-        interaction.guild,
-        "🛑 Scambio annullato",
-        cancel_text,
-        user=interaction.user,
-        color=discord.Color.red()
-    )
+    await interaction.followup.send(f"✅ Scambio **#{id_scambio}** annullato e rimosso dal canale.", ephemeral=True)
 
-    await interaction.followup.send(
-        f"✅ Scambio **#{id_scambio}** annullato correttamente.",
-        ephemeral=True
-    )
 
 @tree.command(name="scambi", description="Crea una proposta di scambio guidata")
 async def scambi(interaction: discord.Interaction):
