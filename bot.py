@@ -331,7 +331,7 @@ BOT_ONLY_BYPASS_ROLE_IDS = {
 
 BOT_ONLY_CHANNELS = {
     1504884471286075532,  # calendario
-    1504874612805337229,  # risultati
+    1513229243021000896,  # risultati
     1504874671064223784,  # classifiche
     1504874788349542431,  # statistiche
     1504825224422756463,  # asta
@@ -11617,7 +11617,8 @@ def unified_pending_matches(discord_id=None, only_user=True):
             SELECT
                 m.*,
                 c.name AS competition_name,
-                COALESCE(g.name, g.group_name, 'Girone Unico') AS group_label
+                COALESCE(g.name, g.group_name, 'Girone Unico') AS group_label,
+                MAX(m.round_number) OVER (PARTITION BY m.championship_id) AS max_round_number
             FROM championship_matches m
             LEFT JOIN championships c ON c.id = m.championship_id
             LEFT JOIN championship_groups g ON g.id = m.group_id
@@ -11634,13 +11635,23 @@ def unified_pending_matches(discord_id=None, only_user=True):
             if only_user and discord_id and club:
                 if normalize_text(home_club) != normalize_text(club) and normalize_text(away_club) != normalize_text(club) and home_id != str(discord_id) and away_id != str(discord_id):
                     continue
+            round_number = safe_int(row_get(r, "round_number", 0))
+            max_round_number = safe_int(row_get(r, "max_round_number", 0))
+            db_leg = normalize_text(row_get(r, "leg", "") or "")
+            if db_leg in ("andata", "ritorno", "unica"):
+                leg_label = db_leg
+            elif max_round_number and round_number > (max_round_number // 2):
+                leg_label = "ritorno"
+            else:
+                leg_label = "andata"
+
             out.append({
                 "source_table": "championship_matches",
                 "id": str(row_get(r, "id")),
                 "competition_name": row_get(r, "competition_name", "Campionato"),
                 "competition_type": "Campionati",
                 "round": f"{row_get(r, 'group_label', 'Girone')} - Giornata {row_get(r, 'round_number', '')}",
-                "leg": active_leg,
+                "leg": leg_label,
                 "home_user_id": home_id,
                 "away_user_id": away_id,
                 "home_club": home_club,
