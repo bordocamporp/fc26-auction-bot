@@ -5266,11 +5266,12 @@ async def on_ready():
         print(f"[ON_READY] Pannelli operativi non registrati: {e}")
 
     try:
+        bot.add_view(ResultsPanelView())
         bot.add_view(CalendarPanelView())
         bot.add_view(StandingsPanelView())
         bot.add_view(StatsPanelView())
     except Exception as e:
-        print(f"[ON_READY] Pannelli calendario/classifiche/statistiche non registrati: {e}")
+        print(f"[ON_READY] Pannelli risultati/calendario/classifiche/statistiche non registrati: {e}")
 
     try:
         if not getattr(bot, "_trade_auto_expire_task_started", False):
@@ -13188,6 +13189,22 @@ async def send_stats_category_from_panel(interaction: discord.Interaction, categ
     await interaction.followup.send(embeds=embeds, ephemeral=True)
 
 
+class ResultsPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="INSERISCI RISULTATO",
+        style=discord.ButtonStyle.success,
+        emoji="⚽",
+        custom_id="bc_panel_results_insert"
+    )
+    async def insert_result(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Usa la stessa procedura del comando /risultato:
+        # competizione -> partita -> gol/marcatori -> conferma avversario.
+        await risultato.callback(interaction)
+
+
 class CalendarPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -13248,7 +13265,38 @@ async def _send_panel_to_channel(guild, channel_id, embed, view):
     return channel
 
 
-@tree.command(name="setup_pannelli_competizioni", description="Staff: pubblica i pannelli calendario, classifiche e statistiche")
+@tree.command(name="setup_pannello_risultati", description="Staff: pubblica il pannello per inserire i risultati")
+async def setup_pannello_risultati(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
+        return
+
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    try:
+        results_embed = _bc_panel_embed(
+            "Inserimento Risultati",
+            (
+                "Dopo aver giocato una partita, inserisci il risultato direttamente da qui.\n"
+                "Il bot ti guiderà passo passo:\n"
+                "• scelta della competizione\n"
+                "• scelta della partita attiva\n"
+                "• inserimento gol e marcatori\n"
+                "• conferma o contestazione dell'avversario\n\n"
+                "Il risultato diventa ufficiale solo dopo la conferma dell'avversario."
+            ),
+            discord.Color.gold(),
+            "⚽"
+        )
+
+        await _send_panel_to_channel(interaction.guild, RESULTS_CHANNEL_ID, results_embed, ResultsPanelView())
+        await interaction.followup.send("✅ Pannello risultati pubblicato nel canale RISULTATI.", ephemeral=True)
+    except Exception as e:
+        print(f"[SETUP PANNELLO RISULTATI] Errore: {type(e).__name__}: {e}")
+        await interaction.followup.send(f"❌ Errore pubblicazione pannello risultati: `{type(e).__name__}: {e}`", ephemeral=True)
+
+
+@tree.command(name="setup_pannelli_competizioni", description="Staff: pubblica i pannelli risultati, calendario, classifiche e statistiche")
 async def setup_pannelli_competizioni(interaction: discord.Interaction):
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
@@ -13257,6 +13305,17 @@ async def setup_pannelli_competizioni(interaction: discord.Interaction):
     await safe_defer(interaction, ephemeral=True, thinking=True)
 
     try:
+        results_embed = _bc_panel_embed(
+            "Inserimento Risultati",
+            (
+                "Dopo aver giocato una partita, inserisci il risultato direttamente da qui.\n"
+                "Il bot ti guiderà nella scelta della competizione, della partita e dei marcatori.\n"
+                "L'avversario riceverà la richiesta di conferma o contestazione."
+            ),
+            discord.Color.gold(),
+            "⚽"
+        )
+
         calendar_embed = _bc_panel_embed(
             "Calendario Partite",
             (
@@ -13285,12 +13344,13 @@ async def setup_pannelli_competizioni(interaction: discord.Interaction):
             "⚽"
         )
 
+        await _send_panel_to_channel(interaction.guild, RESULTS_CHANNEL_ID, results_embed, ResultsPanelView())
         await _send_panel_to_channel(interaction.guild, CALENDAR_CHANNEL_ID, calendar_embed, CalendarPanelView())
         await _send_panel_to_channel(interaction.guild, STANDINGS_CHANNEL_ID, standings_embed, StandingsPanelView())
         await _send_panel_to_channel(interaction.guild, STATS_CHANNEL_ID, stats_embed, StatsPanelView())
 
         await interaction.followup.send(
-            "✅ Pannelli pubblicati correttamente nei canali calendario, classifiche e statistiche.",
+            "✅ Pannelli pubblicati correttamente nei canali risultati, calendario, classifiche e statistiche.",
             ephemeral=True
         )
     except Exception as e:
