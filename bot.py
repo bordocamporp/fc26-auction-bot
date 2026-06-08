@@ -12023,10 +12023,21 @@ class GoalCountSelect(discord.ui.Select):
         goals = safe_int(self.values[0], 1)
         self.flow_view.add_scorer(self.side, self.player_name, goals)
 
-        await interaction.response.edit_message(
-            embed=self.flow_view.build_embed(),
-            view=self.flow_view,
-        )
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(
+                    embed=self.flow_view.build_embed(),
+                    view=self.flow_view,
+                )
+            else:
+                await interaction.message.edit(
+                    embed=self.flow_view.build_embed(),
+                    view=self.flow_view,
+                )
+        except discord.NotFound as e:
+            print(f"[GOAL COUNT SELECT] Interazione scaduta: {e}")
+        except Exception as e:
+            print(f"[GOAL COUNT SELECT] Errore: {type(e).__name__}: {e}")
 
 
 class GoalCountView(discord.ui.View):
@@ -12069,14 +12080,19 @@ class PlayerScorerSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        # Risposta immediata: evita 10062 Unknown interaction se Railway/Supabase rallentano.
+        await safe_defer(interaction, ephemeral=True, thinking=True)
+
         if self.values[0] == "none":
-            await interaction.response.send_message(
+            await safe_send(
+                interaction,
                 "❌ Nessun giocatore disponibile per questa squadra.",
                 ephemeral=True,
             )
             return
 
-        await interaction.response.send_message(
+        await safe_send(
+            interaction,
             f"⚽ Quanti gol ha fatto **{self.values[0]}**?",
             view=GoalCountView(self.flow_view, self.side, self.values[0]),
             ephemeral=True,
@@ -12149,11 +12165,13 @@ class GuidedScorerFlowView(discord.ui.View):
 
     @discord.ui.button(label="Aggiungi marcatore casa", style=discord.ButtonStyle.primary, emoji="🏠")
     async def add_home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await safe_defer(interaction, ephemeral=True, thinking=True)
         players = get_players_for_club_or_user(
             club_name=self.match["home_club"],
             user_id=self.match.get("home_user_id"),
         )
-        await interaction.response.send_message(
+        await safe_send(
+            interaction,
             f"🏠 Scegli marcatore per **{self.match['home_club']}**:",
             view=PlayerScorerView(self, "home", players),
             ephemeral=True,
@@ -12161,11 +12179,13 @@ class GuidedScorerFlowView(discord.ui.View):
 
     @discord.ui.button(label="Aggiungi marcatore trasferta", style=discord.ButtonStyle.primary, emoji="🚌")
     async def add_away(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await safe_defer(interaction, ephemeral=True, thinking=True)
         players = get_players_for_club_or_user(
             club_name=self.match["away_club"],
             user_id=self.match.get("away_user_id"),
         )
-        await interaction.response.send_message(
+        await safe_send(
+            interaction,
             f"🚌 Scegli marcatore per **{self.match['away_club']}**:",
             view=PlayerScorerView(self, "away", players),
             ephemeral=True,
@@ -12254,14 +12274,17 @@ class GuidedMatchSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        await safe_defer(interaction, ephemeral=True, thinking=True)
+
         if self.values[0] == "none":
-            await interaction.response.send_message("❌ Nessuna partita disponibile.", ephemeral=True)
+            await safe_send(interaction, "❌ Nessuna partita disponibile.", ephemeral=True)
             return
 
         match = self.match_map[self.values[0]]
         flow = GuidedScorerFlowView(match)
 
-        await interaction.response.send_message(
+        await safe_send(
+            interaction,
             embed=flow.build_embed(),
             view=flow,
             ephemeral=True,
@@ -12284,7 +12307,7 @@ class GuidedCompetitionSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True, thinking=True)
 
         try:
             matches = get_matches_for_competition(interaction.user.id, self.values[0])
@@ -12908,7 +12931,7 @@ async def send_user_calendar_from_panel(interaction: discord.Interaction):
                 color=discord.Color.dark_grey()
             )
             embed.set_footer(text="BordoCampo FC26 • Calendario")
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await safe_send(interaction, embed=embed, ephemeral=True)
             return
 
         grouped = {}
@@ -12937,10 +12960,10 @@ async def send_user_calendar_from_panel(interaction: discord.Interaction):
             embed.set_footer(text="BordoCampo FC26 • Il tuo calendario")
             embeds.append(embed)
 
-        await interaction.followup.send(embeds=embeds[:10], ephemeral=True)
+        await safe_send(interaction, embeds=embeds[:10], ephemeral=True)
     except Exception as e:
         print(f"[PANNELLO CALENDARIO ERROR] {type(e).__name__}: {e}")
-        await interaction.followup.send(f"❌ Errore calendario: `{type(e).__name__}`", ephemeral=True)
+        await safe_send(interaction, f"❌ Errore calendario: `{type(e).__name__}`", ephemeral=True)
 
 
 def _classifica_category_matches(comp, category):
