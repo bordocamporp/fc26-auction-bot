@@ -11843,6 +11843,10 @@ def parse_scorers_text(raw):
 def save_unified_result_and_sync(source_table, match_id, home_goals, away_goals, home_scorers=None, away_scorers=None):
     home_scorers = home_scorers or []
     away_scorers = away_scorers or []
+    try:
+        ensure_site_standings_columns()
+    except Exception as e:
+        print(f"[RISULTATO SYNC] Migrazione schema saltata: {e}")
     conn = db_connect_safe()
     cur = conn.cursor()
     try:
@@ -12597,6 +12601,75 @@ def ensure_site_standings_columns():
         ]:
             cur.execute(sql)
 
+        # Schema usato da pannello risultati/statistiche.
+        # Serve anche se on_ready non esegue ensure_extra_tables/ensure_results_calendar_tables.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS match_results (
+                id BIGSERIAL PRIMARY KEY,
+                source_table TEXT,
+                source_match_id TEXT,
+                competition_name TEXT,
+                competition_type TEXT,
+                round TEXT,
+                home_team TEXT,
+                away_team TEXT,
+                home_score INTEGER DEFAULT 0,
+                away_score INTEGER DEFAULT 0,
+                winner TEXT,
+                status TEXT DEFAULT 'played',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        for sql in [
+            "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS source_table TEXT",
+            "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS source_match_id TEXT",
+            "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS competition_name TEXT",
+            "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS competition_type TEXT",
+            'ALTER TABLE match_results ADD COLUMN IF NOT EXISTS "round" TEXT',
+            "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS home_team TEXT",
+            "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS away_team TEXT",
+            "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS home_score INTEGER DEFAULT 0",
+            "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS away_score INTEGER DEFAULT 0",
+            "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS winner TEXT",
+            "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'played'",
+            "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        ]:
+            cur.execute(sql)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS goalscorers (
+                id BIGSERIAL PRIMARY KEY,
+                fixture_id BIGINT,
+                source_table TEXT,
+                source_match_id TEXT,
+                user_id TEXT,
+                club_name TEXT,
+                player_name TEXT,
+                goals INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        for sql in [
+            "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS fixture_id BIGINT",
+            "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS source_table TEXT",
+            "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS source_match_id TEXT",
+            "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS user_id TEXT",
+            "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS club_name TEXT",
+            "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS player_name TEXT",
+            "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS goals INTEGER DEFAULT 1",
+            "ALTER TABLE goalscorers ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        ]:
+            cur.execute(sql)
+
+        try:
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_match_results_source ON match_results(source_table, source_match_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_goalscorers_source ON goalscorers(source_table, source_match_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_standings_comp ON standings(competition_name, competition_type)")
+        except Exception:
+            pass
+
         conn.commit()
         return True
     except Exception as e:
@@ -13032,6 +13105,11 @@ def build_national_cup_bracket_embed_any(competition_name):
     if has_data:
         return embed
 
+    try:
+        ensure_site_standings_columns()
+    except Exception as e:
+        print(f"[PANNELLO STATISTICHE] Migrazione schema saltata: {e}")
+
     conn = connect()
     cur = conn.cursor()
     rows = []
@@ -13082,7 +13160,7 @@ async def send_classifica_category_from_panel(interaction: discord.Interaction, 
     except Exception as e:
         print(f"[PANNELLO CLASSIFICA] Migrazione classifiche fallita: {e}")
 
-    comps = get_user_classifica_competitions_by_category(interaction.user.id, category)
+    comps = await asyncio.to_thread(get_user_classifica_competitions_by_category, interaction.user.id, category)
     if not comps:
         embed = discord.Embed(
             title="❌ NON SEI ISCRITTO ALLA COMPETIZIONE",
@@ -13090,37 +13168,44 @@ async def send_classifica_category_from_panel(interaction: discord.Interaction, 
             color=discord.Color.red()
         )
         embed.set_footer(text="BordoCampo FC26 • Classifiche")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await safe_send(interaction, embed=embed, ephemeral=True)
         return
 
-    embeds = []
-    for comp in comps[:10]:
-        if comp.get("kind") == "bracket":
-            if category == "nazionale":
-                embed = build_national_cup_bracket_embed_any(comp.get("name"))
+    def _build_classifica_embeds():
+        built = []
+        for comp in comps[:10]:
+            if comp.get("kind") == "bracket":
+                if category == "nazionale":
+                    embed = build_national_cup_bracket_embed_any(comp.get("name"))
+                else:
+                    embed = build_bracket_embed(comp.get("name"))
             else:
-                embed = build_bracket_embed(comp.get("name"))
-        else:
-            embed = build_standings_embed(comp.get("type"), comp.get("name"))
-        embed.add_field(name="🌐 Sito", value=SITE_PUBLIC_TEXT, inline=False)
-        embeds.append(embed)
+                embed = build_standings_embed(comp.get("type"), comp.get("name"))
+            embed.add_field(name="🌐 Sito", value=SITE_PUBLIC_TEXT, inline=False)
+            built.append(embed)
+        return built
 
-    await interaction.followup.send(embeds=embeds, ephemeral=True)
+    embeds = await asyncio.to_thread(_build_classifica_embeds)
+    await safe_send(interaction, embeds=embeds, ephemeral=True)
 
 
 def _stats_category_filter_sql(category):
+    # psycopg2 vuole UN SOLO parametro array per LIKE ANY(%s::text[]).
+    # Prima passava più stringhe separate e causava:
+    # "not all arguments converted during string formatting".
+    european_patterns = ["%europe%", "%champions%", "%europa%", "%conference%"]
+    cup_patterns = ["%coppa%"] + european_patterns
+    text_expr = "LOWER(COALESCE(mr.competition_type,'') || ' ' || COALESCE(mr.competition_name,''))"
+
     if category == "campionato":
-        return "AND NOT (LOWER(COALESCE(mr.competition_type,'') || ' ' || COALESCE(mr.competition_name,'')) LIKE ANY(%s))", [
-            "%coppa%", "%europe%", "%champions%", "%europa%", "%conference%"
-        ]
+        return f"AND NOT ({text_expr} LIKE ANY(%s::text[]))", [cup_patterns]
     if category == "europea":
-        return "AND (LOWER(COALESCE(mr.competition_type,'') || ' ' || COALESCE(mr.competition_name,'')) LIKE ANY(%s))", [
-            "%europe%", "%champions%", "%europa%", "%conference%"
-        ]
+        return f"AND ({text_expr} LIKE ANY(%s::text[]))", [european_patterns]
     if category == "nazionale":
-        return "AND (LOWER(COALESCE(mr.competition_type,'') || ' ' || COALESCE(mr.competition_name,'')) LIKE %s OR LOWER(COALESCE(mr.competition_name,'')) LIKE %s)", [
-            "%coppa nazionale%", "%coppa%"
-        ]
+        return (
+            f"AND ({text_expr} LIKE %s OR LOWER(COALESCE(mr.competition_name,'')) LIKE %s)",
+            ["%coppa nazionale%", "%coppa%"]
+        )
     return "", []
 
 
@@ -13135,6 +13220,11 @@ def build_top_scorers_embed_for_competition(category, competition_name=None, com
         "europea": discord.Color.blue(),
         "nazionale": discord.Color.gold(),
     }
+
+    try:
+        ensure_site_standings_columns()
+    except Exception as e:
+        print(f"[PANNELLO STATISTICHE] Migrazione schema saltata: {e}")
 
     conn = connect()
     cur = conn.cursor()
@@ -13200,8 +13290,12 @@ def build_top_scorers_embed_for_competition(category, competition_name=None, com
 
 async def send_stats_category_from_panel(interaction: discord.Interaction, category: str):
     await safe_defer(interaction, ephemeral=True, thinking=True)
+    try:
+        await asyncio.to_thread(ensure_site_standings_columns)
+    except Exception as e:
+        print(f"[PANNELLO STATISTICHE] Migrazione schema fallita: {e}")
 
-    comps = get_user_classifica_competitions_by_category(interaction.user.id, category)
+    comps = await asyncio.to_thread(get_user_classifica_competitions_by_category, interaction.user.id, category)
     if not comps:
         embed = discord.Embed(
             title="❌ NON SEI ISCRITTO ALLA COMPETIZIONE",
@@ -13209,18 +13303,21 @@ async def send_stats_category_from_panel(interaction: discord.Interaction, categ
             color=discord.Color.red()
         )
         embed.set_footer(text="BordoCampo FC26 • Statistiche")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await safe_send(interaction, embed=embed, ephemeral=True)
         return
 
-    embeds = []
-    for comp in comps[:10]:
-        embeds.append(build_top_scorers_embed_for_competition(
-            category,
-            competition_name=comp.get("name"),
-            competition_type=comp.get("type")
-        ))
+    def _build_stats_embeds():
+        built = []
+        for comp in comps[:10]:
+            built.append(build_top_scorers_embed_for_competition(
+                category,
+                competition_name=comp.get("name"),
+                competition_type=comp.get("type")
+            ))
+        return built
 
-    await interaction.followup.send(embeds=embeds, ephemeral=True)
+    embeds = await asyncio.to_thread(_build_stats_embeds)
+    await safe_send(interaction, embeds=embeds, ephemeral=True)
 
 
 class ResultsPanelView(discord.ui.View):
