@@ -5282,6 +5282,14 @@ async def on_ready():
         print(f"[TRADE EXPIRE] Avvio loop fallito: {e}")
 
     try:
+        if not getattr(bot, "_trade_auto_expire_task_started", False):
+            bot.loop.create_task(trade_auto_expire_loop())
+            bot._trade_auto_expire_task_started = True
+            print("[TRADE EXPIRE] Loop scadenza 24h avviato.")
+    except Exception as e:
+        print(f"[TRADE EXPIRE] Avvio loop fallito: {e}")
+
+    try:
         local_commands = tree.get_commands(guild=None)
         print(f"[SYNC DEBUG] Comandi registrati localmente prima del sync: {len(local_commands)}")
         print("[SYNC DEBUG] Nomi comandi:", ", ".join(cmd.name for cmd in local_commands[:120]))
